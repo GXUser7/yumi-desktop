@@ -1,0 +1,508 @@
+package com.mydrop.vpn.core.parse
+
+import com.mydrop.vpn.core.model.MultiplexOptions
+import com.mydrop.vpn.core.model.Protocol
+import com.mydrop.vpn.core.model.ProxyNode
+import com.mydrop.vpn.core.model.identified
+import com.mydrop.vpn.core.model.ProxySettings
+import com.mydrop.vpn.core.model.RealityOptions
+import com.mydrop.vpn.core.model.TlsOptions
+import com.mydrop.vpn.core.model.TransportOptions
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
+
+/**
+ * Turns provider share-links into [ProxyNode]s.
+ *
+ * Every parser here is deliberately forgiving: providers emit the same protocol with different
+ * parameter spellings (`sni`/`peer`/`host`, `insecure`/`allowInsecure`, `hy2`/`hysteria2`), and a
+ * subscription with one malformed line must still yield all the other servers.
+ */
+object ProxyUriParser {
+
+    private val lenientJson = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
+
+    /** Parses one link. Returns null when the line is not a proxy URI we understand. */
+    fun parse(uri: String, subscriptionId: String? = null): ProxyNode? {
+        val trimmed = uri.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("#")) return null
+
+        val scheme = trimmed.substringBefore("://", missingDelimiterValue = "").lowercase()
+        return runCatching {
+            when (scheme) {
+                "vmess" -> parseVmess(trimmed, subscriptionId)
+                "vless" -> parseVless(trimmed, subscriptionId)
+                "trojan" -> parseTrojan(trimmed, subscriptionId)
+                "ss" -> parseShadowsocks(trimmed, subscriptionId)
+                "hysteria2", "hy2" -> parseHysteria2(trimmed, subscriptionId)
+                "hysteria", "hy" -> parseHysteria(trimmed, subscriptionId)
+                "tuic" -> parseTuic(trimmed, subscriptionId)
+                "anytls" -> parseAnyTls(trimmed, subscriptionId)
+                "socks", "socks5", "socks4" -> parseSocks(trimmed, subscriptionId)
+                "http", "https" -> parseHttp(trimmed, subscriptionId)
+                "wireguard", "wg" -> parseWireGuard(trimmed, subscriptionId)
+                "ssh" -> parseSsh(trimmed, subscriptionId)
+                else -> null
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Transports named in [text] that the core cannot carry, counted by name.
+     *
+     * Refusing those lines is right — see [node] — but refusing them silently means a server the
+     * provider lists simply is not there, with nothing to say why. This is what lets the import
+     * report it instead.
+     */
+    fun unsupportedTransports(text: String): Map<String, Int> =
+        text.lineSequence()
+            .map(String::trim)
+            .filter { it.contains("://") }
+            .mapNotNull { line -> splitUri(line)?.unsupportedTransport() }
+            .groupingBy { it }
+            .eachCount()
+
+    /** Parses every recognised link in a blob, skipping junk lines. */
+    fun parseAll(text: String, subscriptionId: String? = null): List<ProxyNode> =
+        text.lineSequence()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .mapNotNull { parse(it, subscriptionId) }
+            .toList()
+
+    // ---------------------------------------------------------------- VLESS
+
+    private fun parseVless(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val uuid = urlDecode(p.userInfo).takeIf { it.isNotEmpty() } ?: return null
+
+        val settings = ProxySettings.Vless(
+            uuid = uuid,
+            flow = p.q("flow").orEmpty(),
+            packetEncoding = p.q("packetencoding", "packet-encoding", "packet_encoding") ?: "xudp",
+        )
+        return node(p, settings, subId, uri)
+    }
+
+    // ---------------------------------------------------------------- VMess
+
+    private fun parseVmess(uri: String, subId: String?): ProxyNode? {
+        val payload = uri.removePrefix("vmess://").substringBefore('#')
+        // Canonical form is base64(JSON); some panels emit a plain URI instead.
+        val json = base64DecodeOrNull(payload)?.let {
+            runCatching { lenientJson.parseToJsonElement(it) as? JsonObject }.getOrNull()
+        }
+        return if (json != null) parseVmessJson(json, uri, subId) else parseVmessUri(uri, subId)
+    }
+
+    private fun parseVmessJson(o: JsonObject, uri: String, subId: String?): ProxyNode? {
+        val host = o.str("add") ?: return null
+        val port = o.str("port")?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        val uuid = o.str("id") ?: return null
+
+        val net = o.str("net")?.lowercase().orEmpty()
+        val headerHost = o.str("host").orEmpty()
+        val path = o.str("path").orEmpty().ifEmpty { "/" }
+
+        val transport = when (net) {
+            "ws" -> TransportOptions.WebSocket(
+                path = path,
+                headers = if (headerHost.isNotEmpty()) mapOf("Host" to headerHost) else emptyMap(),
+            )
+            "grpc" -> TransportOptions.Grpc(serviceName = o.str("path").orEmpty())
+            "h2", "http" -> TransportOptions.Http(host = splitCsv(headerHost), path = path)
+            "httpupgrade" -> TransportOptions.HttpUpgrade(host = headerHost, path = path)
+            "quic" -> TransportOptions.Quic
+            else -> null
+        }
+
+        val tlsMode = o.str("tls")?.lowercase().orEmpty()
+        val tls = if (tlsMode == "tls" || tlsMode == "reality") {
+            TlsOptions(
+                enabled = true,
+                serverName = o.str("sni")?.ifEmpty { null } ?: headerHost.ifEmpty { null } ?: host,
+                alpn = splitCsv(o.str("alpn")),
+                fingerprint = o.str("fp")?.ifEmpty { null },
+                insecure = o.str("allowinsecure", "allow_insecure", "insecure", "skip-cert-verify")
+                    ?.let { it == "1" || it.equals("true", ignoreCase = true) } ?: false,
+            )
+        } else {
+            null
+        }
+
+        val settings = ProxySettings.Vmess(
+            uuid = uuid,
+            alterId = o.str("aid")?.toIntOrNull() ?: 0,
+            security = o.str("scy")?.ifEmpty { null } ?: "auto",
+        )
+
+        return ProxyNode(
+            id = "",
+            name = o.str("ps")?.ifEmpty { null } ?: "$host:$port",
+            server = host,
+            port = port,
+            settings = settings,
+            tls = tls,
+            transport = transport,
+            subscriptionId = subId,
+            sourceUri = uri,
+        ).identified()
+    }
+
+    private fun parseVmessUri(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val uuid = urlDecode(p.userInfo).substringBefore(':').takeIf { it.isNotEmpty() } ?: return null
+        val settings = ProxySettings.Vmess(
+            uuid = uuid,
+            alterId = p.qInt("alterid", "aid") ?: 0,
+            security = p.q("security", "scy", "encryption") ?: "auto",
+        )
+        return node(p, settings, subId, uri)
+    }
+
+    // --------------------------------------------------------------- Trojan
+
+    private fun parseTrojan(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val password = urlDecode(p.userInfo).takeIf { it.isNotEmpty() } ?: return null
+        // Trojan is TLS-only by definition, so a link without `security=` still means TLS.
+        return node(p, ProxySettings.Trojan(password), subId, uri, tlsDefaultOn = true)
+    }
+
+    // ---------------------------------------------------------- Shadowsocks
+
+    private fun parseShadowsocks(uri: String, subId: String?): ProxyNode? {
+        val withoutScheme = uri.removePrefix("ss://")
+        val name = withoutScheme.substringAfter('#', "").let(::urlDecode)
+        val body = withoutScheme.substringBefore('#')
+
+        // Legacy form encodes the whole "method:password@host:port" as one base64 blob.
+        if (!body.contains('@')) {
+            val decoded = base64DecodeOrNull(body.substringBefore('?')) ?: return null
+            val at = decoded.lastIndexOf('@')
+            if (at < 0) return null
+            val (method, password) = decoded.substring(0, at).split(':', limit = 2)
+                .takeIf { it.size == 2 } ?: return null
+            val (host, port) = splitHostAndPort(decoded.substring(at + 1)) ?: return null
+            val settings = ProxySettings.Shadowsocks(method, password)
+            return ProxyNode(
+                id = "",
+                name = name.ifEmpty { "$host:$port" },
+                server = host,
+                port = port,
+                settings = settings,
+                subscriptionId = subId,
+                sourceUri = uri,
+            ).identified()
+        }
+
+        // SIP002: ss://base64(method:password)@host:port?plugin=...#name
+        val p = splitUri(uri) ?: return null
+        val (method, password) = credentialPair(p.userInfo).takeIf { it.size == 2 }
+            ?: return null
+
+        val plugin = p.q("plugin").orEmpty()
+        val settings = ProxySettings.Shadowsocks(
+            method = method,
+            password = password,
+            plugin = plugin.substringBefore(';'),
+            pluginOptions = plugin.substringAfter(';', ""),
+        )
+        return ProxyNode(
+            id = "",
+            name = p.fragment.ifEmpty { "${p.host}:${p.port}" },
+            server = p.host,
+            port = p.port,
+            settings = settings,
+            subscriptionId = subId,
+            sourceUri = uri,
+        ).identified()
+    }
+
+    // ------------------------------------------------------------ Hysteria2
+
+    private fun parseHysteria2(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val password = urlDecode(p.userInfo).takeIf { it.isNotEmpty() } ?: return null
+        val settings = ProxySettings.Hysteria2(
+            password = password,
+            obfsType = p.q("obfs", "obfs-type", "obfs_type").orEmpty(),
+            obfsPassword = p.q("obfs-password", "obfspassword", "obfs_password").orEmpty(),
+            upMbps = p.qInt("upmbps", "up", "up_mbps", "up-mbps") ?: 0,
+            downMbps = p.qInt("downmbps", "down", "down_mbps", "down-mbps") ?: 0,
+        )
+        return node(p, settings, subId, uri, tlsDefaultOn = true)
+    }
+
+    private fun parseHysteria(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val settings = ProxySettings.Hysteria(
+            auth = p.q("auth", "auth_str", "authstr") ?: urlDecode(p.userInfo),
+            obfs = p.q("obfs", "obfs-type", "obfs_type").orEmpty(),
+            upMbps = p.qInt("upmbps", "up", "up_mbps", "up-mbps") ?: 0,
+            downMbps = p.qInt("downmbps", "down", "down_mbps", "down-mbps") ?: 0,
+        )
+        return node(p, settings, subId, uri, tlsDefaultOn = true)
+    }
+
+    // ----------------------------------------------------------------- TUIC
+
+    private fun parseTuic(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val creds = urlDecode(p.userInfo).split(':', limit = 2)
+        // The uuid is what identifies the session; without it the link is a fragment, not a server.
+        if (creds.getOrElse(0) { "" }.isEmpty()) return null
+        val settings = ProxySettings.Tuic(
+            uuid = creds[0],
+            password = creds.getOrElse(1) { "" },
+            congestionControl = p.q("congestion_control", "congestioncontrol", "congestion-control") ?: "bbr",
+            udpRelayMode = p.q("udp_relay_mode", "udprelaymode", "udp-relay-mode") ?: "native",
+            zeroRttHandshake = p.qBool("zero_rtt_handshake", "reduce_rtt", "zero-rtt-handshake", "reduce-rtt"),
+        )
+        return node(p, settings, subId, uri, tlsDefaultOn = true)
+    }
+
+    private fun parseAnyTls(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val password = urlDecode(p.userInfo).takeIf { it.isNotEmpty() } ?: return null
+        val settings = ProxySettings.AnyTls(password = password)
+        return node(p, settings, subId, uri, tlsDefaultOn = true)
+    }
+
+    /**
+     * `wireguard://<private-key>@host:port?publickey=…&reserved=…&address=…&mtu=…#name`
+     *
+     * There is no standard behind this one — it is the shape Hiddify and its relatives emit, and
+     * the field names vary by which of them wrote the link, so both spellings of each are read.
+     */
+    private fun parseWireGuard(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val settings = ProxySettings.WireGuard(
+            privateKey = urlDecode(p.userInfo).ifEmpty { p.query["privatekey"].orEmpty() },
+            peerPublicKey = p.query["publickey"] ?: p.query["public-key"] ?: return null,
+            preSharedKey = p.query["presharedkey"] ?: p.query["pre-shared-key"].orEmpty(),
+            localAddresses = (p.query["address"] ?: p.query["ip"]).orEmpty()
+                .split(',')
+                .map(String::trim)
+                .filter(String::isNotEmpty),
+            mtu = p.query["mtu"]?.toIntOrNull() ?: 1408,
+            // Cloudflare WARP hands out three bytes here and refuses the session without them.
+            reserved = p.query["reserved"].orEmpty()
+                .split(',')
+                .mapNotNull { it.trim().toIntOrNull() },
+        )
+        return node(p, settings, subId, uri)
+    }
+
+    /** `ssh://user:password@host:port#name`. */
+    private fun parseSsh(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val creds = urlDecode(p.userInfo).split(':', limit = 2)
+        val settings = ProxySettings.Ssh(
+            user = creds.getOrElse(0) { "root" }.ifEmpty { "root" },
+            password = creds.getOrElse(1) { "" },
+        )
+        return node(p, settings, subId, uri)
+    }
+
+    // --------------------------------------------------------- SOCKS / HTTP
+
+    private fun parseSocks(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        // Some panels base64 the whole "user:pass" pair rather than percent-encoding it, so the
+        // encoded form is tried first — but only accepted when it decodes to something that
+        // actually looks like a credential pair. An ordinary login of letters and digits whose
+        // length happens to be a multiple of four is valid base64: "user1234" decodes cleanly to
+        // six bytes of binary, and the username reaching the core used to be that binary.
+        val creds = credentialPair(p.userInfo)
+        val settings = ProxySettings.Socks(
+            version = if (p.scheme == "socks4") "4" else "5",
+            username = creds.getOrElse(0) { "" },
+            password = creds.getOrElse(1) { "" },
+        )
+        return node(p, settings, subId, uri)
+    }
+
+    private fun parseHttp(uri: String, subId: String?): ProxyNode? {
+        val p = splitUri(uri) ?: return null
+        val creds = urlDecode(p.userInfo).split(':', limit = 2)
+        val settings = ProxySettings.Http(
+            username = creds.getOrElse(0) { "" },
+            password = creds.getOrElse(1) { "" },
+        )
+        return node(p, settings, subId, uri, tlsDefaultOn = p.scheme == "https")
+    }
+
+    // -------------------------------------------------------------- Shared
+
+    /**
+     * Stream transports the core can carry. Exactly the five sing-box implements — anything else
+     * named in a link is a wrapper it has never heard of.
+     */
+    private val KNOWN_TRANSPORTS =
+        setOf("ws", "websocket", "grpc", "httpupgrade", "xhttp", "splithttp")
+
+    /** Spellings that all mean "no wrapper at all", which is a perfectly good answer. */
+    private val PLAIN_TRANSPORTS = setOf("tcp", "raw", "none", "original")
+
+    /**
+     * The transport a link asks for and this core cannot provide, or null when it can.
+     *
+     * Reads `type` and `net` only, never `obfs`: on Hysteria2 that field carries `salamander`,
+     * which is an obfuscator handled inside the protocol rather than a stream transport, and
+     * treating it as one would reject every obfuscated Hysteria2 node.
+     */
+    private fun ParsedUri.unsupportedTransport(): String? {
+        val declared = q("type", "net")?.lowercase() ?: return null
+        return declared.takeUnless { it in KNOWN_TRANSPORTS || it in PLAIN_TRANSPORTS }
+    }
+
+    private fun node(
+        p: ParsedUri,
+        settings: ProxySettings,
+        subId: String?,
+        sourceUri: String,
+        tlsDefaultOn: Boolean = false,
+    ): ProxyNode? {
+        // A transport the core cannot speak makes the whole node unusable, and dropping just the
+        // transport is the worst way to find that out: the link parses, the server appears in the
+        // list looking like any other, the tunnel comes up — and then every connection dies with
+        // "reality verification failed", because the server is framing a protocol we are not
+        // speaking. XHTTP is the one that turned up in the wild; sing-box implements five stream
+        // transports and that is not among them. Refusing the line says so at import instead.
+        p.unsupportedTransport()?.let { return null }
+
+        val transport = p.transport()
+        return ProxyNode(
+            id = "",
+            name = p.fragment.ifEmpty { "${p.host}:${p.port}" },
+            server = p.host,
+            port = p.port,
+            settings = settings,
+            tls = p.tls(tlsDefaultOn, transport),
+            transport = transport,
+            multiplex = p.multiplex(),
+            subscriptionId = subId,
+            sourceUri = sourceUri,
+        ).identified()
+    }
+
+    private fun ParsedUri.transport(): TransportOptions? {
+        val hostHeader = q("host").orEmpty()
+        val path = q("path")?.ifEmpty { null } ?: "/"
+        return when (q("type", "net", "obfs")?.lowercase()) {
+            "ws", "websocket" -> TransportOptions.WebSocket(
+                path = path,
+                headers = if (hostHeader.isNotEmpty()) mapOf("Host" to hostHeader) else emptyMap(),
+                maxEarlyData = qInt("eds", "max_early_data", "max-early-data") ?: 0,
+                earlyDataHeaderName = q("ed", "early_data_header_name", "early-data-header-name"),
+            )
+            "grpc" -> TransportOptions.Grpc(
+                serviceName = q("servicename", "service_name", "service-name", "path").orEmpty(),
+            )
+            "httpupgrade" -> TransportOptions.HttpUpgrade(host = hostHeader, path = path)
+            // Two names for one transport: `splithttp` is what it was called before it was
+            // renamed, and subscriptions still hand out both.
+            "xhttp", "splithttp" -> TransportOptions.Xhttp(
+                path = path,
+                host = hostHeader,
+                mode = q("mode").orEmpty().ifEmpty { "auto" },
+            )
+            // `http`/`h2` and `quic` are deliberately absent, and their absence is the point.
+            // The core removed both transports outright and answers a document naming either with
+            // a removed-feature error, so a link asking for one has to be refused at import rather
+            // than accepted and quietly downgraded to plain TCP — which is what accepting it would
+            // amount to, and which produces a server that dials, measures well and carries nothing.
+            else -> null
+        }
+    }
+
+    private fun ParsedUri.tls(defaultOn: Boolean, transport: TransportOptions?): TlsOptions? {
+        val security = q("security")?.lowercase()
+        val realityKey = q("pbk", "public-key", "publickey", "public_key", "pubkey", "key")
+
+        val enabled = when {
+            security == "reality" || realityKey != null -> true
+            security == "tls" || security == "xtls" -> true
+            security == "none" -> false
+            else -> defaultOn
+        }
+        if (!enabled) return null
+
+        val sniFallback = (transport as? TransportOptions.WebSocket)
+            ?.headers?.get("Host")
+            ?: q("host")
+            ?: host
+
+        return TlsOptions(
+            enabled = true,
+            serverName = q("sni", "peer", "servername", "server_name") ?: sniFallback,
+            insecure = qBool("insecure", "allowinsecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify"),
+            alpn = splitCsv(q("alpn")),
+            fingerprint = q("fp", "fingerprint", "client-fingerprint", "client_fingerprint"),
+            pinnedCertSha256 = q("pcs", "pinnedpeercertsha256", "pinned_peer_cert_sha256").orEmpty(),
+            verifyPeerCertByName = q("vcn", "verifypeercertbyname", "verify_peer_cert_by_name").orEmpty(),
+            reality = realityKey?.let {
+                RealityOptions(
+                    publicKey = normalizeRealityKey(it),
+                    shortId = q("sid", "short-id", "shortid", "short_id").orEmpty(),
+                    spiderX = q("spx", "spider-x", "spiderx", "spider_x", "path") ?: "/",
+                )
+            },
+        )
+    }
+
+    private fun ParsedUri.multiplex(): MultiplexOptions? {
+        if (!qBool("mux", "multiplex")) return null
+        return MultiplexOptions(
+            enabled = true,
+            protocol = q("mux-protocol", "mux_protocol") ?: "h2mux",
+            maxConnections = qInt("mux-max-connections", "mux_max_connections") ?: 4,
+        )
+    }
+
+    /**
+     * `user:password` from a link's userinfo, base64 or percent-encoded.
+     *
+     * A base64 decode is only believed when the result is printable and carries the colon that
+     * makes it a pair; anything else falls back to plain percent-decoding. See [parseSocks].
+     */
+    private fun credentialPair(userInfo: String): List<String> {
+        val decoded = base64DecodeOrNull(userInfo)?.takeIf(::looksLikeCredentials)
+        return (decoded ?: urlDecode(userInfo)).split(':', limit = 2)
+    }
+
+    /**
+     * Whether a base64 decode produced credentials rather than noise.
+     *
+     * The colon is what makes it a pair. The character test used to demand printable ASCII, which
+     * threw away every password containing a non-Latin character — and the caller then fell back to
+     * the *raw base64 string* as the password, so the node was created with credentials nobody had
+     * ever set. Control characters are the real signal that a decode went wrong; letters outside
+     * ASCII are not.
+     */
+    private fun looksLikeCredentials(decoded: String): Boolean =
+        decoded.contains(':') &&
+            decoded.none { ch -> ch.code < 0x20 && ch != '\t' } &&
+            decoded.none { ch -> ch.code == 0x7f }
+
+    /** vmess JSON mixes strings and numbers for the same field depending on the panel. */
+    private fun JsonObject.str(vararg keys: String): String? {
+        for (key in keys) {
+            val v = (this[key] as? JsonPrimitive)?.let { if (it.isString) it.content else it.jsonPrimitive.content }
+            if (v != null) return v
+        }
+        val lowerKeys = keys.map { it.lowercase() }.toSet()
+        for ((k, v) in this) {
+            if (k.lowercase() in lowerKeys) {
+                return (v as? JsonPrimitive)?.let { if (it.isString) it.content else it.jsonPrimitive.content }
+            }
+        }
+        return null
+    }
+}

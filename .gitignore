@@ -1,0 +1,16 @@
+.gradle/
+**/build/
+dist/
+runtime/
+.local/
+*.log
+*.keystore
+*.jks
+profiles.json
+settings.json
+*.exe
+*.dll
+*.msi
+*.zip
+!gradle/wrapper/gradle-wrapper.jar
+.kotlin/

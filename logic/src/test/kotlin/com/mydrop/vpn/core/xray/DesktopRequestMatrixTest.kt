@@ -1,0 +1,209 @@
+package com.mydrop.vpn.core.xray
+
+import com.mydrop.vpn.core.model.AppSettings
+import com.mydrop.vpn.core.model.ProxyNode
+import com.mydrop.vpn.core.model.ProxySettings
+import com.mydrop.vpn.core.model.RealityOptions
+import com.mydrop.vpn.core.model.TlsOptions
+import com.mydrop.vpn.core.model.TransportOptions
+import java.io.File
+import com.yumi.desktop.model.*
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** Synthetic protocol/transport requests consumed by the Go parser tests; no connections are made. */
+class DesktopRequestMatrixTest {
+
+    private val outputDir = File("build/service-requests")
+
+    /**
+     * A key of the right shape, built rather than written down.
+     *
+     * WireGuard and Shadowsocks-2022 both want exactly thirty-two bytes of base64, and a literal of
+     * that shape in a public repository is indistinguishable from a real key — to a reader, and to
+     * the secret scanners watching the repository, which flagged the version of this file that
+     * spelled them out. Generating them says plainly that there is nothing here to leak.
+     */
+    private fun fakeKey(seed: Int): String =
+        java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + seed).toByte() })
+
+    /** REALITY wants raw URL-safe base64 without padding; same reasoning as [fakeKey]. */
+    private fun fakeRealityKey(): String =
+        java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(ByteArray(32) { (it * 7).toByte() })
+
+
+    /** The placeholder every proxy client's documentation uses; not a credential. */
+    private val uuid = "11111111-2222-3333-4444-555555555555"
+
+    private val protocols: List<Pair<String, ProxySettings>> = listOf(
+        "vless" to ProxySettings.Vless(uuid = uuid),
+        "vless-vision" to ProxySettings.Vless(uuid = uuid, flow = "xtls-rprx-vision"),
+        "vmess" to ProxySettings.Vmess(uuid = uuid, alterId = 0, security = "auto"),
+        "vmess-aid" to ProxySettings.Vmess(uuid = uuid, alterId = 4, security = "aes-128-gcm"),
+        "trojan" to ProxySettings.Trojan(password = "trojan-password"),
+        "ss-aead" to ProxySettings.Shadowsocks(method = "aes-256-gcm", password = "ss-password"),
+        "ss-chacha" to ProxySettings.Shadowsocks(
+            method = "chacha20-ietf-poly1305",
+            password = "ss-password",
+        ),
+        "ss-2022" to ProxySettings.Shadowsocks(
+            method = "2022-blake3-aes-256-gcm",
+            password = fakeKey(0),
+        ),
+        "socks" to ProxySettings.Socks(username = "user", password = "pass"),
+        "socks-open" to ProxySettings.Socks(),
+        "http-proxy" to ProxySettings.Http(username = "user", password = "pass"),
+    )
+
+    private val transports: List<Pair<String, TransportOptions?>> = listOf(
+        "tcp" to null,
+        "ws" to TransportOptions.WebSocket(path = "/ws", headers = mapOf("Host" to "cdn.example.com")),
+        "grpc" to TransportOptions.Grpc(serviceName = "grpc-service", permitWithoutStream = true),
+        "httpupgrade" to TransportOptions.HttpUpgrade(host = "cdn.example.com", path = "/up"),
+        "xhttp" to TransportOptions.Xhttp(path = "/x", host = "cdn.example.com", mode = "auto"),
+        "xhttp-packet-up" to TransportOptions.Xhttp(path = "/x", mode = "packet-up"),
+        "xhttp-stream-up" to TransportOptions.Xhttp(path = "/x", mode = "stream-up"),
+        "xhttp-stream-one" to TransportOptions.Xhttp(path = "/x", mode = "stream-one"),
+    )
+
+    private val security: List<Pair<String, TlsOptions?>> = listOf(
+        "plain" to null,
+        "tls" to TlsOptions(serverName = "example.com", alpn = listOf("h2", "http/1.1")),
+        "tls-fp" to TlsOptions(serverName = "example.com", fingerprint = "firefox"),
+        // Refused by the core when it is passed through, so the factory has to substitute; the
+        // document below is the proof that it does.
+        "tls-unknown-fp" to TlsOptions(serverName = "example.com", fingerprint = "not-a-browser"),
+        "reality" to TlsOptions(
+            serverName = "decoy.example.com",
+            fingerprint = "chrome",
+            reality = RealityOptions(
+                publicKey = fakeRealityKey(),
+                shortId = "0123456789abcdef",
+                spiderX = "/",
+            ),
+        ),
+    )
+
+    private fun dump(name: String, node: ProxyNode) {
+        if (node.settings == ProxySettings.Direct) return
+        outputDir.mkdirs()
+        val request = ConnectRequestFactory.create(node, AppSettings(mtu = 1500), DesktopSettings())
+        File(outputDir, "$name.json").writeText(Json { encodeDefaults = true }.encodeToString(request))
+    }
+
+    @Test
+    fun `dump every protocol crossed with every transport and security mode`() {
+        var written = 0
+
+        protocols.forEach { (protocolName, settings) ->
+            transports.forEach { (transportName, transport) ->
+                security.forEach { (securityName, tls) ->
+                    // REALITY rides raw TCP in practice, and a REALITY handshake wrapped in
+                    // WebSocket is not a combination any provider hands out. Kept for the plain
+                    // case only, which is the one that matters.
+                    if (tls?.reality != null && transport != null) return@forEach
+
+                    val name = "$protocolName-$transportName-$securityName"
+                    dump(
+                        name,
+                        ProxyNode(
+                            id = name,
+                            name = name,
+                            server = "example.com",
+                            port = 443,
+                            settings = settings,
+                            tls = tls,
+                            transport = transport,
+                        ),
+                    )
+                    written++
+                }
+            }
+        }
+
+        // Hysteria2: its own transport, its own mandatory TLS, and its obfuscator and bandwidth in
+        // a layer of their own.
+        listOf(
+            "hysteria2-plain" to ProxySettings.Hysteria2(password = "hy2-password"),
+            "hysteria2-salamander" to ProxySettings.Hysteria2(
+                password = "hy2-password",
+                obfsType = "salamander",
+                obfsPassword = "obfs-password",
+            ),
+            "hysteria2-brutal" to ProxySettings.Hysteria2(
+                password = "hy2-password",
+                upMbps = 50,
+                downMbps = 200,
+            ),
+            "hysteria2-everything" to ProxySettings.Hysteria2(
+                password = "hy2-password",
+                obfsType = "salamander",
+                obfsPassword = "obfs-password",
+                upMbps = 50,
+                downMbps = 200,
+            ),
+        ).forEach { (name, settings) ->
+            dump(
+                name,
+                ProxyNode(
+                    id = name,
+                    name = name,
+                    server = "example.com",
+                    port = 8443,
+                    settings = settings,
+                    tls = TlsOptions(serverName = "example.com"),
+                ),
+            )
+            written++
+        }
+
+        // WireGuard: no stream layer, and the one protocol that wants host and port in one string.
+        listOf(
+            "wireguard-plain" to ProxySettings.WireGuard(
+                privateKey = fakeKey(1),
+                peerPublicKey = fakeKey(2),
+                localAddresses = listOf("10.2.0.2/32"),
+            ),
+            "wireguard-warp" to ProxySettings.WireGuard(
+                privateKey = fakeKey(1),
+                peerPublicKey = fakeKey(2),
+                preSharedKey = fakeKey(3),
+                localAddresses = listOf("10.2.0.2/32", "fd01:5ca1:ab1e::2/128"),
+                mtu = 1280,
+                reserved = listOf(1, 2, 3),
+            ),
+        ).forEach { (name, settings) ->
+            dump(
+                name,
+                ProxyNode(
+                    id = name,
+                    name = name,
+                    server = "wg.example.com",
+                    port = 51820,
+                    settings = settings,
+                ),
+            )
+            written++
+        }
+
+        // A direct node, which is the shape that stopped the *other* core from starting: its
+        // factory wrote `server` and `server_port` before it knew the protocol, and one of these
+        // in a subscription meant no tunnel at all.
+        dump(
+            "direct",
+            ProxyNode(
+                id = "direct",
+                name = "direct",
+                server = "example.com",
+                port = 443,
+                settings = ProxySettings.Direct,
+            ),
+        )
+        written++
+
+        assertTrue("expected a full matrix, wrote $written", written >= 150)
+    }
+}

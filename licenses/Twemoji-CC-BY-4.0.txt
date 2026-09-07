@@ -1,0 +1,13 @@
+Twemoji
+Copyright 2020 Twitter, Inc and other contributors
+
+The graphics are licensed under CC-BY 4.0:
+https://creativecommons.org/licenses/by/4.0/
+
+Yumi Desktop bundles the COLR/CPAL build produced by the twemoji-colr project
+(https://github.com/mozilla/twemoji-colr) as desktop/src/main/resources/font/twemoji.ttf.
+It is used for one thing only: drawing country flags, which Windows does not
+ship a glyph for.
+
+The twemoji-colr build tooling is licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0

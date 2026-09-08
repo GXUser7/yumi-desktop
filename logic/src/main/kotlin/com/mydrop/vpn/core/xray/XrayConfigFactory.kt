@@ -1045,7 +1045,8 @@ object XrayConfigFactory {
         "fe80::/10",
     )
 
-    private fun LogLevel.toXrayLevel(): String = when (this) {
+    /** Internal rather than private: the desktop builds its config in the service, and needs this. */
+    internal fun LogLevel.toXrayLevel(): String = when (this) {
         LogLevel.Trace -> "debug"
         LogLevel.Debug -> "debug"
         LogLevel.Info -> "info"

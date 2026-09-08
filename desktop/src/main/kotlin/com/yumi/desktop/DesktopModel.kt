@@ -23,6 +23,8 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)
     val status = MutableStateFlow(ServiceStatus(state = "unavailable"))
+    /** Whether the tunnel the service reports as up is the one this machine is actually using. */
+    val tunnelCheck = MutableStateFlow(TunnelVerdict.Unknown)
     val traffic = MutableStateFlow(TrafficStats.Zero)
     val busy = MutableStateFlow(false)
     val speed = MutableStateFlow(SpeedTestState())
@@ -37,6 +39,7 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     private val commands = Mutex()
     private val subscriptions = Mutex()
     private var speedJob: Job? = null
+    private var checkJob: Job? = null
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
         DeviceIdentity(settings.value.deviceId, System.getProperty("os.name"), System.getProperty("os.version"), "Yumi Desktop")
     }, probeEndpoint = { status.value.probe() })
@@ -79,6 +82,38 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
             if (next.connectedAt == old.connectedAt) (next.upload - old.upload).coerceAtLeast(0) else 0,
             if (next.connectedAt == old.connectedAt) (next.download - old.download).coerceAtLeast(0) else 0)
         status.value = next
+        verifyTunnel(old, next)
+    }
+
+    /**
+     * One verdict per connection, taken shortly after the service says it is up.
+     *
+     * Keyed on `connectedAt` rather than on the state alone, because the state arrives once a
+     * second from the poll and every one of those readings says "connected" — checking on the
+     * state would put two requests on the wire per second for as long as the tunnel is up.
+     * Reconnecting to another server moves the timestamp, which is exactly when the answer stops
+     * being about anything.
+     */
+    private fun verifyTunnel(old: ServiceStatus, next: ServiceStatus) {
+        if (next.state != "connected") {
+            checkJob?.cancel(); checkJob = null; tunnelCheck.value = TunnelVerdict.Unknown
+            return
+        }
+        if (old.state == "connected" && old.connectedAt == next.connectedAt) return
+        val probe = next.probe() ?: return
+        checkJob?.cancel()
+        tunnelCheck.value = TunnelVerdict.Unknown
+        // The check blocks on sockets and cannot be interrupted mid-request, so the verdict is
+        // only published if the connection it describes is still the current one.
+        checkJob = scope.launch(Dispatchers.IO) {
+            // `Start()` returning is not the same moment as Windows having applied the adapter's
+            // routes and resolver, and a verdict taken in that gap would accuse the machine of
+            // ignoring a tunnel it has not finished being told about.
+            delay(SETTLE_MILLIS)
+            val verdict = TunnelCheck.run(probe)
+            ensureActive()
+            tunnelCheck.value = verdict
+        }
     }
     fun toggleConnection() = action {
         commands.withLock {
@@ -242,5 +277,8 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     private companion object {
         /** How stale a list has to be for opening the window to be a reason to refresh it. */
         const val STARTUP_FLOOR_MILLIS = 2 * 60_000L
+
+        /** Long enough for Windows to have finished adopting the new adapter's routes and DNS. */
+        const val SETTLE_MILLIS = 3_000L
     }
 }

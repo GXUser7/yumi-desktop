@@ -59,6 +59,30 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 - [ ] Reboot with the tunnel connected. Nothing should be tunnelling after the reboot until you
       press connect.
 
+## Beside another VPN client
+
+The case this is for: a second TUN client on the same machine, which does not have to be running
+to break things. Clash Verge, Hiddify and sing-box all leave their adapter behind when their
+tunnel is switched off, and it keeps the resolver and a default route.
+
+- [ ] With another client's TUN adapter present, connect. Within a few seconds the headline still
+      reads connected, and under it, in the failure colour, a line saying the tunnel is up but the
+      machine is not using it. Nothing is disconnected on the user's behalf.
+- [ ] Which of the three lines appears is the diagnosis, and they must not be interchangeable: a
+      fake-ip client answering DNS says so; a machine routing around the adapter says that; a
+      server that has stopped answering says that.
+- [ ] Close the other client, remove its adapter, `ipconfig /flushdns`, reconnect: the line goes.
+- [ ] The check runs once per connection. Watch the connect screen for a minute with the tunnel
+      healthy — it must not repeat, and the traffic counters must not show it doing so.
+
+## The journal
+
+- [ ] Settings → log level, then connect. `%ProgramData%\Yumi Desktop\worker.log` records at the
+      chosen level: **Error** leaves a failing connection with one line, **Info** narrates it.
+- [ ] Connect to a server that is deliberately unreachable. The reason is in the journal in the
+      core's own words, and no longer only in the app.
+- [ ] The file is truncated, not grown without bound, once it passes a megabyte.
+
 ## Split tunnelling
 
 - [ ] **Everything except selected**: add a browser's `.exe`, connect, and that browser goes direct

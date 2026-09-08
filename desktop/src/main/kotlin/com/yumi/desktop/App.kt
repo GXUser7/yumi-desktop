@@ -589,6 +589,7 @@ private val ReadingWidth = 840.dp
     modifier: Modifier,
 ) {
     val semantic = LocalSemanticColors.current
+    val verdict by m.tunnelCheck.collectAsState()
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(status.state, status.connectedAt) {
         while (status.state == "connected") {
@@ -627,8 +628,8 @@ private val ReadingWidth = 840.dp
     }
     // Only what the square beside this tile cannot say. It carries the flag, the name, the
     // protocol and the latency, so repeating any of that here was the same sentence twice on one
-    // screen. What is left is the two cases the server row has no way of explaining: a handshake
-    // that failed, and a service that is not installed.
+    // screen. What is left is what the server row has no way of explaining: a handshake that
+    // failed, a service that is not installed, and a tunnel the machine is not using.
     val subtitle = when {
         // Three different situations used to share one sentence, and two of them were then given
         // advice that could not help. A service that is refusing this account is running: telling
@@ -648,6 +649,29 @@ private val ReadingWidth = 840.dp
             )
         }
         status.state == "failed" -> status.error?.let { serviceError(m, it) }
+        // A tunnel can be up and unused. The service cannot see that — it reports what `Start()`
+        // returned — so this is the only place the difference between "connected" and "working"
+        // can be put into words, and it is worth the words: without them the screen says
+        // `connected` at somebody whose browser is loading nothing, and every one of these three
+        // causes sends them to check the others.
+        status.state == "connected" -> when (verdict) {
+            TunnelVerdict.ResolverHijacked -> m.text(
+                "Туннель работает, но имена разрешает другой VPN-клиент. Закройте его.",
+                "The tunnel works, but another VPN client is answering DNS. Close it.",
+            )
+            TunnelVerdict.SystemBypassed -> m.text(
+                "Туннель работает, но система шлёт трафик мимо него.",
+                "The tunnel works, but the system routes traffic around it.",
+            )
+            // Without advice, deliberately. The probe cannot tell a server that has stopped
+            // answering from a machine whose own link has gone, because on Windows the adapter
+            // captures this app too and there is nothing left to ask the question from.
+            TunnelVerdict.NodeSilent -> m.text(
+                "Сервер не отвечает через туннель.",
+                "The server is not answering through the tunnel.",
+            )
+            TunnelVerdict.Passing, TunnelVerdict.Unknown -> null
+        }
         else -> null
     }
     val ink = if (connected) semantic.connected else MaterialTheme.colorScheme.onSurface
@@ -675,7 +699,10 @@ private val ReadingWidth = 840.dp
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodySmall,
-                color = if (status.state == "failed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                // A subtitle under `connected` only exists because something is wrong, so it is
+                // set in the same ink as a failure rather than in the quiet grey of a remark.
+                color = if (status.state == "failed" || status.state == "connected") MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )

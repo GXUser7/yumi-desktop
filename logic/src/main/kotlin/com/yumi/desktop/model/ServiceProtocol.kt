@@ -14,6 +14,14 @@ import kotlinx.serialization.json.*
     val applications: List<String> = emptyList(),
     val domains: List<String> = emptyList(),
     val networks: List<String> = emptyList(),
+    /**
+     * How much the core may say on its way down, in Xray's own spelling.
+     *
+     * The service decides where that goes and refuses anything outside its own vocabulary; this
+     * only chooses the volume. The default here is the service's, spelled again because a request
+     * that omits the field is one this app did not build.
+     */
+    val logLevel: String = "warning",
 )
 @Serializable data class ServiceRequest(
     val version: Int = 1,
@@ -46,6 +54,7 @@ object ConnectRequestFactory {
         return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
             options = TunnelOptions(settings.mtu, settings.enableIpv6, settings.bypassLan, settings.remoteDns,
                 desktop.splitMode, desktop.applications.map(RuleValidation::application),
-                desktop.domains.map(RuleValidation::domain), desktop.networks.map(RuleValidation::network)))
+                desktop.domains.map(RuleValidation::domain), desktop.networks.map(RuleValidation::network),
+                logLevel = with(XrayConfigFactory) { settings.logLevel.toXrayLevel() }))
     }
 }

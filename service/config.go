@@ -22,6 +22,10 @@ type Options struct {
     Applications []string `json:"applications"`
     Domains []string `json:"domains"`
     Networks []string `json:"networks"`
+    // How much the core is allowed to say on its way down. Only the verbosity crosses the
+    // privilege boundary; where it is written stays service-owned, as the allowlist below says
+    // of every other log field.
+    LogLevel string `json:"logLevel"`
 }
 type Request struct {
     Version int `json:"version"`
@@ -48,6 +52,10 @@ type Status struct {
 }
 
 const maxFrame = 1024 * 1024
+
+/** Loud enough to name a failure, quiet enough not to file every destination the user visits. */
+const defaultLogLevel = "warning"
+
 type obj = map[string]any
 
 func decodeRequest(data []byte) (Request, error) {
@@ -65,6 +73,12 @@ func decodeRequest(data []byte) (Request, error) {
 
 func validateOptions(o Options) error {
     if o.MTU < 1280 || o.MTU > 9000 || (o.SplitMode != "ExceptSelected" && o.SplitMode != "OnlySelected") { return errors.New("invalid_options") }
+    // An empty level is an app that predates this field, not a request for silence; it gets the
+    // default rather than a refusal, because refusing would turn an upgrade into a dead tunnel.
+    switch o.LogLevel {
+    case "", "none", "error", "warning", "info", "debug":
+    default: return errors.New("invalid_log_level")
+    }
     if len(o.Applications)+len(o.Domains)+len(o.Networks) > 1024 { return errors.New("too_many_rules") }
     for _, p := range o.Applications {
         if !regexp.MustCompile(`(?i)^[a-z]:[/\\].*\.exe$`).MatchString(p) || strings.ContainsAny(p, "\x00\r\n") { return errors.New("invalid_application") }
@@ -183,8 +197,22 @@ func buildConfig(r Request, port int, user, password string) obj {
         gateway=append(gateway,"fdfe:dcba:9876::1/126")
         routes=append(routes,"::/1","8000::/1")
     }
+    // What the core is allowed to say, and the reason it is a setting rather than a constant.
+    //
+    // This was `none`, which meant the one component that knows why a tunnel did not start was
+    // the one component forbidden from saying so. `Status.Detail` carries the sentence `Start()`
+    // returns and nothing else: a core that comes up and then cannot reach the server, or
+    // resolves through a DNS that answers nothing, fails after that point and had no way to be
+    // heard. The app has had a log-level setting the whole time; on this platform it went
+    // nowhere.
+    //
+    // The destination is still not the app's to choose — stderr, which the supervisor points at
+    // `%ProgramData%\Yumi Desktop\worker.log`. Worth knowing before raising this: that file is
+    // readable by any account on the machine, and `info` and above records the destination of
+    // every connection the core makes.
+    level:=o.LogLevel; if level==""{level=defaultLogLevel}
     return obj{
-        "log":obj{"loglevel":"none"},
+        "log":obj{"loglevel":level},
         "stats":obj{}, "policy":obj{"system":obj{"statsOutboundUplink":true,"statsOutboundDownlink":true}},
         "dns":obj{"servers":[]string{dns},"queryStrategy":strategy,"tag":"dns-in"},
         "inbounds":[]obj{

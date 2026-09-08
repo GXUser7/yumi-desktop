@@ -83,6 +83,26 @@ When a tunnel will not start, what the worker said on its way down is in
 `%ProgramData%\Yumi Desktop\worker.log` — a Go panic, a Wintun driver that would not load, the
 core's own complaint. The file is truncated rather than rotated once it passes a megabyte.
 
+How much the core writes there follows **Settings → log level**, which defaults to a level that
+names failures and nothing else. Two things are worth knowing before raising it: the file is
+readable by any account on the machine, and at *Info* and above the core records the destination
+of every connection it makes. Where the log is written is not the application's to choose — the
+service decides that, and only the volume crosses the pipe.
+
+## When it says connected and nothing loads
+
+The service reports `connected` when the core has started: the adapter exists, the routes were
+accepted. Whether the machine then *uses* that tunnel is a different question, and on Windows the
+usual reason it does not is another VPN client. They leave their TUN adapter behind when switched
+off, holding the resolver and a default route, and a fake-ip client answers every name with an
+address from `198.18.0.0/15` that means nothing outside its own tunnel.
+
+So shortly after connecting, Yumi asks two questions: one through its own probe inbound, which
+reaches the server without touching a local resolver, and one as any other program on the machine
+would. Server yes and machine no is the interesting answer, and the connect screen says which of
+the three it got. Nothing is disconnected automatically — the tunnel is fine; it is the machine
+around it that is not using it.
+
 ## Building
 
 You need a JDK 21, Go 1.26 and the two verified downloads that `bootstrap.ps1` fetches (Wintun and

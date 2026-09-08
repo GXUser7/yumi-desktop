@@ -65,4 +65,19 @@ func TestInvalidOptions(t *testing.T) {
     r:=fixture();r.Options.MTU=0;if validateOptions(*r.Options)==nil{t.Fatal("accepted MTU")}
     r=fixture();r.Options.Networks=[]string{"192.0.2.1/99"};if validateOptions(*r.Options)==nil{t.Fatal("accepted CIDR")}
     r=fixture();r.Options.Applications=[]string{"relative.exe"};if validateOptions(*r.Options)==nil{t.Fatal("accepted relative application")}
+    for _,level:=range []string{"trace","verbose","INFO","warning ","file:///secret"}{
+        r=fixture();r.Options.LogLevel=level;if validateOptions(*r.Options)==nil{t.Fatalf("accepted log level %q",level)}
+    }
+    for _,level:=range []string{"","none","error","warning","info","debug"}{
+        r=fixture();r.Options.LogLevel=level;if err:=validateOptions(*r.Options);err!=nil{t.Fatalf("rejected log level %q: %v",level,err)}
+    }
+}
+
+// The setting exists in the app and used to stop at the pipe: every tunnel was built with
+// `loglevel: none`, so the core could not name its own failure. This is that wire.
+func TestLogLevelReachesTheCore(t *testing.T) {
+    r:=fixture();r.Options.LogLevel="debug"
+    if buildConfig(r,19090,"fixture","not-a-real-secret")["log"].(obj)["loglevel"]!="debug"{t.Fatal("chosen level did not reach the core")}
+    r=fixture()
+    if buildConfig(r,19090,"fixture","not-a-real-secret")["log"].(obj)["loglevel"]!=defaultLogLevel{t.Fatal("an unset level must fall back to the default, not to silence")}
 }

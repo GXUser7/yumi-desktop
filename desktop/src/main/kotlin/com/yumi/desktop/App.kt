@@ -1,10 +1,13 @@
 package com.yumi.desktop
 
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -12,6 +15,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -27,13 +31,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mydrop.vpn.core.format.ValueAndUnit
@@ -46,58 +51,34 @@ import com.mydrop.vpn.ui.components.*
 import com.mydrop.vpn.ui.theme.LocalSemanticColors
 import com.mydrop.vpn.ui.theme.MonoStyle
 import com.yumi.desktop.model.*
-import com.yumi.desktop.platform.DesktopPlatform
 import kotlinx.coroutines.delay
-import javax.swing.JFileChooser
-import javax.swing.filechooser.FileNameExtensionFilter
 
 /*
- * The window, laid out the way the phone and the television are.
+ * The window, in YouCloud's material.
  *
- * Three things carry the family resemblance and nothing else has to: the poster headline every
- * screen opens with, the rounded figure the tunnel lives inside, and the one loud control under
- * it. Everything else is a surface with a radius on it. What the window adds — and the phone
- * cannot — is a second column beside the figure, so the numbers a phone hides behind a drag
- * gesture are simply on screen.
+ * Shapes drift behind everything and every surface is matte glass over them. Three things still
+ * carry the family resemblance with the phone and the television: the poster headline the tunnel
+ * screen opens with, the rounded figure the tunnel lives inside, and the one loud control beside
+ * it. What the window adds — and the phone cannot — is a second column, so the numbers a phone
+ * hides behind a drag gesture are simply on screen.
  */
 
-/** Screen margin, and the gap between the rail, the main column and the aside. */
+/** Screen margin, and the gap between the dock, the main column and the aside. */
 private val Inset = 18.dp
 
 /**
- * Where the wordmark starts inside the rail — and, because it is the same number, where every
- * page's headline starts too.
- *
- * The two are set at different sizes and live in different columns, so nothing lines them up on
- * its own: the rail was indented and the pages were not, and a title sat a centimetre above the
- * logo it was meant to read alongside. Both poster styles trim their leading down to the ink, so
- * boxes that start at the same height put their capitals at the same height as well, whatever size
- * the title happens to be — which is why one constant is enough for a 38 px page title and the
- * tunnel screen's 52 px one alike.
+ * Where the mark starts beside the dock — and, being the same number, where every page's title
+ * starts too, so the two read along one line.
  */
-private val HeadlineTop = 26.dp
+internal val HeadlineTop = 26.dp
 
-/**
- * The tile's own inner rim, and the reason the state can sit in one without losing its line.
- *
- * A page carries [HeadlineTop] itself — [PageHeader] for the pages that have a title, the tunnel
- * screen for its own — so the tunnel screen can start its mosaic exactly this much higher and let
- * the tile's padding put the word back on the wordmark's line. Move one of the two and the
- * headline stops agreeing with the logo.
- */
+/** The tile's own inner rim; see [ConnectPage] for why the tunnel screen starts higher by it. */
 private val TileRim = 18.dp
 
-/** Corner radius of the flow figure. The phone's, unchanged: it is the app's signature shape. */
-private val FigureShape = RoundedCornerShape(44.dp)
+/** Corner radius of the flow figure: the phone's, and the scale's extra-extra-large. */
+private val FigureShape = RoundedCornerShape(Radii.extraExtraLarge)
 
-private val CardShape = RoundedCornerShape(28.dp)
-private val TileShape = RoundedCornerShape(18.dp)
-
-/** The tab column's own shape: square enough to read as a column, round enough to belong here. */
-private val RailShape = RoundedCornerShape(30.dp)
-
-/** And the tab inside it, which keeps the soft corner the selected tab has everywhere else. */
-private val RailItemShape = RoundedCornerShape(20.dp)
+private val DialogShape = RoundedCornerShape(Radii.extraLargeIncreased)
 
 enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     Connect("Подключение", "Connection", Icons.Rounded.Shield),
@@ -119,21 +100,23 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 
     YumiTheme(settings, desktop.palette) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            BoxWithConstraints {
-                // The rail keeps its labels while there is room for them; below that a column of
-                // icons still says where you are.
-                val railLabels = maxWidth >= 880.dp
-
+            ExpressiveBackdrop(animated = desktop.liveBackdrop) {
                 Row(Modifier.fillMaxSize().padding(Inset), horizontalArrangement = Arrangement.spacedBy(Inset)) {
-                    NavigationRail(model, page, railLabels) { page = it }
+                    Dock(model, page) { page = it }
                     Box(Modifier.weight(1f).fillMaxHeight()) {
-                        when (page) {
-                            Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
-                            Page.Servers -> ServersPage(model)
-                            Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
-                            Page.Routing -> RoutingPage(model)
-                            Page.Speed -> SpeedPage(model)
-                            Page.Settings -> SettingsPage(model)
+                        AnimatedContent(
+                            targetState = page,
+                            transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) },
+                            label = "page",
+                        ) { shown ->
+                            when (shown) {
+                                Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
+                                Page.Servers -> ServersPage(model)
+                                Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
+                                Page.Routing -> RoutingPage(model)
+                                Page.Speed -> SpeedPage(model)
+                                Page.Settings -> SettingsPage(model)
+                            }
                         }
                     }
                 }
@@ -144,229 +127,139 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
                 AlertDialog(
                     onDismissRequest = { model.message.value = null },
                     confirmButton = { TextButton(onClick = { model.message.value = null }) { Text("OK") } },
-                    shape = CardShape,
-                    text = { Text(it) },
+                    shape = DialogShape,
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    text = { Text(it, style = MaterialTheme.typography.bodyLarge) },
                 )
             }
         }
     }
 }
 
-/* ── The rail ─────────────────────────────────────────────────────────────────────────────── */
+/* ── The dock ─────────────────────────────────────────────────────────────────────────────── */
 
 /**
- * The television's rail, standing in a window.
+ * YouCloud's floating toolbar, stood on its end.
  *
- * A stadium at both ends, floating over the background rather than framing it, with the selected
- * tab carrying the quiet container and the hovered one the full accent. Three appearances rather
- * than two, for the reason the television needs three: if hover and selection took the same tone,
- * pointing at the tab you are already on would change nothing on screen.
+ * Not a column the height of the window with a logo at the top and a list down it — that is the
+ * shape of every admin panel ever made. The pages live in a pill of glass only as tall as they
+ * are, as round buttons; the one you are on fills with the accent.
+ * Settings stands apart in a glass circle of its own, as it does on the phone. The mark sits above
+ * on the page's title line, and the tunnel's state below as a cookie that is never out of sight.
+ * Names come up beside the buttons on hover.
  */
-@Composable private fun NavigationRail(m: DesktopModel, page: Page, labels: Boolean, onSelect: (Page) -> Unit) {
+@Composable private fun Dock(m: DesktopModel, page: Page, onSelect: (Page) -> Unit) {
     val status by m.status.collectAsState()
-    val semantic = LocalSemanticColors.current
-    // Dragged across the breakpoint the rail used to jump between two widths in a single frame,
-    // which is the most visible thing on screen at exactly the moment the user is looking at the
-    // edge of the window. It travels now, and the labels leave and arrive with it — a spring
-    // rather than a tween, so that grabbing the edge and dragging back mid-flight is a redirection
-    // instead of a second jump.
-    val width by animateDpAsState(
-        if (labels) 200.dp else 88.dp,
-        MaterialTheme.motionScheme.slowSpatialSpec(),
-        label = "rail-width",
-    )
-    Surface(
-        modifier = Modifier.width(width.coerceAtLeast(72.dp)).fillMaxHeight(),
-        // A rounded rectangle rather than the television's stadium. A stadium is a shape for
-        // something that floats over a screen the length of a room; standing full height in a
-        // window it wastes both ends on curve and reads as a lozenge rather than as a column.
-        shape = RailShape,
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        shadowElevation = 10.dp,
+    Column(
+        Modifier.width(72.dp).fillMaxHeight().padding(top = HeadlineTop - 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        YumiMark(plate = MaterialTheme.colorScheme.primary, glyph = MaterialTheme.colorScheme.onPrimary, size = 44.dp)
+        Spacer(Modifier.weight(1f))
         Column(
-            Modifier.padding(horizontal = 12.dp).padding(top = HeadlineTop, bottom = 26.dp),
+            Modifier.glass(PillShape, glassTint()).padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            // Crossfaded rather than swapped. Both forms are the same word at the same size, so
-            // the wordmark stays put and only loses its tail — which is what a rail closing looks
-            // like from the inside.
-            // The mark, not a letter, and the same mark either way — collapsed it stands alone,
-            // expanded the word joins it. "DESKTOP" underneath is gone: it named the one thing a
-            // window on a desktop does not have to be told, and it was the only line in the rail
-            // that existed to fill a gap.
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                YumiMark(
-                    plate = MaterialTheme.colorScheme.primary,
-                    glyph = MaterialTheme.colorScheme.onPrimary,
-                    size = if (labels) 32.dp else 38.dp,
-                )
-                AnimatedVisibility(labels) {
-                    Text(
-                        "Yumi",
-                        style = MaterialTheme.typography.headlineLarge,
-                        color = MaterialTheme.colorScheme.primary,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
-                }
-            }
-            Spacer(Modifier.height(20.dp))
-            Page.entries.forEach { item -> RailItem(m, item, item == page, labels) { onSelect(item) } }
-            Spacer(Modifier.weight(1f))
-            // The one place the window says out loud what the tunnel is doing while the user is
-            // on another screen. A dot rather than a word: it has to survive the rail collapsing.
-            val live = status.state == "connected"
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Box(
-                    Modifier.size(8.dp).clip(CircleShape).background(
-                        when (status.state) {
-                            "connected" -> semantic.connected
-                            "connecting", "disconnecting" -> semantic.connecting
-                            "unavailable", "failed" -> MaterialTheme.colorScheme.error
-                            else -> MaterialTheme.colorScheme.outline
-                        },
-                    ),
-                )
-                AnimatedVisibility(labels) {
-                    Text(
-                        if (live) m.text("Защищено", "Protected") else m.text("Не защищено", "Unprotected"),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
-                }
+            Page.entries.filter { it != Page.Settings }.forEach { item ->
+                DockButton(m.text(item.ru, item.en), item.icon, item == page, Modifier.testTag("nav-${item.name}")) { onSelect(item) }
             }
         }
+        Spacer(Modifier.height(12.dp))
+        Box(Modifier.glass(CircleShape, glassTint()).padding(8.dp)) {
+            DockButton(m.text(Page.Settings.ru, Page.Settings.en), Page.Settings.icon, page == Page.Settings, Modifier.testTag("nav-Settings")) {
+                onSelect(Page.Settings)
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        TunnelCookie(m, status) { onSelect(Page.Connect) }
     }
 }
 
-@Composable private fun RailItem(m: DesktopModel, item: Page, selected: Boolean, labels: Boolean, onClick: () -> Unit) {
-    val interaction = remember { MutableInteractionSource() }
-    val hovered by interaction.collectIsHoveredAsState()
-    val scale by animateFloatAsState(if (hovered) 1.04f else 1f, label = "rail-hover")
-    val container by animateColorAsState(
-        when {
-            hovered -> MaterialTheme.colorScheme.primary
-            selected -> MaterialTheme.colorScheme.primaryContainer
-            else -> Color.Transparent
-        },
-        label = "rail-container",
-    )
-    val content = when {
-        hovered -> MaterialTheme.colorScheme.onPrimary
-        selected -> MaterialTheme.colorScheme.onPrimaryContainer
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    val label = m.text(item.ru, item.en)
-    // Not switched between a left-aligned row and a centred one, which would put the icon in a
-    // different place on the first frame after the breakpoint. The row stays left-aligned and the
-    // inset travels instead, so that once the label has shrunk to nothing the icon has arrived in
-    // the middle of a 64 dp item by itself.
-    val inset by animateDpAsState(
-        if (labels) 16.dp else 21.5.dp,
-        MaterialTheme.motionScheme.slowSpatialSpec(),
-        label = "rail-item-inset",
-    )
-    Surface(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth().height(54.dp).scale(scale).testTag("nav-${item.name}"),
-        shape = RailItemShape,
-        color = container,
-        contentColor = content,
-        interactionSource = interaction,
+@OptIn(ExperimentalFoundationApi::class)
+@Composable private fun DockButton(label: String, icon: ImageVector, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    TooltipArea(
+        tooltip = { HoverLabel(label) },
+        delayMillis = 350,
+        tooltipPlacement = TooltipPlacement.ComponentRect(
+            anchor = Alignment.CenterEnd,
+            alignment = Alignment.CenterEnd,
+            offset = DpOffset(14.dp, 0.dp),
+        ),
     ) {
-        Row(
-            Modifier.padding(horizontal = inset.coerceAtLeast(0.dp)),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Icon(item.icon, label, Modifier.size(21.dp))
-            AnimatedVisibility(labels) {
-                Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
-            }
-        }
+        // The page you are on is a filled circle — the dock is a column of circles, and a square
+        // among them read as a different kind of thing rather than as the chosen one.
+        PanelIconButton(icon, label, modifier, checked = selected, checkedCorner = 50, onClick = onClick)
     }
 }
 
-/* ── Shared furniture ─────────────────────────────────────────────────────────────────────── */
+/** A name beside a button: a solid plate, because a popup has nothing behind it to frost. */
+@Composable private fun HoverLabel(text: String) {
+    Surface(shape = PillShape, color = MaterialTheme.colorScheme.inverseSurface, shadowElevation = 6.dp) {
+        Text(
+            text,
+            Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.inverseOnSurface,
+        )
+    }
+}
 
 /**
- * The poster headline every screen opens with, in place of a title bar.
- *
- * An app bar would reserve height for a title never long enough to need it. Setting the title as
- * body content gives the type room to be the size it wants to be.
+ * The tunnel's state, always on screen: a cookie in the state's colour on a glass circle, turning
+ * while the tunnel is being raised. The one place the window says what the tunnel is doing while
+ * the user is on another page.
  */
-@Composable private fun PageHeader(
-    title: String,
-    subtitle: String? = null,
-    actions: @Composable RowScope.() -> Unit = {},
-) {
-    Row(Modifier.fillMaxWidth().padding(top = HeadlineTop, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.displaySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (subtitle != null) {
-                Spacer(Modifier.height(10.dp))
-                // Through the flag pass as well: a speed test's subtitle names the server it went
-                // through, and that name carries a flag like any other.
-                Text(
-                    rememberEmojiText(subtitle, 13.sp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+@OptIn(ExperimentalFoundationApi::class)
+@Composable private fun TunnelCookie(m: DesktopModel, status: ServiceStatus, onClick: () -> Unit) {
+    val semantic = LocalSemanticColors.current
+    val color = when {
+        status.state == "connected" -> semantic.connected
+        status.state == "connecting" || status.state == "disconnecting" -> semantic.connecting
+        status.killSwitch -> MaterialTheme.colorScheme.tertiary
+        status.state == "unavailable" || status.state == "failed" -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.outline
+    }
+    val label = when {
+        status.state == "connected" -> m.text("Защищено", "Protected")
+        status.state == "connecting" -> m.text("Подключение…", "Connecting…")
+        status.killSwitch -> m.text("Килл свитч держит интернет", "Kill switch is holding traffic")
+        else -> m.text("Не защищено", "Unprotected")
+    }
+    val interaction = remember { MutableInteractionSource() }
+    val spin = rememberInfiniteTransition(label = "cookie")
+    val angle by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(6000, easing = LinearEasing)), label = "cookie-angle")
+    TooltipArea(
+        tooltip = { HoverLabel(label) },
+        delayMillis = 250,
+        tooltipPlacement = TooltipPlacement.ComponentRect(Alignment.CenterEnd, Alignment.CenterEnd, DpOffset(14.dp, 0.dp)),
+    ) {
+        Box(
+            Modifier
+                .size(56.dp)
+                .pressMorph(interaction)
+                .glass(CircleShape, glassTint())
+                .clickable(interaction, indication = null, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            val animated by animateColorAsState(color, colorTween(), label = "cookie-color")
+            val busy = status.state == "connecting" || status.state == "disconnecting"
+            Box(
+                Modifier
+                    .size(24.dp)
+                    .graphicsLayerRotation(if (busy || status.state == "connected") angle else 0f)
+                    .clip(MaterialShapes.Cookie9Sided.toShape())
+                    .background(animated),
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically, content = actions)
     }
 }
 
-@Composable private fun Panel(
-    modifier: Modifier = Modifier,
-    color: Color = MaterialTheme.colorScheme.surfaceContainerLow,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Surface(modifier, shape = CardShape, color = color) {
-        Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp), content = content)
-    }
-}
+private fun Modifier.graphicsLayerRotation(degrees: Float) = this.then(
+    Modifier.graphicsLayer { rotationZ = degrees },
+)
 
-@Composable private fun Chip(text: String) {
-    Text(
-        text,
-        style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelMedium.fontSize),
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(horizontal = 12.dp, vertical = 7.dp),
-    )
-}
-
-/** Protocol pill. REALITY-capable protocols take the accent so they stand out in long lists. */
-@Composable private fun ProtocolBadge(protocol: Protocol) {
-    val loud = protocol == Protocol.VLESS || protocol == Protocol.HYSTERIA2
-    Text(
-        protocol.label,
-        style = MaterialTheme.typography.labelSmall,
-        color = if (loud) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier
-            .background(if (loud) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest, RoundedCornerShape(6.dp))
-            .padding(horizontal = 6.dp, vertical = 2.dp),
-    )
-}
-
-@Composable private fun FeatureBadge(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
-        modifier = Modifier
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(6.dp))
-            .padding(horizontal = 6.dp, vertical = 2.dp),
-    )
-}
+/* ── Shared bits ──────────────────────────────────────────────────────────────────────────── */
 
 /**
  * Latency, bucketed. Users act on "fast / usable / bad", and a continuous gradient would imply a
@@ -381,24 +274,24 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
         result.millis < 400 -> m.strings.get(R.string.servers_latency_value, result.millis) to semantic.latencyMedium
         else -> m.strings.get(R.string.servers_latency_value, result.millis) to semantic.latencySlow
     }
-    Text(text, style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelMedium.fontSize), color = color, maxLines = 1)
+    Text(text, style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = color, maxLines = 1)
+}
+
+/** Badges worth showing on a desktop: "Auto ×N" says nothing here, where a group rides its first server. */
+private val ProxyNode.desktopBadges get() = badges.filterNot { it.startsWith("Auto ×") }
+
+@Composable private fun ProtocolPlate(protocol: Protocol) {
+    Plate(protocol.label, loud = protocol == Protocol.VLESS || protocol == Protocol.HYSTERIA2)
 }
 
 @Composable private fun EmptyState(icon: ImageVector, title: String, body: String) {
-    Panel(Modifier.fillMaxWidth()) {
-        Icon(icon, null, Modifier.size(38.dp), tint = MaterialTheme.colorScheme.primary)
-        Text(title, style = MaterialTheme.typography.headlineMedium)
-        Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-}
-
-@Composable private fun Toggle(label: String, checked: Boolean, hint: String? = null, onChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
-            if (hint != null) Text(hint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Switch(checked, onChange)
+    GlassPanel(Modifier.fillMaxWidth()) {
+        Box(
+            Modifier.size(52.dp).clip(MaterialShapes.Sunny.toShape()).background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center,
+        ) { Icon(icon, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer) }
+        Text(title, style = MaterialTheme.typography.headlineSmall)
+        Text(body, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -406,16 +299,15 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
  * A scrolling page with the bar a pointer expects; the wheel works either way.
  *
  * The content stops at [ReadingWidth] rather than filling whatever the window is. A settings panel
- * stretched across a wide monitor puts its switch a foot away from the label it belongs to, and a
- * paragraph of explanation set to the same width stops being readable at the second line.
+ * stretched across a wide monitor puts its switch a foot away from the label it belongs to.
  */
 @Composable private fun ScrollingColumn(content: @Composable ColumnScope.() -> Unit) {
     val scroll = rememberScrollState()
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(end = 14.dp)) {
+        Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(end = 14.dp, bottom = 12.dp)) {
             Column(
                 Modifier.widthIn(max = ReadingWidth),
-                verticalArrangement = Arrangement.spacedBy(18.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
                 content = content,
             )
         }
@@ -424,20 +316,10 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 }
 
 /** As wide as a column of prose and a row of controls should ever get. */
-private val ReadingWidth = 840.dp
+private val ReadingWidth = 860.dp
 
 /* ── Connect ──────────────────────────────────────────────────────────────────────────────── */
 
-/**
- * One column, the whole width.
- *
- * There was an aside here holding the connection's details and the session's counters, and the
- * screen is better without it: the figure was paying for that column in width, and what the column
- * carried was already on screen — the headline names the server and its protocol, and the rates
- * are written on the figure itself while traffic is moving. What is left in the aside's place is
- * only what has nowhere else to be: a warning that the service is missing, and, for someone who
- * has no server at all, the way to get one.
- */
 @Composable private fun ConnectPage(m: DesktopModel, onServers: () -> Unit, onPair: () -> Unit) {
     val status by m.status.collectAsState()
     val traffic by m.traffic.collectAsState()
@@ -461,69 +343,72 @@ private val ReadingWidth = 840.dp
         }
     }
 
-    // Started this much above the page's own inset so that the state tile's rim can give it back:
-    // the word inside the tile lands on the same line as the wordmark in the rail, which is where
-    // it was before the tile existed.
+    // Started this much above the page's own inset so that the headline tile's rim gives it back:
+    // the word inside the tile lands on the line every other page's title starts on.
     BoxWithConstraints(Modifier.fillMaxSize().padding(top = HeadlineTop - TileRim)) {
-        // A poster headline is two lines of 52 sp. On a short window that is a fifth of the height
-        // spent before anything has been said, so it steps down a size rather than squeezing
-        // everything under it.
         val tight = maxHeight < 640.dp
-        Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Surface(Modifier.fillMaxWidth(), shape = CardShape, color = MaterialTheme.colorScheme.surfaceContainerLow) {
-                    Headline(m, status, node, tight, Modifier.padding(TileRim))
+        Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Box(Modifier.fillMaxWidth().glass(PanelShape, glassTint())) {
+                    Headline(m, status, node, tight, Modifier.padding(TileRim + 4.dp))
                 }
                 FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
             }
-            Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 ServerRow(m, node, profiles.latencies[node?.id], onServers)
                 ControlTile(m, status, node != null, Modifier.weight(1f), m::toggleConnection)
-                // The corner the mosaic leaves for whatever the tunnel has to say. With a server
-                // that is what it is carrying; without one, how to get a server.
-                if (node == null) TransferCard(m, onPair)
-                else SessionTile(m, traffic, download.values, upload.values)
+                when {
+                    // A kill switch holding a dead tunnel is the one thing on this screen the user
+                    // must not miss: their internet is off on purpose, and here is how to turn it on.
+                    status.killSwitch && status.state != "connected" && status.state != "connecting" -> TroubleNote(
+                        Icons.Rounded.GppMaybe,
+                        m.text("Интернет закрыт килл свитчем", "The kill switch is holding traffic"),
+                        m.text(
+                            "Туннель не работает, поэтому всё, что шло бы мимо него, заблокировано. Переподключись или сними блокировку.",
+                            "The tunnel is down, so everything that would leave around it is blocked. Reconnect, or lift the block.",
+                        ),
+                        Modifier.fillMaxWidth(),
+                        action = m.text("Снять блокировку", "Lift the block"),
+                        onAction = { m.releaseKillSwitch() },
+                    )
+                    node == null -> TransferCard(m, onPair)
+                    else -> SessionTile(m, traffic, download.values, upload.values)
+                }
             }
         }
     }
 }
 
 /**
- * The server, and the square that changes it.
- *
- * The latency used to be a badge floating in the corner of the map, which made the map carry a
- * control that had nothing to do with it and put the one number worth reading on top of moving
- * coastline. Here it is a tile like the others: a square that opens the server list, with the
- * reading on it, and beside it the server that reading belongs to.
+ * The server, and the square that changes it: a tile with the latency on it that opens the server
+ * list, and beside it the server that reading belongs to.
  */
 @Composable private fun ServerRow(m: DesktopModel, node: ProxyNode?, latency: LatencyResult?, onServers: () -> Unit) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        // Below this the square would leave the name about seventy points to live in, which is
-        // two clipped words and a badge wrapped onto its own line. The square keeps its reading
-        // and its job; the server it belongs to is already named in the headline above.
-        if (maxWidth < 240.dp) ServerButton(m, node, latency, Modifier.fillMaxWidth().height(70.dp), true, onServers)
-        else Row(Modifier.fillMaxWidth().height(94.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (maxWidth < 240.dp) ServerButton(m, node, latency, Modifier.fillMaxWidth().height(72.dp), true, onServers)
+        else Row(Modifier.fillMaxWidth().height(96.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             ServerButton(m, node, latency, Modifier.fillMaxHeight().aspectRatio(1f), false, onServers)
-            Surface(Modifier.weight(1f).fillMaxHeight(), shape = CardShape, color = MaterialTheme.colorScheme.surfaceContainerLow) {
-                Column(Modifier.padding(horizontal = 15.dp, vertical = 13.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        if (node != null) rememberEmojiText(node.name, 14.sp)
-                        else AnnotatedString(m.text("Сервер не выбран", "No server chosen")),
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (node != null) Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
-                        ProtocolBadge(node.protocol)
-                        node.badges.take(2).forEach { FeatureBadge(it) }
-                    }
+            Column(
+                Modifier.weight(1f).fillMaxHeight().glass(TileShape, glassTint()).padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Kicker(m.text("Сервер", "Server"))
+                Text(
+                    if (node != null) rememberEmojiText(node.name, 14.sp)
+                    else AnnotatedString(m.text("Не выбран", "None chosen")),
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (node != null) Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    ProtocolPlate(node.protocol)
+                    node.desktopBadges.take(1).forEach { Plate(it) }
                 }
             }
         }
     }
 }
 
-/** The square itself: the arrows that say what it does, and the number that says why you would. */
 @Composable private fun ServerButton(
     m: DesktopModel,
     node: ProxyNode?,
@@ -540,26 +425,26 @@ private val ReadingWidth = 840.dp
         value < 180 -> semantic.latencyMedium
         else -> semantic.latencySlow
     }
-    Surface(
-        onClick = onServers,
-        modifier = modifier.testTag("server-button"),
-        shape = CardShape,
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val tint = glassTint(if (hovered) 0.9f else GlassAlpha)
+    Box(
+        modifier
+            .testTag("server-button")
+            .pressMorph(interaction)
+            .glass(TileShape, tint)
+            .hoverable(interaction)
+            .clickable(interaction, indication = null, onClick = onServers),
     ) {
         if (wide) Row(
-            Modifier.fillMaxSize().padding(horizontal = 14.dp),
+            Modifier.fillMaxSize().padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             if (node != null) Text(rememberEmojiText(node.name, 15.sp), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             else Text(m.text("Выбрать", "Choose"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
-            Text(
-                value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: "—",
-                style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelMedium.fontSize),
-                color = ink,
-                maxLines = 1,
-            )
+            Text(value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = ink, maxLines = 1)
         } else Column(
             Modifier.fillMaxSize().padding(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -567,27 +452,13 @@ private val ReadingWidth = 840.dp
         ) {
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(3.dp))
-            Text(
-                value?.toString() ?: "—",
-                style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleMedium.fontSize),
-                color = ink,
-            )
-            Text(
-                m.strings.get(R.string.unit_millis).uppercase(),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Text(value?.toString() ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleLarge.fontSize), color = ink)
+            Text(m.strings.get(R.string.unit_millis).uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
 
-@Composable private fun Headline(
-    m: DesktopModel,
-    status: ServiceStatus,
-    node: ProxyNode?,
-    tight: Boolean,
-    modifier: Modifier,
-) {
+@Composable private fun Headline(m: DesktopModel, status: ServiceStatus, node: ProxyNode?, tight: Boolean, modifier: Modifier) {
     val semantic = LocalSemanticColors.current
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(status.state, status.connectedAt) {
@@ -625,27 +496,13 @@ private val ReadingWidth = 840.dp
             secondary = m.strings.get(R.string.connect_tunnel_secondary)
         }
     }
-    // Only what the square beside this tile cannot say. It carries the flag, the name, the
-    // protocol and the latency, so repeating any of that here was the same sentence twice on one
-    // screen. What is left is the two cases the server row has no way of explaining: a handshake
-    // that failed, and a service that is not installed.
+    // Only what the tiles beside this one cannot say: a handshake that failed, a service that is not
+    // installed or belongs to someone else.
     val subtitle = when {
-        // Three different situations used to share one sentence, and two of them were then given
-        // advice that could not help. A service that is refusing this account is running: telling
-        // its owner to install it sends them to reinstall something that works.
         status.state == "unavailable" -> when (status.error) {
-            "service_denied" -> m.text(
-                "Служба туннеля зарегистрирована на другую учётную запись Windows.",
-                "The tunnel service is registered to a different Windows account.",
-            )
-            "service_missing" -> m.text(
-                "Служба туннеля не установлена или остановлена.",
-                "The tunnel service is not installed, or is not running.",
-            )
-            else -> m.text(
-                "Установите Yumi вместе с VPN-службой, чтобы подключаться.",
-                "Install Yumi with its tunnel service to connect.",
-            )
+            "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
+            "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
+            else -> m.text("Установите Yumi вместе с VPN-службой, чтобы подключаться.", "Install Yumi with its tunnel service to connect.")
         }
         status.state == "failed" -> status.error?.let { serviceError(m, it) }
         else -> null
@@ -653,83 +510,53 @@ private val ReadingWidth = 840.dp
     val ink = if (connected) semantic.connected else MaterialTheme.colorScheme.onSurface
     val poster = if (tight) MaterialTheme.typography.displayMedium else MaterialTheme.typography.displayLarge
     Column(modifier) {
+        Kicker(
+            when {
+                connected && node != null -> m.text("Туннель · ${node.protocol.label}", "Tunnel · ${node.protocol.label}")
+                else -> m.text("Туннель", "Tunnel")
+            },
+        )
+        Spacer(Modifier.height(10.dp))
         Text(primary, style = poster, color = ink, maxLines = 1)
-        // Keyed on the state, never on the text: keying on the text would crossfade the whole
-        // line once a second while the timer ticks, which reads as flicker. Tabular figures keep
-        // it from twitching sideways as digit widths change.
+        // Keyed on the state, never on the text: keying on the text would crossfade the whole line
+        // once a second while the timer ticks. Tabular figures keep it from twitching sideways.
         @Suppress("UnusedContentLambdaTargetStateParameter")
         AnimatedContent(
             targetState = status.state,
             transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
             label = "headline-second-line",
         ) { _ ->
-            Text(
-                secondary,
-                style = poster.copy(fontFeatureSettings = "tnum"),
-                color = ink,
-                maxLines = 1,
-            )
+            Text(secondary, style = poster.copy(fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
         }
         if (subtitle != null) {
             Spacer(Modifier.height(if (tight) 8.dp else 12.dp))
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (status.state == "failed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
-        // The one failure the user can put right from here, and the only one worth a button: the
-        // service is running and simply does not admit this account. Everything else on this
-        // screen is a report; this is a door.
+        // The one failure the user can put right from here: the service is running and simply does
+        // not admit this account.
         if (status.state == "unavailable" && status.error == "service_denied") {
             Spacer(Modifier.height(12.dp))
-            Button(onClick = { m.repairService() }, shape = RoundedCornerShape(percent = 50)) {
-                Text(m.text("Переназначить службу на меня", "Register the service to me"))
-            }
+            AccentButton(m.text("Переназначить службу на меня", "Register the service to me")) { m.repairService() }
         }
-        // What the core itself said, under the sentence that categorises it. Set in the figure
-        // face because it is a machine's words and should not be mistaken for ours, and shown at
-        // all because a tunnel that will not start is otherwise unattributable: the code alone
-        // sends everyone to check the same three things that were never the problem.
+        // What the core itself said, under the sentence that categorises it.
         val detail = status.detail?.takeIf { status.state == "failed" && it.isNotBlank() }
         if (detail != null) {
             Spacer(Modifier.height(8.dp))
-            Text(
-                detail,
-                style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelSmall.fontSize),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
     }
 }
 
-@Composable private fun FlowFigure(
-    m: DesktopModel,
-    status: ServiceStatus,
-    traffic: TrafficStats,
-    node: ProxyNode?,
-    modifier: Modifier,
-) {
+@Composable private fun FlowFigure(m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, node: ProxyNode?, modifier: Modifier) {
     val semantic = LocalSemanticColors.current
     val settings by m.settings.settings.collectAsState()
     val running = status.state == "connected"
     val warming = status.state == "connecting"
-    val container by animateColorAsState(
-        if (running) MaterialTheme.colorScheme.surfaceContainerLow else MaterialTheme.colorScheme.surfaceContainerLowest,
-        label = "figure-container",
-    )
-    Box(
-        modifier
-            .clip(FigureShape)
-            .background(container)
-            // An empty outline is how "no traffic" is stated. Once the field is full the border
-            // would only compete with it.
-            .then(if (running) Modifier else Modifier.border(1.dp, MaterialTheme.colorScheme.outlineVariant, FigureShape)),
-    ) {
+    // Matte, like every other surface: the figure is glass, the sea is a translucent wash over it
+    // and the gaps between the cells are left open, so the shapes drifting behind the window show
+    // through the ocean, blurred, and move under it when the window is dragged.
+    val veil by animateFloatAsState(if (running) 0.62f else 0.5f, colorTween(), label = "figure-veil")
+    Box(modifier.glass(FigureShape, glassTint(veil))) {
         when (settings.visualizer) {
             Visualizer.Waves -> TrafficWaves(
                 downloadBytesPerSecond = traffic.downloadBytesPerSecond,
@@ -739,119 +566,101 @@ private val ReadingWidth = 840.dp
                 warming = warming,
             )
             Visualizer.Planet -> {
-                // Two kilobytes read once. A missing asset leaves an empty array, which the mask
-                // reads as "all sea" — a blank planet rather than a crash, because a decorative
-                // figure must never be able to take the window down.
                 val mask = remember {
-                    runCatching {
-                        checkNotNull(DesktopModel::class.java.getResourceAsStream("/world_land.bin")).use { it.readBytes() }
-                    }.getOrElse { ByteArray(0) }
+                    runCatching { checkNotNull(DesktopModel::class.java.getResourceAsStream("/world_land.bin")).use { it.readBytes() } }.getOrElse { ByteArray(0) }
                 }
                 // The flag in the server's own name is its country code. Nothing is asked of the
                 // network to find out where a server is.
-                val place = remember(node?.name) {
-                    node?.name?.let(WorldMap::countryCodeOf)?.let(WorldMap::centroidOf)
-                }
+                val place = remember(node?.name) { node?.name?.let(WorldMap::countryCodeOf)?.let(WorldMap::centroidOf) }
                 PixelPlanet(
                     mask = mask,
                     latitude = place?.get(0),
                     longitude = place?.get(1),
                     connected = running,
                     warming = warming,
-                    seaColor = MaterialTheme.colorScheme.primaryContainer,
-                    landColor = MaterialTheme.colorScheme.primary,
-                    gapColor = container,
+                    seaColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = if (isLightTheme()) 0.42f else 0.38f),
+                    landColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.92f),
+                    gapColor = Color.Transparent,
                     markerColor = semantic.marker,
                 )
             }
         }
-
-        // Only the idle line, on a scrim. The rates live in the session tile now, and the sentence
-        // that is left has nowhere else to go — it needs the scrim because the planet fills this
-        // corner with coastline at exactly the contrast the text is set in.
-        if (!running) Surface(
-            modifier = Modifier.align(Alignment.BottomStart).padding(18.dp),
-            shape = RoundedCornerShape(19.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+        if (!running) Box(
+            Modifier.align(Alignment.BottomStart).padding(18.dp)
+                .glass(PillShape, glassTint(0.86f))
+                .padding(horizontal = 16.dp, vertical = 10.dp),
         ) {
             Text(
                 m.strings.get(if (warming) R.string.connect_stream_warming else R.string.connect_stream_empty),
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
             )
         }
     }
 }
 
 /**
- * The control, standing up.
- *
- * It was a bar across the bottom because the screen was a stack and the bottom was what was left.
- * In the mosaic it is a column of its own, which is what it should have been: the one thing on the
- * screen that does something is now also the tallest thing on it, and the icon sits over the word
- * rather than beside it because a tall shape has height to spend and no width to waste.
+ * The control, standing up: the tallest thing on screen is the one thing that does something.
+ * Loud — the accent — while the tunnel is down, because it is the button being asked for; once it
+ * is up it settles into glass with the one ring on the screen, the ring of the active element.
  */
-@Composable private fun ControlTile(
-    m: DesktopModel,
-    status: ServiceStatus,
-    hasNode: Boolean,
-    modifier: Modifier,
-    onClick: () -> Unit,
-) {
+@Composable private fun ControlTile(m: DesktopModel, status: ServiceStatus, hasNode: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val semantic = LocalSemanticColors.current
     val connected = status.state == "connected"
     val busy = status.state == "connecting" || status.state == "disconnecting"
+    val loud = !connected && !busy
     val container by animateColorAsState(
-        when {
-            // A container tone rather than `surface`. As a bar across the bottom the connected
-            // control could be an outline on the page's own ground; standing a third of the
-            // window tall, the same treatment makes the largest object on screen the darkest
-            // one — a hole cut in the mosaic exactly where the main control should be.
-            connected -> MaterialTheme.colorScheme.surfaceContainerLow
-            busy -> MaterialTheme.colorScheme.primaryContainer
-            else -> MaterialTheme.colorScheme.primary
-        },
+        if (busy) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.primary,
+        colorTween(),
         label = "control-container",
     )
     val content by animateColorAsState(
-        if (connected || busy) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimary,
+        when {
+            connected -> semantic.connected
+            busy -> MaterialTheme.colorScheme.onPrimaryContainer
+            else -> MaterialTheme.colorScheme.onPrimary
+        },
+        colorTween(),
         label = "control-content",
     )
-    // Stopping never needs a server. Gating the whole control on one was fine until the server a
-    // running tunnel was raised on stopped resolving — a subscription refreshed underneath it, or
-    // switched off — and then the only way out of a connection was the tray.
+    // Stopping never needs a server.
     val usable = when (status.state) {
         "unavailable", "disconnecting" -> false
         "connected", "connecting" -> true
         else -> hasNode
     }
-    BoxWithConstraints(modifier) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    BoxWithConstraints(modifier.fillMaxWidth()) {
         // Half the shorter side is a capsule whatever the column turns out to be; connected it
-        // settles to a slab. Animating the radius rather than swapping shapes keeps the corners
-        // continuous, and taking the radius from the measured size rather than from a constant is
-        // what lets the same control be a lozenge at 1280 and a rounded box at 680.
+        // settles to a slab. Pressed, it rounds a little further and sinks.
         val capsule = minOf(maxWidth, maxHeight) / 2
-        val corner by animateDpAsState(if (connected) 34.dp else capsule, label = "control-corner")
+        val corner by animateDpAsState(
+            when {
+                connected -> Radii.extraLargeIncreased
+                pressed -> capsule
+                else -> capsule * 0.92f
+            },
+            Springs.press(),
+            label = "control-corner",
+        )
+        val shape = RoundedCornerShape(corner.coerceAtLeast(0.dp))
         val roomy = maxWidth >= 230.dp
-        Button(
-            onClick = onClick,
-            enabled = usable,
-            modifier = Modifier.fillMaxSize().testTag("connect-button"),
-            shape = RoundedCornerShape(corner.coerceAtLeast(0.dp)),
-            colors = ButtonDefaults.buttonColors(containerColor = container, contentColor = content),
-            border = if (connected) BorderStroke(1.5.dp, semantic.connected) else null,
-            contentPadding = PaddingValues(18.dp),
+        Box(
+            Modifier
+                .fillMaxSize()
+                .testTag("connect-button")
+                .pressMorph(interaction, usable)
+                .then(if (connected) Modifier.glass(shape, glassTint()).border(1.5.dp, semantic.connected, shape) else Modifier.clip(shape).background(if (usable || !loud) container else container.copy(alpha = 0.4f)))
+                .clickable(interaction, indication = null, enabled = usable, onClick = onClick),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 when {
-                    busy -> ShapeSpinner(color = content, size = if (roomy) 42.dp else 32.dp)
-                    connected -> Icon(Icons.Rounded.Pause, null, Modifier.size(if (roomy) 44.dp else 34.dp))
-                    status.state == "failed" -> Icon(Icons.Rounded.ErrorOutline, null, Modifier.size(if (roomy) 40.dp else 32.dp))
-                    else -> Icon(Icons.Rounded.PowerSettingsNew, null, Modifier.size(if (roomy) 40.dp else 32.dp))
+                    busy -> LoadingIndicator(color = content, modifier = Modifier.size(if (roomy) 64.dp else 48.dp))
+                    connected -> Icon(Icons.Rounded.Pause, null, Modifier.size(if (roomy) 46.dp else 34.dp), tint = content)
+                    status.state == "failed" -> Icon(Icons.Rounded.Refresh, null, Modifier.size(if (roomy) 42.dp else 32.dp), tint = content)
+                    else -> Icon(Icons.Rounded.PowerSettingsNew, null, Modifier.size(if (roomy) 42.dp else 32.dp), tint = content)
                 }
                 Text(
                     m.strings.get(
@@ -864,6 +673,7 @@ private val ReadingWidth = 840.dp
                         },
                     ),
                     style = if (roomy) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium,
+                    color = if (connected) MaterialTheme.colorScheme.onSurface else content,
                     textAlign = TextAlign.Center,
                     maxLines = 2,
                 )
@@ -872,73 +682,46 @@ private val ReadingWidth = 840.dp
     }
 }
 
-/**
- * What the tunnel is carrying, in the corner the mosaic leaves for it.
- *
- * The rates stacked rather than set side by side: this tile is a third of a column and can come
- * out under two hundred points wide, where two figures beside each other are two clipped figures.
- */
 @Composable private fun SessionTile(m: DesktopModel, traffic: TrafficStats, download: List<Long>, upload: List<Long>) {
     val semantic = LocalSemanticColors.current
-    Surface(Modifier.fillMaxWidth(), shape = CardShape, color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                m.strings.get(R.string.connect_session).uppercase(),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            SessionRate(m.strings.get(R.string.connect_rate_download), m.strings.rate(traffic.downloadBytesPerSecond), semantic.download)
-            SessionRate(m.strings.get(R.string.connect_rate_upload), m.strings.rate(traffic.uploadBytesPerSecond), semantic.upload)
-            // Only once there is a shape to draw. An empty framed box reads as a chart that failed
-            // to load rather than as a tunnel that is not carrying anything.
-            if (download.size >= 2) Box(
-                Modifier.fillMaxWidth().height(46.dp).clip(TileShape).background(MaterialTheme.colorScheme.surfaceContainer).padding(8.dp),
-            ) {
-                TrafficSparkline(download, upload, semantic.download, semantic.upload, Modifier.fillMaxSize())
-            }
-            Text(
-                m.strings.get(R.string.connect_received, m.strings.bytes(traffic.downloadBytes).toString()),
-                style = MonoStyle.copy(fontSize = MaterialTheme.typography.bodySmall.fontSize),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-            )
+    GlassPanel(Modifier.fillMaxWidth(), shape = TileShape, padding = PaddingValues(18.dp), spacing = 9.dp) {
+        Kicker(m.strings.get(R.string.connect_session))
+        SessionRate(m.strings.get(R.string.connect_rate_download), m.strings.rate(traffic.downloadBytesPerSecond), semantic.download)
+        SessionRate(m.strings.get(R.string.connect_rate_upload), m.strings.rate(traffic.uploadBytesPerSecond), semantic.upload)
+        // Only once there is a shape to draw. An empty framed box reads as a chart that failed to
+        // load rather than as a tunnel that is not carrying anything.
+        if (download.size >= 2) Box(
+            Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(Radii.medium)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)).padding(8.dp),
+        ) {
+            TrafficSparkline(download, upload, semantic.download, semantic.upload, Modifier.fillMaxSize())
         }
+        Text(
+            m.strings.get(R.string.connect_received, m.strings.bytes(traffic.downloadBytes).toString()),
+            style = MonoStyle.copy(fontSize = MaterialTheme.typography.bodySmall.fontSize),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+        )
     }
 }
 
 @Composable private fun SessionRate(label: String, rate: ValueAndUnit, accent: Color) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
-        Text(
-            label.uppercase(),
-            Modifier.weight(1f),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-        )
-        Text(rate.value, style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleMedium.fontSize), color = accent, maxLines = 1)
-        Text(
-            " " + rate.unit,
-            style = MaterialTheme.typography.labelSmall,
-            color = accent.copy(alpha = 0.75f),
-            modifier = Modifier.padding(bottom = 2.dp),
-            maxLines = 1,
-        )
+        Text(label.uppercase(), Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        Text(rate.value, style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleLarge.fontSize), color = accent, maxLines = 1)
+        Text(" " + rate.unit, style = MaterialTheme.typography.labelSmall, color = accent.copy(alpha = 0.75f), modifier = Modifier.padding(bottom = 3.dp), maxLines = 1)
     }
 }
 
 @Composable private fun TransferCard(m: DesktopModel, onPair: () -> Unit) {
-    Panel(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainer) {
-        Text(m.text("Уже пользуешься Yumi?", "Already using Yumi?"), style = MaterialTheme.typography.headlineSmall)
+    GlassPanel(Modifier.fillMaxWidth(), shape = TileShape, padding = PaddingValues(20.dp)) {
+        Kicker(m.text("Первый запуск", "First run"))
+        Text(m.text("Уже пользуешься Yumi?", "Already using Yumi?"), style = MaterialTheme.typography.titleLarge)
         Text(
             m.text("Передай подписку с телефона по QR-коду.", "Transfer a subscription from your phone using a QR code."),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        FilledTonalButton(onClick = onPair, shape = RoundedCornerShape(percent = 50)) {
-            Icon(Icons.Rounded.QrCodeScanner, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(m.text("С телефона", "From phone"))
-        }
+        AccentButton(m.text("С телефона", "From phone"), icon = Icons.Rounded.QrCodeScanner, onClick = onPair)
     }
 }
 
@@ -952,7 +735,7 @@ private val ReadingWidth = 840.dp
     val grid = rememberLazyGridState()
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        PageHeader(
+        PageTitle(
             m.strings.get(R.string.servers_title),
             m.strings.get(
                 R.string.servers_subtitle,
@@ -960,26 +743,12 @@ private val ReadingWidth = 840.dp
                 m.strings.plural(R.plurals.sources, profiles.subscriptions.size),
             ),
         ) {
-            FilledTonalButton(
-                onClick = { m.ping() },
-                enabled = !busy && profiles.visibleNodes.isNotEmpty(),
-                shape = RoundedCornerShape(percent = 50),
-            ) {
-                Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(m.strings.get(R.string.servers_measure_latency))
-            }
+            AccentButton(m.strings.get(R.string.servers_measure_latency), icon = Icons.Rounded.Bolt, enabled = !busy && profiles.visibleNodes.isNotEmpty()) { m.ping() }
         }
-        OutlinedTextField(
-            query,
-            { query = it },
-            Modifier.fillMaxWidth(),
-            singleLine = true,
-            placeholder = { Text(m.strings.get(R.string.servers_search_placeholder)) },
-            leadingIcon = { Icon(Icons.Rounded.Search, null) },
-            shape = RoundedCornerShape(percent = 50),
-        )
-        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Box(Modifier.glass(PillShape, glassTint()).fillMaxWidth()) {
+            GlassField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search)
+        }
+        if (busy) LinearWavyProgressIndicator(Modifier.fillMaxWidth())
         if (matches.isEmpty()) EmptyState(
             Icons.Rounded.Dns,
             m.strings.get(if (query.isBlank()) R.string.servers_empty else R.string.servers_empty_filtered),
@@ -990,8 +759,8 @@ private val ReadingWidth = 840.dp
                 columns = GridCells.Adaptive(300.dp),
                 state = grid,
                 modifier = Modifier.fillMaxSize().padding(end = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(matches, key = { it.id }) { node ->
                     ServerCard(m, node, node.id == profiles.selectedNodeId, profiles.latencies[node.id])
@@ -1005,39 +774,37 @@ private val ReadingWidth = 840.dp
 @Composable private fun ServerCard(m: DesktopModel, node: ProxyNode, selected: Boolean, latency: LatencyResult?) {
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
-    val container by animateColorAsState(
-        when {
-            selected -> MaterialTheme.colorScheme.primaryContainer
-            hovered -> MaterialTheme.colorScheme.surfaceContainerHigh
-            else -> MaterialTheme.colorScheme.surfaceContainerLow
-        },
-        label = "server-container",
-    )
-    Surface(
-        onClick = { m.selectNode(node.id) },
-        shape = RoundedCornerShape(26.dp),
-        color = container,
-        interactionSource = interaction,
-        border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+    val ring by animateColorAsState(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent, colorTween(), label = "server-ring")
+    Column(
+        Modifier
+            .pressMorph(interaction)
+            .glass(TileShape, glassTint(if (hovered || selected) 0.9f else GlassAlpha))
+            .border(1.5.dp, ring, TileShape)
+            .hoverable(interaction)
+            .clickable(interaction, indication = null) { m.selectNode(node.id) }
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    rememberEmojiText(node.name, 15.sp),
-                    Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 2,
-                    minLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (selected) Icon(Icons.Rounded.CheckCircle, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                ProtocolBadge(node.protocol)
-                node.badges.take(2).forEach { FeatureBadge(it) }
-                Spacer(Modifier.weight(1f))
-                LatencyLabel(m, latency)
-            }
+        Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                rememberEmojiText(node.name, 15.sp),
+                Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                minLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            // A cookie with a check: what the design marks "done / chosen" with.
+            if (selected) Box(
+                Modifier.size(26.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(MaterialTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center,
+            ) { Icon(Icons.Rounded.Check, m.text("Выбран", "Chosen"), Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary) }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            ProtocolPlate(node.protocol)
+            node.desktopBadges.take(2).forEach { Plate(it) }
+            Spacer(Modifier.weight(1f))
+            LatencyLabel(m, latency)
         }
     }
 }
@@ -1051,36 +818,18 @@ private val ReadingWidth = 840.dp
     val grid = rememberLazyGridState()
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        PageHeader(
-            m.strings.get(R.string.subscriptions_title),
-            m.strings.plural(R.plurals.sources, profiles.subscriptions.size),
-        ) {
-            OutlinedButton(onClick = { m.refreshAll() }, enabled = !busy, shape = RoundedCornerShape(percent = 50)) {
-                Icon(Icons.Rounded.Refresh, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(m.strings.get(R.string.action_refresh))
-            }
-            FilledTonalButton(onClick = onPair, shape = RoundedCornerShape(percent = 50)) {
-                Icon(Icons.Rounded.QrCodeScanner, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(m.text("С телефона", "From phone"))
-            }
-            Button(onClick = onAdd, shape = RoundedCornerShape(percent = 50)) {
-                Icon(Icons.Rounded.Add, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(m.strings.get(R.string.action_add))
-            }
+        PageTitle(m.strings.get(R.string.subscriptions_title), m.strings.plural(R.plurals.sources, profiles.subscriptions.size)) {
+            PanelIconButton(Icons.Rounded.Refresh, m.strings.get(R.string.action_refresh), Modifier.glass(CircleShape, glassTint()), enabled = !busy) { m.refreshAll() }
+            QuietButton(m.text("С телефона", "From phone"), icon = Icons.Rounded.QrCodeScanner, onClick = onPair)
+            AccentButton(m.strings.get(R.string.action_add), icon = Icons.Rounded.Add, onClick = onAdd)
         }
-        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (busy) LinearWavyProgressIndicator(Modifier.fillMaxWidth())
         if (profiles.subscriptions.isEmpty()) EmptyState(
             Icons.Rounded.Cloud,
             m.strings.get(R.string.subscriptions_empty),
             m.text("Перенеси её из Yumi на телефоне или вставь ссылку.", "Transfer it from Yumi on your phone or paste a link."),
         )
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            // A subscription card is a paragraph and two numbers. Stretched across a wide window
-            // it puts the quota at one end and the expiry at the other with a metre of nothing
-            // between them, so several sit side by side instead.
             LazyVerticalGrid(
                 columns = GridCells.Adaptive(440.dp),
                 state = grid,
@@ -1097,162 +846,165 @@ private val ReadingWidth = 840.dp
     remove?.let { sub ->
         AlertDialog(
             onDismissRequest = { remove = null },
-            shape = CardShape,
-            title = { Text(m.text("Удалить подписку?", "Delete subscription?")) },
-            text = { Text(sub.remoteTitle ?: sub.name) },
-            confirmButton = { TextButton(onClick = { m.removeSubscription(sub.id); remove = null }) { Text(m.strings.get(R.string.action_delete)) } },
+            shape = DialogShape,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = { Text(m.text("Удалить подписку?", "Delete subscription?"), style = MaterialTheme.typography.headlineSmall) },
+            text = { Text(sub.remoteTitle ?: sub.name, style = MaterialTheme.typography.bodyLarge) },
+            confirmButton = { AccentButton(m.strings.get(R.string.action_delete)) { m.removeSubscription(sub.id); remove = null } },
             dismissButton = { TextButton(onClick = { remove = null }) { Text(m.strings.get(R.string.action_cancel)) } },
         )
     }
 }
 
 @Composable private fun SubscriptionCard(m: DesktopModel, sub: Subscription, busy: Boolean, onRemove: () -> Unit) {
-    Panel(Modifier.fillMaxWidth()) {
+    GlassPanel(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                sub.remoteTitle ?: sub.name,
-                Modifier.weight(1f),
-                style = MaterialTheme.typography.headlineSmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            IconButton(onClick = { m.action { m.refresh(sub) } }, enabled = !busy) {
-                Icon(Icons.Rounded.Refresh, m.strings.get(R.string.action_refresh))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Kicker(m.text("Подписка", "Subscription"))
+                Text(sub.remoteTitle ?: sub.name, style = MaterialTheme.typography.titleLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
-            IconButton(onClick = onRemove) {
-                Icon(Icons.Rounded.DeleteOutline, m.strings.get(R.string.action_delete), tint = MaterialTheme.colorScheme.error)
-            }
+            PanelIconButton(Icons.Rounded.Refresh, m.strings.get(R.string.action_refresh), size = 44.dp, enabled = !busy) { m.action { m.refresh(sub) } }
+            PanelIconButton(Icons.Rounded.DeleteOutline, m.strings.get(R.string.action_delete), size = 44.dp, onClick = onRemove)
         }
         val info = sub.userInfo
         val fraction = info?.usedFraction
         if (fraction != null) {
-            // Coloured explicitly rather than left to the default: a quota bar is a reading, and
-            // the accent is what every other reading in this window is set in.
-            LinearProgressIndicator(
+            LinearWavyProgressIndicator(
                 progress = { fraction },
-                modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape),
+                modifier = Modifier.fillMaxWidth(),
                 color = MaterialTheme.colorScheme.primary,
-                trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(
-                    m.strings.get(
-                        R.string.subscriptions_used_of,
-                        m.strings.bytes(info.usedBytes ?: 0L).toString(),
-                        m.strings.bytes(info.totalBytes ?: 0L).toString(),
-                    ),
-                    style = MaterialTheme.typography.bodySmall,
+                    m.strings.get(R.string.subscriptions_used_of, m.strings.bytes(info.usedBytes ?: 0L).toString(), m.strings.bytes(info.totalBytes ?: 0L).toString()),
+                    style = MaterialTheme.typography.bodyMedium,
                 )
                 val days = daysUntil(info.expiresAtEpochSeconds)
                 if (days != null) Text(
                     if (days > 0) m.strings.get(R.string.subscriptions_days_left, days) else m.strings.get(R.string.subscriptions_expired),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (days > 0) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (days > 0) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.tertiary,
                 )
             }
         } else {
-            Text(m.strings.get(R.string.subscriptions_no_quota), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(m.strings.get(R.string.subscriptions_no_quota), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Text(
-            m.strings.get(
-                R.string.subscriptions_updated,
-                m.strings.plural(R.plurals.servers, sub.nodeIds.size),
-                m.strings.relativeTime(sub.lastUpdatedEpochMillis),
-            ),
+            m.strings.get(R.string.subscriptions_updated, m.strings.plural(R.plurals.servers, sub.nodeIds.size), m.strings.relativeTime(sub.lastUpdatedEpochMillis)),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (sub.lastError != null) Text(
-            m.text("Не удалось обновить. Подписка сохранена.", "Refresh failed. Your subscription is saved."),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
-        )
+        if (sub.lastError != null) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.tertiary)
+            Text(m.text("Не удалось обновить. Подписка сохранена.", "Refresh failed. Your subscription is saved."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary)
+        }
     }
 }
 
 /* ── Split tunnelling ─────────────────────────────────────────────────────────────────────── */
 
+/**
+ * What goes through the tunnel and what goes around it.
+ *
+ * Three blocks, in the order the service applies them: the direction, then the databases — which
+ * win over the applications, so a browser sent wholly through the tunnel still opens Russian sites
+ * directly — then the applications, then what a person typed by name or address, which wins over
+ * the databases because it is the most specific thing anybody said.
+ */
 @Composable private fun RoutingPage(m: DesktopModel) {
     val current by m.desktop.state.collectAsState()
     val settings by m.settings.settings.collectAsState()
+    val status by m.status.collectAsState()
     var domains by remember(current.domains) { mutableStateOf(current.domains.joinToString("\n")) }
     var networks by remember(current.networks) { mutableStateOf(current.networks.joinToString("\n")) }
-    var apps by remember(current.applications) { mutableStateOf(current.applications) }
-    var mode by remember(current.splitMode) { mutableStateOf(current.splitMode) }
     var invalid by remember { mutableStateOf(false) }
+    var picking by remember { mutableStateOf(false) }
+    val known by m.knownApps.collectAsState()
+    LaunchedEffect(Unit) { if (known.isEmpty()) m.discoverApps() }
 
     ScrollingColumn {
-        PageHeader(m.text("Туннелирование", "Split tunneling"), m.text("Что идёт через VPN, а что мимо", "What goes through the VPN, and what goes around it"))
-        Panel(Modifier.fillMaxWidth()) {
-            Text(m.text("Куда направлять трафик", "Where traffic goes"), style = MaterialTheme.typography.headlineSmall)
-            SplitMode.entries.forEach { value ->
-                Row(Modifier.fillMaxWidth().clip(TileShape).clickable { mode = value }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(mode == value, { mode = value })
-                    Text(
-                        if (value == SplitMode.ExceptSelected) m.text("Всё через VPN, кроме выбранного", "Everything through VPN except selected")
-                        else m.text("Только выбранное через VPN", "Only selected traffic through VPN"),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
+        PageTitle(m.text("Туннелирование", "Split tunneling"), m.text("Что идёт через VPN, а что мимо", "What goes through the VPN, and what goes around it"))
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Куда направлять трафик", "Where traffic goes"), m.text("Направление", "Direction"))
+            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ModeCard(
+                    Modifier.weight(1f).fillMaxHeight(),
+                    Icons.Rounded.Shield,
+                    m.text("Всё через VPN", "Everything through VPN"),
+                    m.text("Кроме выбранных приложений и сайтов", "Except the apps and sites you choose"),
+                    current.splitMode == SplitMode.ExceptSelected,
+                ) { m.changeDesktop(current.copy(splitMode = SplitMode.ExceptSelected), true) }
+                ModeCard(
+                    Modifier.weight(1f).fillMaxHeight(),
+                    Icons.Rounded.FilterAlt,
+                    m.text("Только выбранное", "Only what you choose"),
+                    m.text("Остальное идёт напрямую", "Everything else goes direct"),
+                    current.splitMode == SplitMode.OnlySelected,
+                ) { m.changeDesktop(current.copy(splitMode = SplitMode.OnlySelected), true) }
             }
-            Toggle(m.text("Локальная сеть напрямую", "Bypass local network"), settings.bypassLan) { m.changeSettings({ s -> s.copy(bypassLan = it) }, true) }
+            SwitchRow(
+                m.text("Локальная сеть напрямую", "Local network directly"),
+                settings.bypassLan,
+                m.text("Роутер, принтер, NAS и перенос подписки с телефона", "Router, printer, NAS and phone transfer"),
+            ) { m.changeSettings({ s -> s.copy(bypassLan = it) }, true) }
         }
-        Panel(Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(m.text("Приложения", "Applications"), Modifier.weight(1f), style = MaterialTheme.typography.headlineSmall)
-                OutlinedButton(
-                    onClick = {
-                        val chooser = JFileChooser()
-                        chooser.fileFilter = FileNameExtensionFilter("Windows applications (*.exe)", "exe")
-                        if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
-                            apps = (apps + RuleValidation.application(chooser.selectedFile.absolutePath)).distinct()
-                        }
-                    },
-                    shape = RoundedCornerShape(percent = 50),
-                ) { Text(m.text("Выбрать .exe", "Choose .exe")) }
+
+        RussiaPanel(m, current, status)
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(
+                m.text("Приложения", "Applications"),
+                if (current.splitMode == SplitMode.ExceptSelected) m.text("Мимо VPN", "Around the VPN") else m.text("Через VPN", "Through the VPN"),
+            ) {
+                AccentButton(m.text("Выбрать", "Choose"), icon = Icons.Rounded.Add) { picking = true }
             }
-            apps.forEach { path ->
+            if (current.applications.isEmpty()) Text(
+                m.text(
+                    "Найди программу в списке запущенных и установленных или впиши имя процесса — например, telegram.exe.",
+                    "Find a program among the running and installed ones, or type a process name — telegram.exe, for example.",
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            current.applications.forEach { process ->
+                val app = known.firstOrNull { it.process.equals(process, true) }
                 Row(
-                    Modifier.fillMaxWidth().clip(TileShape).background(MaterialTheme.colorScheme.surfaceContainer).padding(start = 14.dp),
+                    Modifier.fillMaxWidth().clip(RowShape).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)).padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
-                    Text(path, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.MiddleEllipsis)
-                    IconButton(onClick = { apps = apps - path }) { Icon(Icons.Rounded.Close, m.text("Убрать", "Remove"), Modifier.size(18.dp)) }
+                    AppIcon(rememberAppIcon(app?.path), Icons.Rounded.Terminal)
+                    Column(Modifier.weight(1f)) {
+                        Text(app?.name ?: com.yumi.desktop.platform.AppCatalog.prettify(process), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(process, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                    if (app?.running == true) Plate(m.text("запущено", "running"))
+                    PanelIconButton(Icons.Rounded.Close, m.text("Убрать", "Remove"), size = 40.dp) {
+                        m.changeDesktop(current.copy(applications = current.applications - process), true)
+                    }
                 }
             }
-            OutlinedTextField(
-                domains,
-                { domains = it; invalid = false },
-                Modifier.fillMaxWidth(),
-                label = { Text(m.text("Домены, по одному в строке", "Domains, one per line")) },
-                minLines = 3,
-                shape = TileShape,
-                isError = invalid,
-            )
-            OutlinedTextField(
-                networks,
-                { networks = it; invalid = false },
-                Modifier.fillMaxWidth(),
-                label = { Text(m.text("IP и подсети, по одному в строке", "IP addresses and subnets, one per line")) },
-                minLines = 3,
-                shape = TileShape,
-                isError = invalid,
-            )
+        }
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Сайты и адреса", "Sites and addresses"), m.text("По имени и IP", "By name and IP"))
+            GlassField(domains, { domains = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("Домены, по одному в строке", "Domains, one per line"), placeholder = "example.com", singleLine = false, minLines = 3, isError = invalid)
+            GlassField(networks, { networks = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("IP и подсети, по одному в строке", "IP addresses and subnets, one per line"), placeholder = "203.0.113.0/24", singleLine = false, minLines = 3, isError = invalid)
             Text(
                 m.text(
-                    "Домены включают поддомены. Сторонний защищённый DNS и ECH могут скрыть имя сайта: тогда используй правило приложения или IP. Системный DNS при включённом VPN идёт через выбранный резолвер.",
-                    "Domains include subdomains. External encrypted DNS and ECH can hide site names: use an application or IP rule in that case. System DNS uses your selected resolver through VPN.",
+                    "Домены включают поддомены и действуют сильнее баз: так можно вернуть в VPN отдельный российский сайт. Сторонний защищённый DNS и ECH могут скрыть имя сайта — тогда используй правило приложения или IP.",
+                    "Domains include subdomains and outrank the databases, so a single Russian site can be sent back through the VPN. External encrypted DNS and ECH can hide a site's name — use an application or IP rule then.",
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (invalid) Text(m.text("Проверь домены и IP-адреса.", "Check your domains and IP addresses."), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-            Button(
-                onClick = {
+            if (invalid) Text(m.text("Проверь домены и IP-адреса.", "Check your domains and IP addresses."), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                AccentButton(m.text("Сохранить", "Save")) {
                     try {
                         val next = current.copy(
-                            splitMode = mode,
-                            applications = apps,
                             domains = domains.lines().filter { it.isNotBlank() }.map(RuleValidation::domain).distinct(),
                             networks = networks.lines().filter { it.isNotBlank() }.map(RuleValidation::network).distinct(),
                         )
@@ -1260,10 +1012,100 @@ private val ReadingWidth = 840.dp
                     } catch (_: Exception) {
                         invalid = true
                     }
-                },
-                shape = RoundedCornerShape(percent = 50),
-            ) { Text(m.text("Сохранить правила", "Save rules")) }
-            Text(m.text("Активное соединение будет переподключено.", "An active connection will reconnect."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Text(m.text("Активное соединение переподключится.", "An active connection will reconnect."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+
+    if (picking) AppPickerDialog(
+        m,
+        current.applications,
+        onDone = { chosen -> picking = false; if (chosen != current.applications) m.changeDesktop(current.copy(applications = chosen), true) },
+        onDismiss = { picking = false },
+    )
+}
+
+@Composable private fun ModeCard(modifier: Modifier, icon: ImageVector, title: String, body: String, selected: Boolean, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    val container by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f),
+        colorTween(),
+        label = "mode",
+    )
+    val content = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    Column(
+        modifier
+            .pressMorph(interaction)
+            .clip(TileShape)
+            .background(container)
+            .clickable(interaction, indication = null, onClick = onClick)
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Icon(icon, null, Modifier.size(24.dp), tint = content)
+        Text(title, style = MaterialTheme.typography.titleMedium, color = content)
+        Text(body, style = MaterialTheme.typography.bodyMedium, color = content.copy(alpha = 0.78f))
+    }
+}
+
+/**
+ * Russian sites around the tunnel, by the databases — and the databases themselves, fetched the way
+ * Yumi on the phone fetches them: by themselves the first time, and again with one round button.
+ */
+@Composable private fun RussiaPanel(m: DesktopModel, current: DesktopSettings, status: ServiceStatus) {
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(m.text("Российские сайты напрямую", "Russian sites directly"), m.text("Базы маршрутизации", "Routing databases")) {
+            Switch(current.bypassRussia, { m.changeDesktop(current.copy(bypassRussia = it), true) })
+        }
+        Text(
+            m.text(
+                "Сайты и адреса из баз geosite и geoip идут мимо VPN — даже из приложений, которые целиком отправлены в туннель. YouTube остаётся в туннеле.",
+                "Sites and addresses in the geosite and geoip databases go around the VPN — even from applications sent wholly through the tunnel. YouTube stays in the tunnel.",
+            ),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            Modifier.fillMaxWidth().clip(RowShape).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)).padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            val semantic = LocalSemanticColors.current
+            when {
+                status.geoUpdating -> LoadingIndicator(Modifier.size(28.dp), color = MaterialTheme.colorScheme.primary)
+                status.geoReady -> StateDot(semantic.connected, 10.dp)
+                else -> StateDot(MaterialTheme.colorScheme.outline, 10.dp)
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    when {
+                        status.state == "unavailable" -> m.text("Служба недоступна", "Service unavailable")
+                        status.geoUpdating -> m.text("Скачиваю базы…", "Downloading the databases…")
+                        status.geoReady -> m.text("Базы на месте", "Databases ready")
+                        else -> m.text("Баз ещё нет", "No databases yet")
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    when {
+                        status.geoError != null && !status.geoUpdating -> m.text("Не скачались: ", "Download failed: ") + status.geoError
+                        status.geoReady -> m.strings.bytes(status.geoBytes).toString() + " · " + m.strings.relativeTime(status.geoUpdatedAt)
+                        else -> m.text("Без них правило молчит, а всё идёт по остальным правилам", "Until they arrive this rule is silent and the others decide")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            PanelIconButton(
+                if (status.geoReady) Icons.Rounded.Refresh else Icons.Rounded.Download,
+                m.text("Обновить базы", "Update databases"),
+                size = 48.dp,
+                checked = !status.geoReady && !status.geoUpdating && status.state != "unavailable",
+                enabled = !status.geoUpdating && status.state != "unavailable",
+            ) { m.updateGeo() }
         }
     }
 }
@@ -1278,7 +1120,7 @@ private val ReadingWidth = 840.dp
     val accent = if (speed.phase == SpeedPhase.Upload) semantic.upload else semantic.download
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        PageHeader(
+        PageTitle(
             m.strings.get(R.string.speed_title),
             when {
                 speed.phase == SpeedPhase.Failed -> speed.message ?: m.strings.get(R.string.speed_phase_failed)
@@ -1287,168 +1129,118 @@ private val ReadingWidth = 840.dp
                 status.state == "connected" -> m.text("Через VPN", "Through the tunnel")
                 else -> m.text("Напрямую — туннель выключен, это канал самого ПК", "Direct — the tunnel is off, this is your PC's own link")
             },
-
         )
-        // Two stages: the dial, and what the dial produced. The dial is on screen before the test
-        // starts as well as during it — resting at zero with its scale showing, which is what a
-        // dial is for. A screen that only grows an instrument once you press the button leaves the
-        // reading with nothing to be read against.
         if (speed.hasResult && !running) {
             SpeedResult(m.strings.get(R.string.connect_rate_download), Icons.Rounded.ArrowDownward, m.strings.megabits(speed.downloadBytesPerSecond), speed.downloadSeries, semantic.download, Modifier.weight(1f))
             SpeedResult(m.strings.get(R.string.connect_rate_upload), Icons.Rounded.ArrowUpward, m.strings.megabits(speed.uploadBytesPerSecond), speed.uploadSeries, semantic.upload, Modifier.weight(1f))
         } else {
-            Panel(Modifier.weight(1f).fillMaxWidth()) {
-                BoxWithConstraints(
-                    Modifier.weight(1f).fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
+            GlassPanel(Modifier.weight(1f).fillMaxWidth()) {
+                BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     val side = minOf(maxWidth, maxHeight)
-                    // The wedge under the hub is a fixed fraction of the dial, and type is not.
-                    // At 1280 the dial is four hundred points across and the invitation sits in it
-                    // comfortably; shrink the window and the dial halves while the words stay at
-                    // 26 sp, until they lie across the needle and the last two numbers of the
-                    // scale. Past this size the dial keeps its own face and the words go under it.
                     val roomy = side >= 320.dp
                     SpeedGauge(
                         bytesPerSecond = speed.liveBytesPerSecond,
                         accent = accent,
-                        trackColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                        trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
                         modifier = Modifier.size(side),
                     )
-                    // Below the hub, in the wedge the dial leaves open at the bottom. Centred, it
-                    // would sit on the needle's pivot with the needle sweeping through the digits.
-                    Column(
-                        Modifier.offset(y = side * 0.26f).widthIn(max = side * 0.86f),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
+                    Column(Modifier.offset(y = side * 0.26f).widthIn(max = side * 0.86f), horizontalAlignment = Alignment.CenterHorizontally) {
                         if (running) {
                             val reading = m.strings.megabits(speed.liveBytesPerSecond)
-                            Text(
-                                reading.value,
-                                style = (if (roomy) MaterialTheme.typography.displayLarge else MaterialTheme.typography.headlineLarge)
-                                    .copy(fontFeatureSettings = "tnum"),
-                            )
+                            Text(reading.value, style = (if (roomy) MaterialTheme.typography.displayLarge else MaterialTheme.typography.headlineLarge).copy(fontFeatureSettings = "tnum"))
                             Text(reading.unit, style = MaterialTheme.typography.labelLarge, color = accent)
                             if (roomy) {
                                 Spacer(Modifier.height(10.dp))
-                                Text(
-                                    m.strings.get(speed.phase.labelRes),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    textAlign = TextAlign.Center,
-                                )
+                                Text(m.strings.get(speed.phase.labelRes), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                             }
                         } else if (roomy) {
-                            // The invitation and nothing else. At rest the needle lies along the
-                            // bottom-left spoke and passes straight through this wedge, so a line
-                            // of explanation put here comes out with a needle drawn across it —
-                            // it goes under the dial instead. On a small dial even this much is
-                            // too much, and the line below the dial says it on its own.
-                            Text(m.text("Замерь канал", "Measure the link"), style = MaterialTheme.typography.headlineMedium)
+                            Text(m.text("Замерь канал", "Measure the link"), style = MaterialTheme.typography.headlineSmall)
                         }
                     }
                 }
                 if (!running) Text(
-                    if (status.state == "connected")
-                        m.text("Тест пройдёт через туннель и покажет, что даёт выбранный сервер.", "The test runs through the tunnel and shows what the chosen server gives you.")
-                    else
-                        m.text("Туннель выключен, так что будет измерен канал самого ПК.", "The tunnel is off, so this measures your PC's own link."),
+                    if (status.state == "connected") m.text("Тест пройдёт через туннель и покажет, что даёт выбранный сервер.", "The test runs through the tunnel and shows what the chosen server gives you.")
+                    else m.text("Туннель выключен, так что будет измерен канал самого ПК.", "The tunnel is off, so this measures your PC's own link."),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 if (running) {
-                    SpeedTrace(
-                        samples = speed.series,
-                        accent = accent,
-                        gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
-                        modifier = Modifier.fillMaxWidth().height(88.dp),
-                    )
-                    LinearProgressIndicator(
+                    SpeedTrace(samples = speed.series, accent = accent, gridColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f), modifier = Modifier.fillMaxWidth().height(88.dp))
+                    LinearWavyProgressIndicator(
                         progress = { speed.phaseProgress },
                         modifier = Modifier.fillMaxWidth(),
                         color = accent,
-                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
                     )
                 }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (speed.latencyMillis > 0) Chip(m.strings.get(R.string.speed_latency_chip, speed.latencyMillis))
-            if (speed.jitterMillis > 0) Chip(m.strings.get(R.string.speed_jitter_chip, speed.jitterMillis))
-            if (speed.phase == SpeedPhase.Failed) Chip(m.strings.get(R.string.speed_interrupted))
+            if (speed.latencyMillis > 0) Plate(m.strings.get(R.string.speed_latency_chip, speed.latencyMillis))
+            if (speed.jitterMillis > 0) Plate(m.strings.get(R.string.speed_jitter_chip, speed.jitterMillis))
+            if (speed.phase == SpeedPhase.Failed) Plate(m.strings.get(R.string.speed_interrupted))
         }
-        Button(
-            onClick = { if (running) m.cancelSpeed() else m.startSpeed() },
-            enabled = status.state !in listOf("connecting", "disconnecting"),
-            // Sits low, near the bottom edge of the window, where the hand already is.
-            modifier = Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 6.dp).height(84.dp),
-            shape = RoundedCornerShape(if (running) 30.dp else 42.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (running) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.primary,
-                contentColor = if (running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimary,
-            ),
+        val interaction = remember { MutableInteractionSource() }
+        val enabled = status.state !in listOf("connecting", "disconnecting")
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .padding(bottom = 6.dp)
+                .height(84.dp)
+                .pressMorph(interaction, enabled)
+                .then(
+                    if (running) Modifier.glass(RoundedCornerShape(Radii.extraLarge), glassTint()).border(1.5.dp, accent, RoundedCornerShape(Radii.extraLarge))
+                    else Modifier.clip(RoundedCornerShape(Radii.extraExtraLarge)).background(MaterialTheme.colorScheme.primary),
+                )
+                .clickable(interaction, indication = null, enabled = enabled) { if (running) m.cancelSpeed() else m.startSpeed() },
+            contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                when {
-                    running -> Icons.Rounded.Stop
-                    speed.hasResult -> Icons.Rounded.Refresh
-                    else -> Icons.Rounded.PlayArrow
-                },
-                null,
-                Modifier.size(26.dp),
-            )
-            Spacer(Modifier.width(12.dp))
-            Text(
-                m.strings.get(
+            val ink = if (running) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onPrimary
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
                     when {
-                        running -> R.string.speed_stop
-                        speed.hasResult -> R.string.speed_again
-                        else -> R.string.speed_start
+                        running -> Icons.Rounded.Stop
+                        speed.hasResult -> Icons.Rounded.Refresh
+                        else -> Icons.Rounded.PlayArrow
                     },
-                ),
-                style = MaterialTheme.typography.titleLarge,
-            )
+                    null,
+                    Modifier.size(26.dp),
+                    tint = ink,
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    m.strings.get(
+                        when {
+                            running -> R.string.speed_stop
+                            speed.hasResult -> R.string.speed_again
+                            else -> R.string.speed_start
+                        },
+                    ),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = ink,
+                )
+            }
         }
     }
 }
 
-/**
- * One direction's result: the figure, then the shape it was made of. An average alone cannot
- * separate a steady link from one that burst and stalled to the same mean.
- */
-@Composable private fun SpeedResult(
-    label: String,
-    icon: ImageVector,
-    value: ValueAndUnit,
-    samples: List<Long>,
-    accent: Color,
-    modifier: Modifier,
-) {
-    Column(
-        modifier.fillMaxWidth().clip(CardShape).background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 20.dp, vertical = 16.dp),
-    ) {
+@Composable private fun SpeedResult(label: String, icon: ImageVector, value: ValueAndUnit, samples: List<Long>, accent: Color, modifier: Modifier) {
+    GlassPanel(modifier.fillMaxWidth(), padding = PaddingValues(horizontal = 22.dp, vertical = 18.dp), spacing = 10.dp) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(30.dp).clip(CircleShape).background(accent.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
-                Icon(icon, null, Modifier.size(17.dp), tint = accent)
+            Box(Modifier.size(34.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(accent.copy(alpha = 0.18f)), contentAlignment = Alignment.Center) {
+                Icon(icon, null, Modifier.size(18.dp), tint = accent)
             }
-            Spacer(Modifier.width(10.dp))
-            Text(label.uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(12.dp))
+            Kicker(label)
             Spacer(Modifier.weight(1f))
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(value.value, style = MaterialTheme.typography.displaySmall.copy(fontFeatureSettings = "tnum"), color = accent)
                 Text(value.unit, style = MaterialTheme.typography.labelMedium, color = accent.copy(alpha = 0.8f), modifier = Modifier.padding(bottom = 6.dp))
             }
         }
-        Spacer(Modifier.height(10.dp))
-        SpeedTrace(
-            samples = samples,
-            accent = accent,
-            gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
-            live = false,
-            modifier = Modifier.fillMaxWidth().weight(1f),
-        )
+        SpeedTrace(samples = samples, accent = accent, gridColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f), live = false, modifier = Modifier.fillMaxWidth().weight(1f))
     }
 }
 
@@ -1462,86 +1254,74 @@ private val ReadingWidth = 840.dp
     var invalid by remember { mutableStateOf(false) }
 
     ScrollingColumn {
-        PageHeader(m.text("Настройки", "Settings"), "Yumi Desktop 0.1.2 · Xray · GPL-3.0-or-later")
-        Panel(Modifier.fillMaxWidth()) {
-            Text(m.text("Внешний вид", "Appearance"), style = MaterialTheme.typography.headlineSmall)
-            ChipRow(m.text("Тема", "Theme")) {
-                ThemeMode.entries.forEach { mode ->
-                    FilterChip(settings.themeMode == mode, { m.changeSettings({ it.copy(themeMode = mode) }) }, label = { Text(m.strings.get(mode.labelRes)) })
-                }
-            }
-            PaletteRow(m, settings, desktop)
-            Toggle("AMOLED", settings.amoled, m.text("Чёрный фон вместо тёмно-синего", "True black instead of deep blue")) { m.changeSettings({ s -> s.copy(amoled = it) }) }
-            ChipRow(m.text("Фигура", "Figure")) {
-                Visualizer.entries.forEach { value ->
-                    FilterChip(settings.visualizer == value, { m.changeSettings({ it.copy(visualizer = value) }) }, label = { Text(m.strings.get(value.labelRes)) })
-                }
-            }
-            ChipRow(m.text("Язык", "Language")) {
-                AppLanguage.entries.forEach { lang ->
-                    FilterChip(settings.language == lang, { m.changeSettings({ it.copy(language = lang) }) }, label = { Text(m.strings.get(lang.labelRes)) })
-                }
-            }
+        PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later")
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Защита", "Protection"), m.text("Килл свитч", "Kill switch"))
+            SwitchRow(
+                m.text("Блокировать интернет без VPN", "Block the internet without the VPN"),
+                desktop.killSwitch,
+                m.text(
+                    "С подключения и до отключения ничего не уходит мимо туннеля — даже если сервер упал или служба перезапускается. Локальная сеть остаётся, если она идёт напрямую.",
+                    "From connecting until you disconnect nothing leaves around the tunnel — even if the server drops or the service restarts. The local network stays reachable while it bypasses the tunnel.",
+                ),
+            ) { m.changeDesktop(desktop.copy(killSwitch = it), true) }
         }
-        Panel(Modifier.fillMaxWidth()) {
-            Text(m.text("Соединение и DNS", "Connection and DNS"), style = MaterialTheme.typography.headlineSmall)
-            OutlinedTextField(
-                dns,
-                { dns = it; invalid = false },
-                Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text(m.text("DNS-резолвер", "DNS resolver")) },
-                shape = TileShape,
-                isError = invalid,
-            )
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Внешний вид", "Appearance"))
+            ChoiceRow(m.text("Тема", "Theme"), ThemeMode.entries, settings.themeMode, { m.strings.get(it.labelRes) }) { mode -> m.changeSettings({ it.copy(themeMode = mode) }) }
+            PaletteRow(m, settings, desktop)
+            SwitchRow("AMOLED", settings.amoled, m.text("Чёрный фон вместо тёмного", "True black instead of dark")) { m.changeSettings({ s -> s.copy(amoled = it) }) }
+            SwitchRow(m.text("Живой фон", "Live backdrop"), desktop.liveBackdrop, m.text("Фигуры за стеклом медленно плывут и следят за курсором", "The shapes behind the glass drift and follow the pointer")) {
+                m.changeDesktop(desktop.copy(liveBackdrop = it))
+            }
+            ChoiceRow(m.text("Фигура", "Figure"), Visualizer.entries, settings.visualizer, { m.strings.get(it.labelRes) }) { value -> m.changeSettings({ it.copy(visualizer = value) }) }
+            ChoiceRow(m.text("Язык", "Language"), AppLanguage.entries, settings.language, { m.strings.get(it.labelRes) }) { lang -> m.changeSettings({ it.copy(language = lang) }) }
+        }
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Соединение и DNS", "Connection and DNS"))
+            GlassField(dns, { dns = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("DNS-резолвер", "DNS resolver"), isError = invalid)
             Text(
                 m.text("DoH (https://), TCP, UDP или IP-адрес. Без автоматической замены резолвера.", "DoH (https://), TCP, UDP or an IP address. No automatic resolver substitution."),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            OutlinedTextField(mtu, { mtu = it; invalid = false }, Modifier.width(220.dp), singleLine = true, label = { Text("MTU · 1280–9000") }, shape = TileShape, isError = invalid)
-            Toggle("IPv6", settings.enableIpv6) { m.changeSettings({ s -> s.copy(enableIpv6 = it) }, true) }
-            Button(
-                onClick = {
-                    val value = mtu.toIntOrNull()
-                    val resolver = runCatching {
-                        val raw = dns.trim()
-                        if ("://" in raw) {
-                            val uri = java.net.URI(raw)
-                            require(uri.scheme in listOf("https", "tcp", "udp") && !uri.host.isNullOrBlank() && uri.userInfo == null)
-                        } else {
-                            RuleValidation.domain(raw).let {}
-                        }
-                        raw
-                    }.recoverCatching { RuleValidation.network(dns.trim()).also { require('/' !in it) } }.getOrNull()
-                    if (value == null || value !in 1280..9000 || resolver == null) invalid = true
-                    else m.changeSettings({ it.copy(remoteDns = resolver, mtu = value) }, true)
-                },
-                shape = RoundedCornerShape(percent = 50),
-            ) { Text(m.text("Сохранить соединение", "Save connection settings")) }
-            if (invalid) Text(m.text("Проверь DNS и MTU.", "Check DNS and MTU."), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-        }
-        Panel(Modifier.fillMaxWidth()) {
-            Text(m.text("Поведение", "Behavior"), style = MaterialTheme.typography.headlineSmall)
-            Toggle(m.text("Запускать при входе в Windows", "Launch at Windows sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
-            Toggle(m.text("Обновлять подписки автоматически", "Refresh subscriptions automatically"), settings.subscriptionAutoUpdate) { m.changeSettings({ s -> s.copy(subscriptionAutoUpdate = it) }) }
-            // Shown whatever the switch says, because the interval is what the switch means: a
-            // greyed-out number would leave somebody turning the switch on to find out what they
-            // had just agreed to. Refreshing on launch happens regardless — see DesktopModel.
-            ChipRow(m.text("Как часто", "How often")) {
-                UpdateIntervals.forEach { minutes ->
-                    FilterChip(
-                        settings.subscriptionUpdateMinutes == minutes,
-                        { m.changeSettings({ it.copy(subscriptionUpdateMinutes = minutes) }) },
-                        label = { Text(intervalLabel(m, minutes)) },
-                        enabled = settings.subscriptionAutoUpdate,
-                    )
-                }
+            GlassField(mtu, { mtu = it; invalid = false }, Modifier.width(220.dp), label = "MTU · 1280–9000", isError = invalid)
+            SwitchRow("IPv6", settings.enableIpv6) { m.changeSettings({ s -> s.copy(enableIpv6 = it) }, true) }
+            AccentButton(m.text("Сохранить соединение", "Save connection settings")) {
+                val value = mtu.toIntOrNull()
+                val resolver = runCatching {
+                    val raw = dns.trim()
+                    if ("://" in raw) {
+                        val uri = java.net.URI(raw)
+                        require(uri.scheme in listOf("https", "tcp", "udp") && !uri.host.isNullOrBlank() && uri.userInfo == null)
+                    } else {
+                        RuleValidation.domain(raw).let {}
+                    }
+                    raw
+                }.recoverCatching { RuleValidation.network(dns.trim()).also { require('/' !in it) } }.getOrNull()
+                if (value == null || value !in 1280..9000 || resolver == null) invalid = true
+                else m.changeSettings({ it.copy(remoteDns = resolver, mtu = value) }, true)
             }
+            if (invalid) Text(m.text("Проверь DNS и MTU.", "Check DNS and MTU."), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
+        }
+
+        GlassPanel(Modifier.fillMaxWidth()) {
+            SectionTitle(m.text("Поведение", "Behavior"))
+            SwitchRow(m.text("Запускать при входе в Windows", "Launch at Windows sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
+            SwitchRow(m.text("Обновлять подписки автоматически", "Refresh subscriptions automatically"), settings.subscriptionAutoUpdate) { m.changeSettings({ s -> s.copy(subscriptionAutoUpdate = it) }) }
+            if (settings.subscriptionAutoUpdate) ChoiceRow(
+                m.text("Как часто", "How often"),
+                UpdateIntervals,
+                settings.subscriptionUpdateMinutes,
+                { intervalLabel(m, it) },
+            ) { minutes -> m.changeSettings({ it.copy(subscriptionUpdateMinutes = minutes) }) }
             Text(
                 m.text(
-                    "Крестик сворачивает окно в трей. Выход через меню трея отключает VPN. Сервер меняется только по твоему выбору.",
-                    "Closing the window keeps Yumi in the tray. Exit from the tray disconnects VPN. Servers change only when you choose them.",
+                    "Крестик сворачивает окно в трей. Выход через меню трея отключает VPN. Сервер меняется только по твоему выбору — сам он не переключается никогда.",
+                    "Closing the window keeps Yumi in the tray. Exit from the tray disconnects VPN. Servers change only when you choose them — never by themselves.",
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1550,61 +1330,48 @@ private val ReadingWidth = 840.dp
     }
 }
 
-/**
- * How often subscriptions are re-read, as a row to pick from rather than a number to type.
- *
- * Half an hour to a day. Below it the provider is being asked more often than it changes; above it
- * the list is older than the session it is being used in. The app also refreshes once on launch,
- * so the shortest interval is not there to make the list fresh at the start of an evening — it is
- * there for somebody whose provider rotates servers during one.
- */
+/** How often subscriptions are re-read: half an hour to a day. */
 private val UpdateIntervals = listOf(30, 60, 180, 360, 720, 1440)
 
-@Composable private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
+private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
     minutes % 60 == 0 -> m.text("${minutes / 60} ч", "${minutes / 60} h")
     else -> m.text("$minutes мин", "$minutes min")
 }
 
 /**
- * The palettes, shown as what they are.
- *
- * Named chips would make the user read six words and then guess which one is the pale green. A
- * swatch answers the question it is asked, and each one is painted in its own scheme's accent
- * rather than in the current one — the row is the choice, not a label for it.
+ * The palettes, shown as what they are: swatches in each scheme's own accent. The chosen one turns
+ * into a cookie with a check — the design's mark for "this one".
  */
 @Composable private fun PaletteRow(m: DesktopModel, settings: AppSettings, desktop: DesktopSettings) {
     val dark = isDark(settings)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            m.text("Палитра", "Palette").uppercase() + " · " + m.text(desktop.palette.ru, desktop.palette.en),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Kicker(m.text("Палитра", "Palette") + " · " + m.text(desktop.palette.ru, desktop.palette.en))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
             Palette.entries.forEach { option ->
                 val scheme = remember(option, dark) { option.scheme(dark) }
                 val chosen = option == desktop.palette
-                Surface(
-                    onClick = { m.changeDesktop(desktop.copy(palette = option)) },
-                    modifier = Modifier.size(42.dp).testTag("palette-${option.name}"),
-                    shape = CircleShape,
-                    color = scheme.primary,
-                    contentColor = scheme.onPrimary,
-                    border = if (chosen) BorderStroke(2.dp, MaterialTheme.colorScheme.onSurface) else null,
+                val interaction = remember { MutableInteractionSource() }
+                val size by animateDpAsState(if (chosen) 50.dp else 42.dp, Springs.toggle(), label = "swatch")
+                Box(
+                    Modifier
+                        .size(50.dp)
+                        .testTag("palette-${option.name}"),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        if (chosen) Icon(Icons.Rounded.Check, m.text(option.ru, option.en), Modifier.size(19.dp))
+                    Box(
+                        Modifier
+                            .size(size)
+                            .pressMorph(interaction)
+                            .clip(if (chosen) MaterialShapes.Cookie9Sided.toShape() else CircleShape)
+                            .background(scheme.primary)
+                            .clickable(interaction, indication = null) { m.changeDesktop(desktop.copy(palette = option)) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (chosen) Icon(Icons.Rounded.Check, m.text(option.ru, option.en), Modifier.size(20.dp), tint = scheme.onPrimary)
                     }
                 }
             }
         }
-    }
-}
-
-@Composable private fun ChipRow(label: String, content: @Composable RowScope.() -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(label.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), content = content)
     }
 }
 
@@ -1614,19 +1381,16 @@ private val UpdateIntervals = listOf(30, 60, 180, 360, 720, 1440)
     var raw by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onClose,
-        shape = CardShape,
-        title = { Text(m.text("Добавить в Yumi", "Add to Yumi"), style = MaterialTheme.typography.headlineMedium) },
+        shape = DialogShape,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = { Text(m.text("Добавить в Yumi", "Add to Yumi"), style = MaterialTheme.typography.displaySmall) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(m.text("Ссылка подписки или конфигурация сервера", "Subscription link or server configuration"), style = MaterialTheme.typography.bodyMedium)
-                OutlinedTextField(raw, { raw = it }, Modifier.width(460.dp), minLines = 4, maxLines = 8, shape = TileShape)
+                Text(m.text("Ссылка подписки или конфигурация сервера", "Subscription link or server configuration"), style = MaterialTheme.typography.bodyLarge)
+                GlassField(raw, { raw = it }, Modifier.width(480.dp), placeholder = "https://… · vless://…", singleLine = false, minLines = 4)
             }
         },
-        confirmButton = {
-            Button(onClick = { m.importText(raw); onClose() }, enabled = raw.isNotBlank(), shape = RoundedCornerShape(percent = 50)) {
-                Text(m.strings.get(R.string.action_add))
-            }
-        },
+        confirmButton = { AccentButton(m.strings.get(R.string.action_add), enabled = raw.isNotBlank()) { m.importText(raw); onClose() } },
         dismissButton = { TextButton(onClick = onClose) { Text(m.strings.get(R.string.action_cancel)) } },
     )
 }
@@ -1638,8 +1402,9 @@ private val UpdateIntervals = listOf(30, 60, 180, 360, 720, 1440)
     DisposableEffect(Unit) { onDispose { m.pairing.stop() } }
     AlertDialog(
         onDismissRequest = onClose,
-        shape = CardShape,
-        title = { Text(m.text("Подписка с телефона", "Subscription from phone"), style = MaterialTheme.typography.headlineMedium) },
+        shape = DialogShape,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = { Text(m.text("Подписка с телефона", "Subscription from phone"), style = MaterialTheme.typography.displaySmall) },
         text = {
             Column(Modifier.width(440.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text(
@@ -1647,44 +1412,42 @@ private val UpdateIntervals = listOf(30, 60, 180, 360, 720, 1440)
                         "Подключи устройства к одной локальной сети. В Yumi на телефоне открой сканер, отсканируй QR и выбери подписку.",
                         "Connect both devices to the same local network. Open the scanner in Yumi on your phone, scan the QR and choose a subscription.",
                     ),
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.bodyLarge,
                 )
                 when (val s = state) {
                     is PairingReceiverState.Waiting -> {
-                        Surface(shape = TileShape, color = Color.White) {
+                        Surface(shape = RoundedCornerShape(Radii.largeIncreased), color = Color.White) {
                             QrCode(s.invite.encode(), Modifier.size(290.dp).padding(14.dp))
                         }
-                        Text(m.text("Одноразовый код · 5 минут", "Single-use code · 5 minutes"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Kicker(m.text("Одноразовый код · 5 минут", "Single-use code · 5 minutes"))
                     }
                     is PairingReceiverState.Receiving -> {
-                        ShapeSpinner(MaterialTheme.colorScheme.primary, size = 34.dp)
-                        Text(m.text("Сохраняем подписку…", "Saving subscription…"), style = MaterialTheme.typography.bodyMedium)
+                        LoadingIndicator(color = MaterialTheme.colorScheme.primary)
+                        Text(m.text("Сохраняем подписку…", "Saving subscription…"), style = MaterialTheme.typography.bodyLarge)
                     }
                     is PairingReceiverState.Complete -> {
-                        Icon(Icons.Rounded.CheckCircle, null, Modifier.size(60.dp), tint = MaterialTheme.colorScheme.primary)
+                        Box(Modifier.size(64.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
+                            Icon(Icons.Rounded.Check, null, Modifier.size(32.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                        }
                         Text(
                             if (s.result.status == "saved_refresh_failed") m.text("Подписка сохранена. Обнови её после проверки соединения.", "Subscription saved. Refresh it after checking your connection.")
                             else m.text("Подписка перенесена", "Subscription transferred"),
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.bodyLarge,
                         )
                     }
-                    is PairingReceiverState.Failed -> Text(
-                        m.text(
-                            "Не удалось принять подписку. Проверь локальную сеть, брандмауэр и срок действия QR.",
-                            "Transfer failed. Check your local network, firewall and QR expiry.",
-                        ),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.error,
+                    is PairingReceiverState.Failed -> TroubleNote(
+                        Icons.Rounded.WifiOff,
+                        m.text("Не удалось принять подписку", "Transfer failed"),
+                        m.text("Проверь локальную сеть, брандмауэр и срок действия QR.", "Check your local network, firewall and QR expiry."),
+                        action = m.text("Новый QR", "New QR"),
+                        onAction = { m.startPairing() },
                     )
-                    else -> ShapeSpinner(MaterialTheme.colorScheme.primary, size = 34.dp)
+                    else -> LoadingIndicator(color = MaterialTheme.colorScheme.primary)
                 }
                 if (addresses.size > 1) addresses.forEach { address ->
-                    Row(
-                        Modifier.fillMaxWidth().clip(TileShape).clickable { m.selectedAddress.value = address; m.startPairing() },
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
+                    Row(Modifier.fillMaxWidth().clip(RowShape).clickable { m.selectedAddress.value = address; m.startPairing() }, verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(address == selected, { m.selectedAddress.value = address; m.startPairing() })
-                        Text(address.label, style = MaterialTheme.typography.bodySmall)
+                        Text(address.label, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
             }
@@ -1698,8 +1461,9 @@ private val UpdateIntervals = listOf(30, 60, 180, 360, 720, 1440)
 
 private fun serviceError(m: DesktopModel, code: String) = when (code) {
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
+    "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")
+    "kill_switch_failed" -> m.text("Не удалось включить килл свитч, поэтому туннель не поднят. Выключи его в настройках, чтобы подключиться без него.", "The kill switch could not be raised, so the tunnel was not started. Turn it off in Settings to connect without it.")
     "invalid_configuration", "forbidden_field", "unsupported_protocol" ->
         m.text("Конфигурация сервера не поддерживается ядром.", "The server configuration is not supported by the core.")
     else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.")
 }
-

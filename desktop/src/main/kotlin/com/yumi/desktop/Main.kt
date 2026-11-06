@@ -20,15 +20,21 @@ import java.io.RandomAccessFile
 import javax.imageio.ImageIO
 
 fun main(args: Array<String>) {
-    val smoke = "--ui-smoke" in args
-    if(smoke) System.setProperty("yumi.dataDir",File(".local/ui-smoke").absolutePath)
+    val demo = "--ui-demo" in args
+    val smoke = "--ui-smoke" in args || demo
+    if(smoke) System.setProperty("yumi.dataDir",File(if(demo) ".local/ui-demo" else ".local/ui-smoke").absolutePath)
     val directory = DesktopPlatform.dataDirectory()
+    if(demo) seedDemo(directory)
     val lockFile = RandomAccessFile(File(directory,"instance.lock"),"rw")
     val lock = lockFile.channel.tryLock()
     if(lock==null){File(directory,"activate").writeText(System.nanoTime().toString());lockFile.close();return}
-    val backend = if(smoke) object:TunnelBackend {
-        override suspend fun request(request:ServiceRequest)=ServiceStatus(state="unavailable",error="service_unavailable")
-    } else WindowsTunnelBackend()
+    val backend = when {
+        demo -> DemoBackend()
+        smoke -> object:TunnelBackend {
+            override suspend fun request(request:ServiceRequest)=ServiceStatus(state="unavailable",error="service_unavailable")
+        }
+        else -> WindowsTunnelBackend()
+    }
     val model=DesktopModel(backend,directory)
     application {
         var visible by remember{mutableStateOf("--tray" !in args)}
@@ -59,19 +65,34 @@ fun main(args: Array<String>) {
             LaunchedEffect(dark, chrome.background, chrome.onSurfaceVariant) {
                 DesktopPlatform.applyWindowChrome(window.windowHandle, dark, chrome.background.toArgb(), chrome.onSurfaceVariant.toArgb())
             }
-            YumiApp(model,smokePage)
+            // The window's place on the screen, for the backdrop: dragging the window knocks the
+            // shapes behind the glass about. See SceneMotion in Glass.kt.
+            val windowMotion = remember { WindowMotion() }
+            DisposableEffect(window) {
+                val listener = object : java.awt.event.ComponentAdapter() {
+                    override fun componentMoved(e: java.awt.event.ComponentEvent) {
+                        windowMotion.x = window.x; windowMotion.y = window.y; windowMotion.known = true
+                    }
+                }
+                windowMotion.x = window.x; windowMotion.y = window.y; windowMotion.known = true
+                window.addComponentListener(listener)
+                onDispose { window.removeComponentListener(listener) }
+            }
+            CompositionLocalProvider(LocalWindowMotion provides windowMotion) { YumiApp(model,smokePage) }
             LaunchedEffect(Unit) {
                 val activation=File(directory,"activate");var stamp=activation.lastModified()
                 while(isActive){delay(500);val next=activation.lastModified();if(next!=stamp){stamp=next;visible=true;window.toFront();window.requestFocus()}}
             }
             if(smoke) LaunchedEffect(Unit) {
                 val output=File(".local/screenshots").also(File::mkdirs)
+                val prefix=if(demo) "demo" else "smoke"
+                if(demo){delay(1500);model.toggleConnection();delay(3500)}
                 for(theme in listOf(ThemeMode.Dark,ThemeMode.Light)) {
                     model.settings.update{it.copy(themeMode=theme)}
                     for(page in Page.entries){
                         smokePage=page;delay(2000)
                         val rectangle=Rectangle(window.contentPane.locationOnScreen,window.contentPane.size)
-                        ImageIO.write(Robot().createScreenCapture(rectangle),"png",File(output,"${theme.name}-${page.name}.png"))
+                        ImageIO.write(Robot().createScreenCapture(rectangle),"png",File(output,"$prefix-${theme.name}-${page.name}.png"))
                     }
                 }
                 close()

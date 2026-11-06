@@ -29,7 +29,9 @@ interface TunnelBackend {
 }
 
 class WindowsTunnelBackend : TunnelBackend {
-    private val json = Json { encodeDefaults = true; ignoreUnknownKeys = false }
+    // Unknown keys are tolerated on the way in: a service a version ahead may report more than
+    // this window knows to show, and that is no reason to call it unavailable.
+    private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
     override suspend fun request(request: ServiceRequest): ServiceStatus = withContext(Dispatchers.IO) {
         if (!DesktopPlatform.isWindows) return@withContext ServiceStatus(state = "unavailable", error = "platform_not_supported")
         try {

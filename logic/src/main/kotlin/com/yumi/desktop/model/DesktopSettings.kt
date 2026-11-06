@@ -23,6 +23,8 @@ import com.mydrop.vpn.core.net.isNumericAddress
     /** Russian sites and addresses around the tunnel, by the geo databases, above every
      *  application rule. Inert until the databases are downloaded. */
     val bypassRussia: Boolean = true,
+    /** The shapes behind the glass drift. Off holds them still and costs nothing at all. */
+    val liveBackdrop: Boolean = true,
 )
 
 object RuleValidation {

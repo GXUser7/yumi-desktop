@@ -5,7 +5,8 @@ name: installer
 # every push builds the installer the same way tools/build.ps1 does on a desk, tests included, and
 # a tag publishes it.
 #
-# A pushed tag v<version> publishes a pre-release with the installer and its checksum attached,
+# A pushed tag v<version> — or a manual run given one in `release`, which creates the tag on the
+# commit it built — publishes a pre-release with the installer and its checksum attached,
 # described by docs/releases/v<version>.md with the SHA-256 appended. Without that file the release
 # stays a draft: nothing goes out under the project's name with notes nobody wrote.
 
@@ -15,6 +16,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish this build as the given tag, e.g. v0.2.0 (empty: build only)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -67,7 +73,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release, 'v')
     needs: windows
     runs-on: ubuntu-latest
     permissions:
@@ -84,10 +90,11 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          version="${TAG#v}"
+          notes="docs/releases/${TAG}.md"
           # Written on Windows: CRLF, and "<hash>  <name>". Only the hash goes into the notes.
           checksum=$(tr -d '\r' < dist/*.sha256 | cut -d' ' -f1)
           if [ -f "$notes" ]; then
@@ -98,8 +105,11 @@ jobs:
             draft="--draft"
           fi
           printf '\n### Проверка файла\n\n```\nSHA-256  %s\n```\n' "$checksum" >> release-notes.md
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          # --target names the commit that was built; it creates the tag when a manual run
+          # asked for one, and agrees with it when the run came from the tag itself.
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             $draft --prerelease \
             --title "Yumi Desktop $version — бета" \
             --notes-file release-notes.md

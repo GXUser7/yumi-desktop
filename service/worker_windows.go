@@ -52,6 +52,9 @@ func worker() {
     defer func(){cleanAdapter();instance.Close()}()
     if err=instance.Start();err!=nil { fail("tunnel_start_failed",err);return }
     initial.Status.State="connected";initial.Status.ConnectedAt=time.Now().UnixMilli()
+    // The adapter the core just made, for the supervisor's kill switch to let through. Opened
+    // rather than created, so closing the handle leaves the adapter where it is.
+    if adapter,err:=wintun.OpenAdapter("Yumi");err==nil { initial.Status.TunLUID=adapter.LUID();_=adapter.Close() }
     manager,_:=instance.GetFeature(stats.ManagerType()).(stats.Manager)
     stopped:=make(chan struct{})
     go func(){ _,_=io.Copy(io.Discard,input);close(stopped) }()

@@ -4,19 +4,23 @@ package main
 
 import (
     "bufio"
+    "context"
     "encoding/binary"
     "encoding/json"
     "errors"
     "flag"
     "io"
     "net"
+    "net/http"
     "os"
     "os/exec"
     "path/filepath"
     "sync"
+    "sync/atomic"
     "syscall"
     "time"
 
+    "github.com/GXUser7/yumi-desktop/service/firewall"
     "github.com/Microsoft/go-winio"
     "golang.org/x/sys/windows"
     "golang.org/x/sys/windows/svc"
@@ -34,9 +38,92 @@ type supervisor struct {
     stdin io.WriteCloser
     done chan struct{}
     generation uint64
+
+    // The kill switch. Its own lock, taken before mu whenever both are needed and never while mu
+    // is held, because installing filters is a round trip to the filtering engine and the status
+    // poll must not wait behind it. shieldUp mirrors shield != nil for the status, which reads it
+    // under mu and so cannot take shieldMu.
+    shieldMu sync.Mutex
+    shield *firewall.Firewall
+    shieldLUID uint64
+    shieldLAN bool
+    shieldUp atomic.Bool
+
+    // Where the routing databases live, and the download in flight; see geo.go. Guarded by mu.
+    geoDir string
+    geoUpdating bool
+    geoError string
 }
 
-func (s *supervisor) snapshot() Status { s.mu.Lock();defer s.mu.Unlock();return s.status }
+func (s *supervisor) snapshot() Status {
+    s.mu.Lock()
+    status:=s.status
+    status.GeoUpdating=s.geoUpdating;status.GeoError=s.geoError
+    dir:=s.geoDir
+    s.mu.Unlock()
+    geo:=inspectGeo(dir)
+    status.GeoReady=geo.Ready;status.GeoBytes=geo.Bytes;status.GeoUpdatedAt=geo.UpdatedAt
+    status.KillSwitch=s.shieldUp.Load()
+    status.TunLUID=0
+    return status
+}
+
+/*
+Raises the kill switch, or moves it onto a new adapter.
+
+The new filters go in before the old ones come out, so there is no instant without a kill switch;
+while both are installed the old one still blocks an adapter it does not know, which costs a few
+milliseconds of nothing rather than a few milliseconds of leak.
+*/
+func (s *supervisor) raiseShield(luid uint64, lan bool) error {
+    s.shieldMu.Lock();defer s.shieldMu.Unlock()
+    if s.shield!=nil && s.shieldLUID==luid && s.shieldLAN==lan { return nil }
+    next,err:=firewall.Enable(luid,lan)
+    if err!=nil { return err }
+    s.shield.Close()
+    s.shield,s.shieldLUID,s.shieldLAN=next,luid,lan
+    s.shieldUp.Store(true)
+    return nil
+}
+
+func (s *supervisor) releaseShield() {
+    s.shieldMu.Lock();defer s.shieldMu.Unlock()
+    s.shield.Close()
+    s.shield=nil;s.shieldLUID=0
+    s.shieldUp.Store(false)
+}
+
+/*
+The worker's adapter, as soon as the worker reports it: the kill switch is moved onto it if it is up
+and this is still the current tunnel. Wintun names the adapter by a GUID derived from its name, so
+this is normally the same interface as last time and nothing changes.
+*/
+func (s *supervisor) adoptAdapter(generation, luid uint64) {
+    s.shieldMu.Lock()
+    up:=s.shield!=nil;lan:=s.shieldLAN;same:=s.shieldLUID==luid
+    s.shieldMu.Unlock()
+    s.mu.Lock();current:=s.generation==generation;s.mu.Unlock()
+    if !up || same || !current { return }
+    // A failure leaves the old filters in place, which block this adapter as well: the tunnel then
+    // carries nothing rather than something leaking around it. It is written down for whoever
+    // reads the journal.
+    if err:=s.raiseShield(luid,lan);err!=nil { journalLine("kill switch could not follow the adapter: "+detailOf(err)) }
+}
+
+/** Starts a database download unless one is already running; the status reports how it went. */
+func (s *supervisor) updateGeo() {
+    s.mu.Lock()
+    if s.geoUpdating || s.geoDir=="" { s.mu.Unlock();return }
+    s.geoUpdating=true;s.geoError="";dir:=s.geoDir
+    s.mu.Unlock()
+    go func(){
+        ctx,cancel:=context.WithTimeout(context.Background(),10*time.Minute);defer cancel()
+        err:=secureDirectory(dir)
+        if err==nil { err=downloadGeo(ctx,&http.Client{Timeout:8*time.Minute},dir,geoAssets) }
+        s.mu.Lock();s.geoUpdating=false;if err!=nil{s.geoError=detailOf(err)};s.mu.Unlock()
+    }()
+}
+
 func (s *supervisor) stop() {
     s.mu.Lock();child,input,done:=s.child,s.stdin,s.done
     s.generation++;s.child=nil;s.stdin=nil;s.done=nil
@@ -49,11 +136,24 @@ func (s *supervisor) stop() {
 func (s *supervisor) connect(r Request) error {
     s.stop()
     port,err:=freePort();if err!=nil{return errors.New("probe_port_unavailable")}
+    // The kill switch goes up before the worker starts and stays up through whatever happens to
+    // it; only a disconnect lowers it. Turning the setting off takes effect on the next connect.
+    if r.Options.KillSwitch {
+        s.shieldMu.Lock();luid:=s.shieldLUID;s.shieldMu.Unlock()
+        if err:=s.raiseShield(luid,r.Options.BypassLAN);err!=nil{return errorWithDetail{"kill_switch_failed",err}}
+    } else {
+        s.releaseShield()
+    }
     initial:=Status{Version:1,State:"connecting",NodeID:r.NodeID,ProbePort:port,ProbeUser:randomSecret(),ProbePassword:randomSecret()}
-    config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword)
+    s.mu.Lock();dir:=s.geoDir;s.mu.Unlock()
+    geo:=r.Options.BypassRussia && inspectGeo(dir).Ready
+    config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword,geo)
     exe,err:=os.Executable();if err!=nil{return errors.New("worker_unavailable")}
     child:=exec.Command(exe,"--worker")
     child.SysProcAttr=&syscall.SysProcAttr{HideWindow:true}
+    // Where the core looks for geoip.dat and geosite.dat; the name is the core's own
+    // (common/platform: xray.location.asset, spelt as an environment variable).
+    if dir!="" { child.Env=append(os.Environ(),"XRAY_LOCATION_ASSET="+dir) }
     // Everything the worker says on stderr - a Go panic, a Wintun driver refusing to load, the
     // core's own complaints - used to go to io.Discard. That is the one thing a tunnel that will
     // not start must not do: the app can only report "could not start", and the sentence that
@@ -70,7 +170,9 @@ func (s *supervisor) connect(r Request) error {
         for scanner.Scan(){
             var status Status
             if json.Unmarshal(scanner.Bytes(),&status)==nil && status.Version==1 {
+                luid:=status.TunLUID;status.TunLUID=0
                 s.mu.Lock();if s.generation==generation{s.status=status};s.mu.Unlock()
+                if luid!=0 { s.adoptAdapter(generation,luid) }
             }
         }
         _=child.Wait()
@@ -86,8 +188,15 @@ func (s *supervisor) handle(r Request) Status {
     if r.Command=="status" { return s.snapshot() }
     s.commands.Lock();defer s.commands.Unlock()
     switch r.Command {
-    case "disconnect":s.stop()
-    case "connect":if err:=s.connect(r);err!=nil{return Status{Version:1,State:"failed",Error:err.Error()}}
+    case "disconnect":s.stop();s.releaseShield()
+    case "geo_update":s.updateGeo()
+    case "connect":if err:=s.connect(r);err!=nil{
+        failed:=Status{Version:1,State:"failed",Error:err.Error(),KillSwitch:s.shieldUp.Load()}
+        var detailed errorWithDetail
+        if errors.As(err,&detailed){failed.Error=detailed.code;failed.Detail=detailOf(detailed.cause)}
+        s.mu.Lock();s.status=failed;s.mu.Unlock()
+        return s.snapshot()
+    }
     }
     return s.snapshot()
 }
@@ -103,6 +212,36 @@ func (s *supervisor) handle(r Request) Status {
  * answer and this is a log nobody reads until something breaks, at which point what matters is
  * the last failure and not the previous hundred.
  */
+func journalLine(line string) {
+    if w,ok:=workerJournal().(*os.File);ok { _,_=w.WriteString(line+"\n");_=w.Close() }
+}
+
+/** A failure code for the app, carrying the sentence the library wrote for the detail line. */
+type errorWithDetail struct{ code string; cause error }
+func (e errorWithDetail) Error() string { return e.code }
+
+/*
+The routing databases' directory, under ProgramData and closed to everyone but SYSTEM and
+administrators for writing.
+
+ProgramData lets ordinary users create files in its subfolders by default, and the core run as
+SYSTEM parses whatever it finds here. Nothing a database says can run code, but it can decide where
+traffic goes, and that is not a decision for any account on the machine to make by dropping a file.
+*/
+func geoDirectory() string {
+    root:=os.Getenv("ProgramData");if root==""{return ""}
+    return filepath.Join(root,"Yumi Desktop","geo")
+}
+
+func secureDirectory(dir string) error {
+    sd,err:=windows.SecurityDescriptorFromString("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;BU)")
+    if err!=nil{return err}
+    dacl,_,err:=sd.DACL();if err!=nil{return err}
+    if err=os.MkdirAll(dir,0o755);err!=nil{return err}
+    return windows.SetNamedSecurityInfo(dir,windows.SE_FILE_OBJECT,
+        windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,nil,nil,dacl,nil)
+}
+
 func workerJournal() io.Writer {
     root:=os.Getenv("ProgramData");if root==""{return io.Discard}
     dir:=filepath.Join(root,"Yumi Desktop")
@@ -152,8 +291,8 @@ func (t *tunnelService) Execute(_ []string,requests <-chan svc.ChangeRequest,cha
     // Owner-only access and remote-client rejection are both enforced by the pipe implementation.
     listener,err:=winio.ListenPipe(pipeName,&winio.PipeConfig{SecurityDescriptor:"D:P(A;;GA;;;SY)(A;;GA;;;"+t.owner+")",InputBufferSize:65536,OutputBufferSize:65536})
     if err!=nil{return true,1}
-    s:=&supervisor{status:Status{Version:1,State:"disconnected"}}
-    defer func(){listener.Close();s.commands.Lock();defer s.commands.Unlock();s.stop()}()
+    s:=&supervisor{status:Status{Version:1,State:"disconnected"},geoDir:geoDirectory()}
+    defer func(){listener.Close();s.commands.Lock();defer s.commands.Unlock();s.stop();s.releaseShield()}()
     go func(){for{conn,err:=listener.Accept();if err!=nil{return};go serveClient(conn,t.owner,s)}}()
     current:=svc.Status{State:svc.Running,Accepts:svc.AcceptStop|svc.AcceptShutdown}
     changes<-current
@@ -172,7 +311,9 @@ func install(owner string) error {
     if _,err:=windows.StringToSid(owner);err!=nil{return err}
     m,err:=mgr.Connect();if err!=nil{return err};defer m.Disconnect()
     exe,err:=os.Executable();if err!=nil{return err}
-    config:=mgr.Config{DisplayName:"Yumi VPN tunnel",StartType:mgr.StartAutomatic,Description:"Local tunnel service for Yumi Desktop"}
+    // An unrestricted service SID puts NT SERVICE\YumiTunnel into the token the service and its
+    // worker run with, which is what the kill switch's permit for this executable is scoped to.
+    config:=mgr.Config{DisplayName:"Yumi VPN tunnel",StartType:mgr.StartAutomatic,Description:"Local tunnel service for Yumi Desktop",SidType:windows.SERVICE_SID_TYPE_UNRESTRICTED}
     service,err:=m.OpenService(serviceName)
     if err==nil{
         defer service.Close()

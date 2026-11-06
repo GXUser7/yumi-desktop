@@ -12,6 +12,8 @@ class LogRepository(private val strings: Strings = Strings()) {
     fun info(id: Int, vararg args: Any) = append("Info", "Event $id")
     fun warn(id: Int, vararg args: Any) = append("Warning", "Event $id")
     fun debug(id: Int, vararg args: Any) = append("Debug", "Event $id")
+    /** Diagnostic detail that the phone writes to its journal file; the window has no such file. */
+    fun trace(tag: String, message: String) = RuntimeLog.i(tag, message)
     private fun append(level: String, message: String) = lines.update { (it + "$level: $message").takeLast(200) }
 }
 

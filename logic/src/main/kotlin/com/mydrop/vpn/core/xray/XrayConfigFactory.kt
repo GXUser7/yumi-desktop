@@ -4,11 +4,14 @@ import com.mydrop.vpn.core.model.AppSettings
 import com.mydrop.vpn.core.model.LogLevel
 import com.mydrop.vpn.core.model.ProbeEndpoint
 import com.mydrop.vpn.core.model.ProxyNode
+import com.mydrop.vpn.core.model.dialed
+import com.mydrop.vpn.core.model.identified
 import com.mydrop.vpn.core.model.ProxySettings
 import com.mydrop.vpn.core.model.RoutingMode
 import com.mydrop.vpn.core.model.TlsOptions
 import com.mydrop.vpn.core.model.TransportOptions
 import com.mydrop.vpn.core.net.isNumericAddress
+import java.net.InetAddress
 import com.mydrop.vpn.core.net.splitHostPort
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArrayBuilder
@@ -152,6 +155,29 @@ object XrayConfigFactory {
     }
 
     /**
+     * [node] as far as the core can carry it: a group without the members it cannot, the lone
+     * member of a group that had only one it could, and null when nothing is left to dial.
+     *
+     * Asked at import in place of [unsupported], which reads a group as its first member and would
+     * refuse a whole group for one member it cannot carry — or keep one whose first member it can,
+     * with the rest waiting to sink the document the moment the group is selected.
+     */
+    fun carriable(node: ProxyNode): ProxyNode? {
+        val group = node.group ?: return node.takeIf { unsupported(it) == null }
+        val members = group.members.filter { unsupported(it) == null }
+        return when {
+            members.isEmpty() -> null
+            members.size == group.members.size -> node
+            members.size == 1 -> members.single().copy(name = node.name)
+            else -> members.first().copy(
+                name = node.name,
+                sourceUri = null,
+                group = group.copy(members = members),
+            ).identified()
+        }
+    }
+
+    /**
      * @param nodes every server the balancer may move onto without the core being rebuilt. The
      *   caller decides what belongs here — the failover group, the mobile list — and anything
      *   [unsupported] rejects is skipped rather than allowed to sink the document.
@@ -175,24 +201,20 @@ object XrayConfigFactory {
             throw IllegalArgumentException("Xray cannot carry $it, which ${selected.name} needs")
         }
 
-        // The selected node first, and the rest behind it. Order matters twice: the first outbound
-        // is the core's default for anything no rule matched, and while the catch-all rule below
-        // means that should never happen, "should never happen" is a poor thing to have pointing at
-        // an arbitrary server.
-        val usable = buildList {
-            add(selected)
-            addAll(nodes.filter { it.id != selected.id && unsupported(it) == null })
-        }
+        val usable = usable(nodes, selected)
+        val dialed = members(nodes, selected)
         val resolved = settings.withDnsOverride(dnsOverride)
 
         return Document(
             json = json.encodeToString(
                 JsonObject.serializer(),
-                buildConfig(usable, resolved, probe, geoAvailable),
+                buildConfig(dialed, resolved, probe, geoAvailable),
             ),
-            pinnedTag = nodeTag(selected.id),
+            pinnedTag = nodeTag(selected.dialed().first().id),
+            // The servers, not their members: this is what the tunnel can be moved onto, and a
+            // group is moved onto as one (XrayTunnelController.selectOutbound).
             nodeTags = usable.map { nodeTag(it.id) },
-            verificationForced = usable
+            verificationForced = dialed
                 .filter { node ->
                     val tls = node.tls
                     // A node that pins its certificate is not one that asked to skip the check —
@@ -202,6 +224,30 @@ object XrayConfigFactory {
                 }
                 .map { it.name },
         )
+    }
+
+    /**
+     * Every outbound [build] writes for these servers, [selected]'s own first.
+     *
+     * What the core is given: a group is every one of its members, each under a tag of its own,
+     * and the tunnel starts on the provider's first choice. Which member carries it after that is
+     * the watchdog's to decide, by measuring them (see GroupSelector).
+     *
+     * Public because deciding what may go into the document means reasoning about exactly this
+     * list — see `Ipv6Policy` — and a second derivation of it is a second chance to disagree.
+     */
+    fun members(nodes: List<ProxyNode>, selected: ProxyNode): List<ProxyNode> =
+        usable(nodes, selected).flatMap { it.dialed() }.filter { unsupported(it) == null }
+
+    /**
+     * The selected node first, and the rest behind it. Order matters twice: the first outbound is
+     * the core's default for anything no rule matched, and while the catch-all rule below means
+     * that should never happen, "should never happen" is a poor thing to have pointing at an
+     * arbitrary server.
+     */
+    private fun usable(nodes: List<ProxyNode>, selected: ProxyNode): List<ProxyNode> = buildList {
+        add(selected)
+        addAll(nodes.filter { it.id != selected.id && unsupported(it) == null })
     }
 
     /** See the sing-box factory for why the override lands on whichever server actually answers. */
@@ -224,6 +270,66 @@ object XrayConfigFactory {
         // nothing to explain why.
         putJsonObject("stats") { }
         putJsonObject("policy") {
+            // The one timeout the core gets wrong for a phone, spelled out because leaving it out
+            // means accepting it.
+            //
+            // Xray's default for level 0 is a five-minute idle timeout
+            // (`features/policy/policy.go`: `ConnectionIdle: 300`), and on this path it is applied
+            // twice over — once by the tun stack, which builds its `StackOptions.IdleTimeout` from
+            // it (`proxy/tun/handler.go:127`), and again by every outbound's
+            // `CancelAfterInactivity`. Five minutes is a reasonable guess for a browser tab and the
+            // wrong one for the sockets that matter most here, because the sockets that matter most
+            // here are supposed to be silent: a push connection carries nothing between messages,
+            // Firebase's heartbeat runs on the order of half an hour, and Android defers even that
+            // into a Doze maintenance window.
+            //
+            // The reap itself is clean — `proxy/tun/handler.go:160` closes the connection, so the
+            // phone is told. The cost is what being told sets in motion: Play services schedules a
+            // reconnect, and in Doze that alarm waits for a maintenance window. A journal caught
+            // the shape of it. The connection to `mtalk.google.com` opened at 17:04:11 and carried
+            // nothing afterwards; the phone was idle from 17:06:41; the replacement connection was
+            // accepted at 17:30:46, within a second of Doze ending. Twenty-six minutes with no
+            // notifications, while the watchdog's own probes kept pulling 204s through the same
+            // tunnel and correctly called it healthy.
+            //
+            // So this is a mitigation and not a proof: what is established is that the core would
+            // have reaped that flow around 17:09, and that nothing else in the tunnel was wrong.
+            // What is not established — the journal cannot show it — is that a message was sent
+            // during those minutes and lost. Confirming that needs a paired test, one message id,
+            // VPN on and off, screen on and dozing.
+            //
+            // Half an hour clears Firebase's heartbeat with room to spare. The trade is memory: an
+            // idle flow held for thirty minutes instead of five is a map entry and a goroutine
+            // kept six times as long, and a phone whose apps are suspended without closing their
+            // sockets will hold more of them. Worth watching if the service starts being killed.
+            putJsonObject("levels") {
+                putJsonObject("0") {
+                    put("connIdle", CONN_IDLE_SECONDS)
+                    // The other two halves of the same story, and the ones that actually bite.
+                    //
+                    // Xray defaults both to one second (`features/policy/policy.go:132-133`), and
+                    // they are not idle timeouts — they are what the idle timeout is *replaced*
+                    // with the moment one direction of a connection finishes. `postRequest` in the
+                    // VLESS outbound ends with `defer timer.SetTimeout(DownlinkOnly)`, so a
+                    // connection whose uplink copy returns has one second of life left unless
+                    // something arrives.
+                    //
+                    // Measured on a phone, against the socket this matters most for. Through the
+                    // tunnel the push connection to `mtalk.google.com` lived two and a half
+                    // minutes, died, was rebuilt, and walked through four different Google servers
+                    // in twenty minutes — seven connections where there should have been one. With
+                    // the tunnel off, one connection held the whole seventeen-minute window without
+                    // a break. The same three-minute cadence shows against ten different servers
+                    // across three days of journal, so it is not one proxy misbehaving.
+                    //
+                    // Thirty seconds is long enough that a connection waiting on a slow answer is
+                    // not shot for it, and short enough that a genuinely half-closed connection
+                    // does not linger. Zero would be the obvious way to say "no limit" and is the
+                    // opposite: `ActivityTimer.SetTimeout` treats zero as "expire now".
+                    put("uplinkOnly", HALF_CLOSED_SECONDS)
+                    put("downlinkOnly", HALF_CLOSED_SECONDS)
+                }
+            }
             putJsonObject("system") {
                 put("statsOutboundUplink", true)
                 put("statsOutboundDownlink", true)
@@ -794,6 +900,9 @@ object XrayConfigFactory {
             // resolver the user did not pick than a resolver that answers nothing.
             if (remote == null && direct == null) add(FALLBACK_DNS)
         }
+        // The only place IPv6 reaches the document, and [settings] here is not always the user's:
+        // the builder switches it off for servers that were not seen to carry IPv6 — see
+        // `Ipv6Policy` for the journal that made that necessary.
         put("queryStrategy", if (settings.enableIpv6) "UseIP" else "UseIPv4")
         put("disableCache", false)
         put("tag", DNS_IN_TAG)
@@ -811,6 +920,102 @@ object XrayConfigFactory {
      */
     const val FALLBACK_REMOTE_DNS = "https://1.1.1.1/dns-query"
     const val FALLBACK_REMOTE_DNS_ALT = "https://8.8.8.8/dns-query"
+
+    /**
+     * Names that only the carrier's own resolver can answer, and that must never ride the proxy.
+     *
+     * `3gppnetwork.org` is the tree the phone's IMS stack looks in to find the network it places
+     * calls through — `pcscf.ims.mnc<NN>.mcc<NNN>.3gppnetwork.org` for the call server,
+     * `epdg.epc.…` for Wi-Fi calling. The records live inside the operator's network and exist
+     * nowhere else, so no public resolver can return them: 1.1.1.1 and 8.8.8.8 both answer
+     * NXDOMAIN, honestly and uselessly.
+     *
+     * A journal shows the phone asking for `pcscf.ims.mnc002.mcc250.3gppnetwork.org` within
+     * twenty milliseconds of every single Wi-Fi/cellular handover — which is exactly when the IMS
+     * stack re-registers — and being told the name does not exist, four seconds at a time, after a
+     * round trip to a proxy in Germany. Sending these to the proxy is wrong twice over: the answer
+     * cannot be there, and the question says which operator the phone is on.
+     *
+     * What this list can and cannot do, precisely — because the obvious use of it does not work.
+     *
+     * It keeps a *connection* addressed to one of these names off the proxy. It cannot steer the
+     * DNS lookup, and a rule that tries to is silently inert: the router matches a domain with
+     * `ctx.GetTargetDomain()` (`app/router/condition.go:64`), which for a query leaving the DNS
+     * module is the address of the resolver being asked — `1.1.1.1`, not the name being asked
+     * about. Xray does offer per-name resolver selection, as `dns.servers[].domains`, and that is
+     * where a fix belongs; but selection is only half of it, and the other half is having a
+     * resolver that can answer at all. These records live inside the operator's core network, so
+     * the only one that can is the resolver of the network underneath the tunnel, which nothing on
+     * this side hands to the core yet. Until it does, the calls bug is not fixed by this file.
+     */
+    private val CARRIER_INTERNAL_DOMAINS = listOf("domain:3gppnetwork.org")
+
+    /**
+     * Names the rules mode sends through the proxy even when their address is Russian.
+     *
+     * `geoip:ru` decides by where an *address* is registered, and some of what is throttled here
+     * is served from inside the country. YouTube's video comes from Google Global Cache nodes that
+     * Google places in Russian providers' networks: a journal shows
+     * `rr1---sn-4g5ednld.googlevideo.com` resolving to 173.194.182.102, which the database files
+     * under RU, and the rule taking it `direct` — where the TLS handshake hung until the player
+     * gave up, every retry, because every retry was sent to the same node. Even an open road would
+     * not have played: the stream's URL is signed for the address the player asked from, which is
+     * the proxy's. The node next to it, 173.194.187.170, went through the proxy and played.
+     *
+     * `domainStrategy` is `IPIfNonMatch`, so a name that matches here is routed on the name and
+     * never resolved for the country rules; with sniffing on, that holds for connections the
+     * application opened by address too.
+     */
+    private val PROXIED_DESPITE_RU_ADDRESS = listOf(
+        "domain:googlevideo.com",
+        "domain:youtube.com",
+        "domain:youtu.be",
+        "domain:ytimg.com",
+        "domain:ggpht.com",
+        "domain:youtube-nocookie.com",
+        "domain:youtubei.googleapis.com",
+    )
+
+    /**
+     * The resolver this tunnel advertises to applications, and the one address the core answers
+     * for whatever the hijack setting says.
+     *
+     * Shared with the service rather than spelled twice, because the two have to agree exactly:
+     * the service hands this address to `VpnService.Builder.addDnsServer`, and the rule built from
+     * it in [buildRouting] is what makes anything answer there. Spelled in two files, a rename in
+     * one of them is a phone with a resolver nobody is listening on.
+     */
+    const val TUN_DNS_V4 = "172.19.0.2"
+
+    /**
+     * The addresses the service gives the tunnel's interface, and their prefixes.
+     *
+     * Arbitrary and private on purpose — nothing routes to them, and they exist so the interface
+     * has a family to install a default route for. The same pair the sing-box configuration used,
+     * kept so a phone upgrading across the port sees no change.
+     *
+     * Here rather than in the service for the reason [TUN_DNS_V4] is: [buildRouting] drops whatever
+     * is addressed to the subnet they make, and a subnet spelled in two files drifts.
+     */
+    const val TUN_ADDRESS_V4 = "172.19.0.1"
+    const val TUN_PREFIX_V4 = 30
+    const val TUN_ADDRESS_V6 = "fdfe:dcba:9876::1"
+    const val TUN_PREFIX_V6 = 126
+
+    /**
+     * How long a flow may carry nothing before the core closes it, in seconds.
+     *
+     * Thirty minutes rather than the core's own five. See the `policy` block in [buildConfig] for
+     * what the five cost.
+     */
+    private const val CONN_IDLE_SECONDS = 1800
+
+    /**
+     * How long a connection lives after one of its directions has finished, in seconds.
+     *
+     * The core's own default is one. See the `policy` block in [buildConfig].
+     */
+    private const val HALF_CLOSED_SECONDS = 30
 
     /** Used when everything the user chose turned out to be unexpressible; see [buildDns]. */
     private const val FALLBACK_DNS = FALLBACK_REMOTE_DNS
@@ -883,12 +1088,74 @@ object XrayConfigFactory {
             putJsonArray("rules") {
                 dnsRules(settings)
 
+                // Unconditional, and that is the difference between a setting and a trapdoor.
+                //
+                // The service advertises [TUN_DNS_V4] to every application in the tunnel, always —
+                // it is the resolver they were handed, and they will use it whatever this setting
+                // says. Only the rule below made anything answer there, so turning the hijack off
+                // used to leave the whole tunnel pointed at an address where nobody was listening:
+                // the query fell through to the ordinary rules, matched the private ranges of the
+                // LAN bypass — 172.19.0.2 is inside 172.16.0.0/12 — and went out of the physical
+                // interface addressed to an interface that only exists inside this phone. Not a
+                // weaker setting: no DNS at all.
+                //
+                // Nor can the service simply stop advertising a resolver when the hijack is off.
+                // `netd` falls back to the default network's nameservers for a VPN that declares
+                // none (`NetworkController.cpp`, `getNetworkForDnsLocked`), so the tunnel would
+                // carry the traffic while the physical network resolved the names — every lookup
+                // in the clear, which is the one outcome worse than none.
+                //
+                // So the core always answers its own resolver, and the setting means what its name
+                // says: whether queries addressed *elsewhere* are taken as well.
+                addJsonObject {
+                    put("type", "field")
+                    putJsonArray("ip") { add("$TUN_DNS_V4/32") }
+                    put("port", "53")
+                    put("outboundTag", DNS_TAG)
+                }
+
+                // Everything else addressed to the tunnel's own subnet is dropped, ahead of the LAN
+                // bypass, because sending it anywhere sends it round.
+                //
+                // A /30 has a broadcast address, 172.19.0.3, and the kernel's `local` table — read
+                // before any of the rules that honour `VpnService.protect` — routes a packet for it
+                // back into the interface it belongs to, protected socket or not. A journal from a
+                // friend's phone caught what that costs. Some application there broadcast to every
+                // interface it had; the LAN bypass sent the datagram `direct`, freedom sent it from
+                // a new port straight back into the tunnel, and the core took that for a new flow
+                // and sent it again — thirty-eight thousand journal lines in a few seconds, each
+                // turn a UDP port held for [CONN_IDLE_SECONDS]. The second time it happened, twelve
+                // minutes later with the first run's ports still held, the phone ran out of them:
+                // `bind: address already in use` for every socket the core opened, Hysteria's QUIC
+                // and the DNS among them. Every server looked dead, the watchdog measured the
+                // spares through the same starved core, found none alive, and stayed put until the
+                // tunnel was turned off.
+                //
+                // The resolver above is the one address in the subnet anything answers at, so
+                // nothing that works is lost here.
+                addJsonObject {
+                    put("type", "field")
+                    putJsonArray("ip") {
+                        add(subnetOf(TUN_ADDRESS_V4, TUN_PREFIX_V4))
+                        add(subnetOf(TUN_ADDRESS_V6, TUN_PREFIX_V6))
+                    }
+                    put("outboundTag", BLOCK_TAG)
+                }
+
                 if (settings.hijackDns) {
                     addJsonObject {
                         put("type", "field")
                         put("port", "53")
                         put("outboundTag", DNS_TAG)
                     }
+                }
+
+                // Whatever the mode says. A call signalling path that comes out in another
+                // country is not a call signalling path; see [CARRIER_INTERNAL_DOMAINS].
+                addJsonObject {
+                    put("type", "field")
+                    putJsonArray("domain") { CARRIER_INTERNAL_DOMAINS.forEach { add(it) } }
+                    put("outboundTag", DIRECT_TAG)
                 }
 
                 // The probe measures the tunnel, so it has to ride it whatever the routing mode
@@ -939,6 +1206,13 @@ object XrayConfigFactory {
                     // proxy. Saying so by omission rather than by an unresolvable rule is the whole
                     // point — the alternative is a configuration the core refuses to load.
                     RoutingMode.Rules -> if (geoAvailable) {
+                        // Before the country rules, by name, so the address is never asked about;
+                        // see [PROXIED_DESPITE_RU_ADDRESS].
+                        addJsonObject {
+                            put("type", "field")
+                            putJsonArray("domain") { PROXIED_DESPITE_RU_ADDRESS.forEach { add(it) } }
+                            put("balancerTag", BALANCER_TAG)
+                        }
                         addJsonObject {
                             put("type", "field")
                             putJsonArray("domain") { add("geosite:category-ru") }
@@ -1044,6 +1318,20 @@ object XrayConfigFactory {
         "fc00::/7",
         "fe80::/10",
     )
+
+    /**
+     * [address]/[prefix] with the host bits cleared: the subnet written the way a routing rule
+     * reads it, rather than trusting the core to mask an interface address for us.
+     */
+    private fun subnetOf(address: String, prefix: Int): String {
+        // A literal, so no lookup happens.
+        val bytes = InetAddress.getByName(address).address
+        for (index in bytes.indices) {
+            val kept = (prefix - index * 8).coerceIn(0, 8)
+            bytes[index] = (bytes[index].toInt() and (0xFF00 ushr kept)).toByte()
+        }
+        return "${InetAddress.getByAddress(bytes).hostAddress}/$prefix"
+    }
 
     private fun LogLevel.toXrayLevel(): String = when (this) {
         LogLevel.Trace -> "debug"

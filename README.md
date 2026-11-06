@@ -4,27 +4,34 @@
 > service runs with system privileges, so read what it does below before you install it, and
 > expect the rough edges of something young.
 
-The Windows port of Yumi — a VPN client for Xray-family servers, built to look and behave like the
-phone and television versions rather than like a settings dialog.
+The Windows port of Yumi — a VPN client for Xray-family servers — dressed in the matte glass of
+its sister app YouCloud: Material 3 Expressive shapes drift behind the window, every panel is frosted
+glass over them, and dragging the window knocks them about on springs.
 
 * **Connect screen** — a poster headline that says what the tunnel is doing, a figure that shows
   what it is carrying (a scrolling pixel map of the world, or the traffic waves), and one loud
-  control under it.
-* **Servers** — a grid of cards with the protocol, the transport details that actually change
-  behaviour, and a latency reading you can act on.
+  control beside it.
+* **Servers** — a grid of glass cards with the protocol, the transport details that actually change
+  behaviour, and a latency reading you can act on. The server never changes by itself.
 * **Subscriptions** — quota, expiry and refresh, or a QR transfer from Yumi on your phone over the
   local network.
-* **Split tunnelling** — by application, domain or subnet, either direction.
+* **Split tunnelling** — pick applications from what is running and installed, with their icons, or
+  type a process name the way Clash takes one; domains and subnets either direction.
+* **Russian sites directly** — the geoip/geosite databases, fetched by the service on its own, send
+  Russian sites around the tunnel *above* the application rules: a browser sent wholly through the
+  VPN still opens them directly. YouTube stays in the tunnel.
+* **Kill switch** — from connect until disconnect nothing leaves around the tunnel, even when the
+  server or the core falls over.
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
-* **Seven pastel palettes**, light and dark, plus AMOLED black.
+* **Seven palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
 
 | | |
 |:-:|:-:|
-| <img src="docs/screenshots/connect.png" width="420"> | <img src="docs/screenshots/speed.png" width="420"> |
-| <img src="docs/screenshots/routing.png" width="420"> | <img src="docs/screenshots/settings.png" width="420"> |
+| <img src="docs/screenshots/connect.png" width="420"> | <img src="docs/screenshots/routing.png" width="420"> |
+| <img src="docs/screenshots/servers.png" width="420"> | <img src="docs/screenshots/settings.png" width="420"> |
 
-Taken with `--ui-smoke`, which walks every screen against a stub service that cannot connect —
-hence the connection screen saying so.
+Taken with `--ui-demo`, which seeds made-up servers and runs every screen against a stand-in for the
+service that pretends to connect.
 
 Protocols come from Xray: VLESS (including REALITY and Vision), VMess, Trojan, Shadowsocks,
 Hysteria2, TUIC and the rest of the outbound catalogue, over TCP, WebSocket, gRPC, HTTP/2,
@@ -79,6 +86,28 @@ not exist on laptops: Windows marks a new Wi-Fi network public by default, so th
 applied and the phone's connection was dropped without a word. The domain profile is deliberately
 left out.
 
+### Kill switch
+
+With the kill switch on, the service installs Windows Filtering Platform filters the moment you
+connect: everything is blocked except the tunnel adapter, the service itself (which carries the
+tunnel and whatever it routes around it), loopback, DHCP and — when "local network directly" is on
+— the private ranges, so printers and the phone transfer keep working. The filters stay through a
+crashed core or a dropped server and come down only when you disconnect. They live in a dynamic
+session, so if the service itself dies Windows removes them: a crash can cost you the kill switch,
+never the network.
+
+### Routing databases
+
+`geoip.dat` and `geosite.dat` come from the v2fly releases Yumi on the phone uses. The service
+downloads them itself — the app only asks, it never names a URL or a path — verifies the published
+checksum, and keeps them in `%ProgramData%\Yumi Desktop\geo`, which only SYSTEM and administrators
+can write. They are fetched the first time they are missing and again whenever you press the
+button. Until they arrive the rule is silent and nothing else changes.
+
+Rules apply in this order: the domains and subnets you typed, then the databases, then the
+applications, then the default. A site you named outranks the databases, so one Russian site can be
+sent back through the VPN; the databases outrank the applications.
+
 When a tunnel will not start, what the worker said on its way down is in
 `%ProgramData%\Yumi Desktop\worker.log` — a Go panic, a Wintun driver that would not load, the
 core's own complaint. The file is truncated rather than rotated once it passes a megabyte.
@@ -105,7 +134,12 @@ To run the application alone, without the service — every screen works, only c
 ```
 
 `./gradlew.bat :desktop:run --args="--ui-smoke"` walks every screen in both themes and writes
-screenshots to `.local/screenshots`, against a stub service that can never connect.
+screenshots to `.local/screenshots`, against a stub service that can never connect;
+`--ui-demo` does the same with made-up servers and a stand-in service that pretends to connect.
+
+Every push builds the installer on GitHub Actions (`.github/workflows/installer.yml`) exactly as
+`build.ps1` does, tests included, and keeps it as a workflow artifact. Pushing a tag `v<version>`
+also attaches it, with its SHA-256, to a draft release.
 
 ## Licence
 

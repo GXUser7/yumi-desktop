@@ -1,0 +1,89 @@
+name: installer
+
+# Why this exists: every installer so far was built by hand on one machine, so a fix that landed
+# in the repository reached nobody until someone remembered to rebuild — and several did not. Now
+# every push builds the installer the same way tools/build.ps1 does on a desk, tests included, and
+# a tag publishes it.
+#
+# A pushed tag v<version> makes a draft release with the installer and its checksum attached. It
+# stays a draft: the notes are written by a person, and nothing goes out under the project's name
+# until somebody presses publish.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The service's own go.mod names the version, so the toolchain that builds the installer
+      # is the one the tests were written against. build.ps1 sets GOTOOLCHAIN=local, so Go cannot
+      # quietly switch to another one behind this step.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: service/go.mod
+          cache-dependency-path: service/go.sum
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Wintun and Inno Setup
+        shell: pwsh
+        run: ./tools/bootstrap.ps1
+
+      - name: Tests, service, application, installer
+        shell: pwsh
+        run: ./tools/build.ps1 -GoExe (Get-Command go).Source
+
+      - name: Checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/*setup.exe | Select-Object -First 1
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash
+          "$hash  $($installer.Name)" | Set-Content -Encoding ascii "dist/$($installer.Name).sha256"
+          "name=$($installer.Name)" >> $env:GITHUB_OUTPUT
+          Write-Output "$hash  $($installer.Name)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.checksum.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --prerelease \
+            --title "Yumi Desktop ${GITHUB_REF_NAME#v}" \
+            --notes "Собрано из $GITHUB_SHA. Описание допишет автор."

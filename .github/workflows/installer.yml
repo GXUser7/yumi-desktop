@@ -5,9 +5,9 @@ name: installer
 # every push builds the installer the same way tools/build.ps1 does on a desk, tests included, and
 # a tag publishes it.
 #
-# A pushed tag v<version> makes a draft release with the installer and its checksum attached. It
-# stays a draft: the notes are written by a person, and nothing goes out under the project's name
-# until somebody presses publish.
+# A pushed tag v<version> publishes a pre-release with the installer and its checksum attached,
+# described by docs/releases/v<version>.md with the SHA-256 appended. Without that file the release
+# stays a draft: nothing goes out under the project's name with notes nobody wrote.
 
 on:
   push:
@@ -73,17 +73,33 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checked out first: checkout cleans the workspace, and the installer lands in it next.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Draft release
+      - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          # Written on Windows: CRLF, and "<hash>  <name>". Only the hash goes into the notes.
+          checksum=$(tr -d '\r' < dist/*.sha256 | cut -d' ' -f1)
+          if [ -f "$notes" ]; then
+            cp "$notes" release-notes.md
+            draft=""
+          else
+            echo "Собрано из $GITHUB_SHA. Описание допишет автор." > release-notes.md
+            draft="--draft"
+          fi
+          printf '\n### Проверка файла\n\n```\nSHA-256  %s\n```\n' "$checksum" >> release-notes.md
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --draft --prerelease \
-            --title "Yumi Desktop ${GITHUB_REF_NAME#v}" \
-            --notes "Собрано из $GITHUB_SHA. Описание допишет автор."
+            $draft --prerelease \
+            --title "Yumi Desktop $version — бета" \
+            --notes-file release-notes.md

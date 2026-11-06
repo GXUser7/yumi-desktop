@@ -21,8 +21,18 @@ recorded in `licenses/Go-dependencies.txt`.
 The virtual network adapter the tunnel runs over. Shipped as the unmodified signed
 `wintun-0.14.1` amd64 binary, downloaded and checksum-verified by `tools/bootstrap.ps1`.
 
+**WireGuard for Windows** — <https://git.zx2c4.com/wireguard-windows> — MIT.
+The kill switch's filtering-platform code is adapted from its `tunnel/firewall` package and lives
+in `service/firewall/`, with the original copyright notices kept in each file.
+
 **Go standard library and the modules in `service/go.mod`** — mostly BSD-3-Clause and MIT.
 Each module's own notice is copied into `licenses/` at build time.
+
+## Routing databases
+
+**v2fly geoip** and **domain-list-community** — <https://github.com/v2fly> — CC-BY-SA 4.0 and
+MIT. Not shipped: the service downloads them on request, into `%ProgramData%\Yumi Desktop\geo`,
+and they decide which sites go around the tunnel when "Russian sites directly" is on.
 
 ## The application
 
@@ -35,12 +45,15 @@ control manager and the title-bar colour.
 
 ## Typefaces
 
-**Roboto Flex** — SIL Open Font License 1.1 — see `licenses/RobotoFlex-OFL.txt`.
-Bundled as static instances rather than the variable file: pinning the axes at build time drops
-the delta tables, so five faces come to about 170 KB instead of 1.8 MB.
+**Unbounded** — SIL Open Font License 1.1 — see `licenses/Unbounded-OFL.txt`.
+Page titles and the tunnel's headline — the same face Yumi's sister app YouCloud sets its titles in.
 
-**Roboto Mono** — SIL Open Font License 1.1 — see `licenses/RobotoMono-OFL.txt`.
-Every figure that has to line up or tick without jitter.
+**Onest** — SIL Open Font License 1.1 — see `licenses/Onest-OFL.txt`.
+Everything else, figures included: its tabular numerals keep the timer and the rates from
+twitching as digits change.
+
+Both are bundled as static instances cut down to Latin and Cyrillic rather than as the variable
+files: pinning the weight axis drops the delta tables, and Skia then has nothing left to interpret.
 
 **Twemoji** — CC-BY 4.0 (graphics), Apache License 2.0 (build tooling) — see
 `licenses/Twemoji-CC-BY-4.0.txt`. Bundled because Windows ships no glyph for a country flag: a

@@ -61,12 +61,38 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 
 ## Split tunnelling
 
-- [ ] **Everything except selected**: add a browser's `.exe`, connect, and that browser goes direct
+- [ ] **Choose** lists what is running first, then what is installed, with icons. Typing filters it;
+      typing a name that is not there offers "Add “name.exe”", and Enter adds it.
+- [ ] A program picked as `Telegram.exe` and one typed as `telegram` both match the running
+      Telegram.
+- [ ] **Everything except selected**: add a browser, connect, and that browser goes direct
       while everything else goes through.
 - [ ] **Only selected**: the opposite, and the rest of the machine keeps working normally.
 - [ ] Add a domain. Subdomains follow it. A site on the same IP but a different name does not.
 - [ ] Add a subnet in CIDR form. An invalid one is refused with the field marked, not saved.
 - [ ] Save rules while connected: the tunnel reconnects itself once and comes back up.
+
+## Russian sites and the databases
+
+- [ ] On a fresh install the databases download by themselves within a minute of the app opening;
+      the routing page shows their size and age.
+- [ ] `%ProgramData%\Yumi Desktop\geo` is writable by administrators and SYSTEM only.
+- [ ] **Only selected** with a browser chosen: a Russian site (ya.ru) opens with a Russian address on
+      2ip.ru, a foreign one with the server's.
+- [ ] YouTube plays through the tunnel with "Russian sites directly" on.
+- [ ] A Russian domain typed into the domain list goes through the VPN despite the databases.
+- [ ] Unplug the network and press the update button: the old databases stay, the page says why.
+
+## Kill switch
+
+- [ ] On, connect: browsing works. `Get-NetFirewallRule` shows nothing new — the filters are WFP's,
+      see `netsh wfp show filters`.
+- [ ] Kill `yumi-service.exe --worker` in Task Manager: the browser stops loading, the connect screen
+      says the kill switch is holding traffic, and "Lift the block" restores the internet.
+- [ ] With "local network directly" on, the router's page and the phone transfer still work while
+      the block is up.
+- [ ] Stop the service from `services.msc` while blocked: the internet comes back at once.
+- [ ] Off, connect, kill the worker: the internet stays up.
 
 ## Speed test
 
@@ -82,8 +108,10 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 - [ ] Light and dark, and system-follows-Windows.
 - [ ] The title bar follows the theme, in both directions, without restarting the app.
 - [ ] AMOLED collapses the surfaces onto black and keeps the palette's hue.
-- [ ] Drag the window narrow: the rail's labels leave and the icons centre, smoothly, and the
-      whole app stays usable at the minimum size.
+- [ ] Drag the window across the screen: the shapes behind the glass lag, swing back and settle.
+      With "Live backdrop" off they stay still and the app uses no CPU at rest.
+- [ ] Hovering a dock button names it; the page you are on is the accent square.
+- [ ] Drag the window to its minimum size: everything stays usable.
 - [ ] Server names show their country flags, and the ⚡ and ⭐ providers decorate names with are
       coloured — all of them, consistently.
 - [ ] Switch to English. Every screen changes, including units and relative times.

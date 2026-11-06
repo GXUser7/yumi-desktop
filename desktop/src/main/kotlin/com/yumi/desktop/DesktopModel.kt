@@ -45,9 +45,16 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
         if (settings.value.deviceId.isBlank()) settings.update {
             it.copy(deviceId = UUID.randomUUID().toString(), mtu = 1500, routingMode = RoutingMode.Global, autoFailover = false)
         }
+        // The window never moves the tunnel between servers on its own, whatever a settings file
+        // carried over from a phone says.
+        if (settings.value.autoFailover) settings.update { it.copy(autoFailover = false) }
+        // Applications used to be kept as full paths; the rules are process names now.
+        val names = desktop.value.applications.mapNotNull { runCatching { RuleValidation.application(it) }.getOrNull() }.distinct()
+        if (names != desktop.value.applications) desktop.update { it.copy(applications = names) }
         scope.launch {
             while (isActive) {
                 commands.withLock { updateStatus(backend.request(ServiceRequest(command = "status"))) }
+                afterStatus()
                 delay(1000)
             }
         }
@@ -67,6 +74,54 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
             }
         }
     }
+
+    /** Once per launch: the databases are fetched by themselves the first time they are missing. */
+    private var geoAsked = false
+
+    /**
+     * What a fresh status sets in motion, beyond showing it.
+     *
+     * The databases are fetched without being asked the first time they turn out to be missing —
+     * "Russian sites directly" is on by default and means nothing until they are there, and
+     * nobody should have to find a button to make a default setting work. And when they arrive
+     * while the tunnel is up, it is raised again once so that they apply now rather than at the
+     * next connection.
+     */
+    private suspend fun afterStatus() {
+        val current = status.value
+        if (current.state == "unavailable") return
+        if (!geoAsked && desktop.value.bypassRussia && !current.geoReady && !current.geoUpdating) {
+            geoAsked = true
+            commands.withLock { updateStatus(backend.request(ServiceRequest(command = "geo_update"))) }
+        }
+        val arrived = current.geoReady && !geoWasReady
+        geoWasReady = current.geoReady
+        if (arrived && geoSeen && current.state == "connected" && desktop.value.bypassRussia) {
+            commands.withLock { if (status.value.state == "connected") { cancelSpeed(); connectSelected() } }
+        }
+        geoSeen = true
+    }
+    private var geoWasReady = false
+    private var geoSeen = false
+
+    /** Fetches the routing databases again; the service reports progress on the status. */
+    fun updateGeo() = action {
+        commands.withLock { updateStatus(backend.request(ServiceRequest(command = "geo_update"))) }
+    }
+
+    /**
+     * Takes the kill switch down without raising the tunnel: the way out of a blocked internet
+     * when the server is the thing that is broken. The service lowers it on any disconnect.
+     */
+    fun releaseKillSwitch() = action {
+        commands.withLock { cancelSpeed(); updateStatus(backend.request(ServiceRequest(command = "disconnect"))) }
+    }
+
+    /** The programs on this machine, for the split-tunnelling picker. Read off the UI thread. */
+    suspend fun discoverApps(): List<DesktopApp> = withContext(Dispatchers.IO) { AppCatalog.discover() }.also { knownApps.value = it }
+
+    /** The last list [discoverApps] found, for drawing chosen applications with their icons. */
+    val knownApps = MutableStateFlow<List<DesktopApp>>(emptyList())
 
     fun text(ru: String, en: String) = strings.text(ru, en)
     fun action(block: suspend () -> Unit) = scope.launch(Dispatchers.IO) {
@@ -111,8 +166,14 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = action {
         commands.withLock {
             if (next.launchAtLogin != desktop.value.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
+            val loweringShield = desktop.value.killSwitch && !next.killSwitch
             desktop.update { next }
             if (reconnect && status.value.state == "connected") { cancelSpeed(); connectSelected() }
+            // Switching the kill switch off while it holds a dead tunnel means "give me my
+            // internet back", not "next time": the block comes down now.
+            else if (loweringShield && status.value.killSwitch && status.value.state != "connecting") {
+                updateStatus(backend.request(ServiceRequest(command = "disconnect")))
+            }
         }
     }
     fun importText(raw: String) = action {
@@ -124,7 +185,7 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
         } else {
             val parsed = SubscriptionParser.parse(value, "manual")
             require(parsed is SubscriptionBody.Nodes)
-            val supported = parsed.nodes.filter { XrayConfigFactory.unsupported(it) == null }
+            val supported = parsed.nodes.mapNotNull(XrayConfigFactory::carriable)
             require(supported.isNotEmpty())
             profiles.addNodes(supported.map { it.copy(subscriptionId = null) })
         }

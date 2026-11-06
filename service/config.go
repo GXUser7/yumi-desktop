@@ -19,9 +19,16 @@ type Options struct {
     BypassLAN bool `json:"bypassLan"`
     DNS string `json:"dns"`
     SplitMode string `json:"splitMode"`
+    // Process names ("chrome.exe") or, from older settings, absolute paths. See applicationVariants.
     Applications []string `json:"applications"`
     Domains []string `json:"domains"`
     Networks []string `json:"networks"`
+    // Block everything outside the tunnel from the moment of connecting until an explicit
+    // disconnect, including after the worker dies. Enforced by the service; see firewall/.
+    KillSwitch bool `json:"killSwitch"`
+    // Russian sites and addresses go around the tunnel, by the geo databases, whatever the
+    // application rules say. Inert until the databases have been downloaded.
+    BypassRussia bool `json:"bypassRussia"`
 }
 type Request struct {
     Version int `json:"version"`
@@ -45,6 +52,18 @@ type Status struct {
     ProbePort int `json:"probePort"`
     ProbeUser string `json:"probeUser"`
     ProbePassword string `json:"probePassword"`
+    // Whether the kill switch is holding traffic right now. It outlives the tunnel on purpose: a
+    // worker that died leaves this true and the state "failed", and only a disconnect clears it.
+    KillSwitch bool `json:"killSwitch"`
+    // The routing databases on disk, for the settings screen. See geo.go.
+    GeoReady bool `json:"geoReady"`
+    GeoUpdating bool `json:"geoUpdating"`
+    GeoUpdatedAt int64 `json:"geoUpdatedAt"`
+    GeoBytes int64 `json:"geoBytes"`
+    GeoError string `json:"geoError,omitempty"`
+    // The worker's adapter, reported to the supervisor and never past it: the kill switch has to
+    // let this interface through and the supervisor strips it before answering the app.
+    TunLUID uint64 `json:"tunLuid,omitempty"`
 }
 
 const maxFrame = 1024 * 1024
@@ -56,7 +75,7 @@ func decodeRequest(data []byte) (Request, error) {
     if len(data) > maxFrame { return r, errors.New("frame_too_large") }
     if err := d.Decode(&r); err != nil { return r, errors.New("invalid_request") }
     if r.Version != 1 { return r, errors.New("unsupported_version") }
-    switch r.Command { case "status", "disconnect": return r, nil; case "connect": default: return r, errors.New("unknown_command") }
+    switch r.Command { case "status", "disconnect", "geo_update": return r, nil; case "connect": default: return r, errors.New("unknown_command") }
     if r.Options == nil || r.NodeID == "" || len(r.NodeID) > 128 { return r, errors.New("invalid_options") }
     if err := validateOptions(*r.Options); err != nil { return r, err }
     if err := validateOutbound(r.Outbound); err != nil { return r, err }
@@ -67,7 +86,7 @@ func validateOptions(o Options) error {
     if o.MTU < 1280 || o.MTU > 9000 || (o.SplitMode != "ExceptSelected" && o.SplitMode != "OnlySelected") { return errors.New("invalid_options") }
     if len(o.Applications)+len(o.Domains)+len(o.Networks) > 1024 { return errors.New("too_many_rules") }
     for _, p := range o.Applications {
-        if !regexp.MustCompile(`(?i)^[a-z]:[/\\].*\.exe$`).MatchString(p) || strings.ContainsAny(p, "\x00\r\n") { return errors.New("invalid_application") }
+        if !validApplication(p) { return errors.New("invalid_application") }
     }
     for _, d := range o.Domains {
         if !validHost(d) || strings.Contains(d, ":") { return errors.New("invalid_domain") }
@@ -149,21 +168,124 @@ func detailOf(err error) string {
 
 func randomSecret() string { b := make([]byte,24); if _,err := rand.Read(b); err != nil { panic(err) }; return base64.RawURLEncoding.EncodeToString(b) }
 
-func buildConfig(r Request, port int, user, password string) obj {
+// An application rule is a process name — "chrome.exe", the way Clash and the core both think of
+// one — or, from settings written before names were accepted, an absolute path to an .exe.
+//
+// Names rather than paths because the core compares paths byte for byte against what Windows
+// reports for the running process, and a path picked out of a shortcut or typed by hand differs
+// from that in case often enough to make the rule match nothing. A name also survives the update
+// that moves an application into a versioned folder, which is how Discord and its relatives ship.
+var applicationName = regexp.MustCompile(`^[^\\/:*?"<>|\x00-\x1f]{1,255}$`)
+var applicationPath = regexp.MustCompile(`(?i)^[a-z]:[/\\].*\.exe$`)
+
+func validApplication(p string) bool {
+    if strings.ContainsAny(p, "\x00\r\n") { return false }
+    if applicationPath.MatchString(p) { return true }
+    trimmed := strings.TrimSpace(p)
+    return trimmed == p && applicationName.MatchString(p) && strings.Trim(p, ".") != ""
+}
+
+// The spellings of an application the core is given.
+//
+// The core matches a name exactly, case included, against the executable's file name without
+// ".exe" (common/net/find_process_windows.go), while Windows itself does not care: "Telegram.exe"
+// launched from a shortcut and "telegram.exe" typed into the box are the same program to everyone
+// but the router. A name picked from the list arrives spelt as it is on disk; one typed by hand
+// arrives as typed, so it is offered in the three spellings people actually use. Paths pass
+// through unchanged — they are compared whole, as before.
+func applicationVariants(apps []string) []string {
+    seen := map[string]bool{}
+    out := []string{}
+    add := func(v string) { if v != "" && !seen[v] { seen[v] = true; out = append(out, v) } }
+    for _, app := range apps {
+        if strings.ContainsAny(app, "/\\") { add(strings.ReplaceAll(app, "\\", "/")); continue }
+        name := app
+        if strings.HasSuffix(strings.ToLower(name), ".exe") { name = name[:len(name)-4] }
+        add(name)
+        add(strings.ToLower(name))
+        if lower := strings.ToLower(name); lower != "" { add(strings.ToUpper(lower[:1]) + lower[1:]) }
+    }
+    return out
+}
+
+// The tunnel's own addresses. Here and only here, because two of the rules below are built from
+// them and the adapter is given them, and a subnet spelt in two places drifts.
+const (
+    tunGatewayV4 = "172.31.255.1/30"
+    tunDNSV4     = "172.31.255.2"
+    tunSubnetV4  = "172.31.255.0/30"
+    tunGatewayV6 = "fdfe:dcba:9876::1/126"
+    tunSubnetV6  = "fdfe:dcba:9876::/126"
+)
+
+// The private ranges, spelt out rather than taken from geoip:private, so that reaching the router
+// or the printer never depends on a database having been downloaded.
+var privateRanges = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"}
+
+// Names that go through the proxy even when the address they resolve to is registered in Russia.
+//
+// The same list as the phone's (XrayConfigFactory.PROXIED_DESPITE_RU_ADDRESS), for the same reason:
+// YouTube's video is served from Google Global Cache nodes inside Russian providers, geoip files
+// those addresses under RU, and a rule sending them direct sends the player to a node that hangs.
+var proxiedDespiteRussianAddress = []string{
+    "domain:googlevideo.com", "domain:youtube.com", "domain:youtu.be", "domain:ytimg.com",
+    "domain:ggpht.com", "domain:youtube-nocookie.com", "domain:youtubei.googleapis.com",
+}
+
+// How long a flow may stay silent, and how long a half-closed one lives, in seconds.
+//
+// The second is the one that bites. The core's default for both directions is one second
+// (features/policy/policy.go), and it is not an idle timeout: it replaces the idle timeout the
+// moment either direction finishes, so a connection whose upload is done has one second to receive
+// something or be shot. The phone's journal showed push connections rebuilt every few minutes for
+// exactly this; a desktop's long-polls and chat sockets have the same shape.
+const (
+    connIdleSeconds   = 1800
+    halfClosedSeconds = 30
+)
+
+func buildConfig(r Request, port int, user, password string, geo bool) obj {
     o := *r.Options
     proxy := obj{}; for k,v := range r.Outbound { proxy[k] = v }; proxy["tag"] = "proxy-node"
     rules := []obj{
         {"type":"field", "inboundTag":[]string{"dns-in","probe-in"}, "outboundTag":"proxy-node"},
         {"type":"field", "port":"53", "outboundTag":"dns-out"},
+        // Everything else addressed to the tunnel's own subnet is dropped, because sending it
+        // anywhere sends it round. Its broadcast address belongs to the adapter, so a datagram for
+        // it that the LAN rule sent direct came straight back into the tunnel as a new flow — the
+        // phone's journal caught that loop eating every UDP port it had.
+        {"type":"field", "ip":[]string{tunSubnetV4, tunSubnetV6}, "outboundTag":"block"},
     }
     if !o.IPv6 { rules = append(rules, obj{"type":"field","ip":[]string{"::/0"},"outboundTag":"block"}) }
-    if o.BypassLAN { rules = append(rules, obj{"type":"field","ip":[]string{"10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","fc00::/7","fe80::/10","::1/128"},"outboundTag":"direct"}) }
+    if o.BypassLAN { rules = append(rules, obj{"type":"field","ip":privateRanges,"outboundTag":"direct"}) }
     target, fallback := "direct", "proxy-node"
     if o.SplitMode == "OnlySelected" { target, fallback = fallback, target }
     // Separate rules implement OR across applications, domains and networks.
-    if len(o.Applications)>0 { rules=append(rules,obj{"type":"field","process":o.Applications,"outboundTag":target}) }
+    //
+    // What the user typed by name or address comes first: it is the most specific thing anybody
+    // said. The geo databases come next and then the applications, which is the point of having
+    // them — a browser sent wholly through the tunnel still opens Russian sites directly.
     if len(o.Domains)>0 { domains:=[]string{}; for _,d := range o.Domains { domains=append(domains,"domain:"+d) }; rules=append(rules,obj{"type":"field","domain":domains,"outboundTag":target}) }
     if len(o.Networks)>0 { rules=append(rules,obj{"type":"field","ip":o.Networks,"outboundTag":target}) }
+    apps := applicationVariants(o.Applications)
+    appRule := func() { if len(apps)>0 { rules=append(rules,obj{"type":"field","process":apps,"outboundTag":target}) } }
+    if o.SplitMode == "ExceptSelected" {
+        // Applications sent around the tunnel go around it for everything, YouTube included, so
+        // they are named before the exception below can catch them.
+        appRule()
+        if geo { rules=append(rules,obj{"type":"field","domain":proxiedDespiteRussianAddress,"outboundTag":"proxy-node"}) }
+    } else if geo && len(apps)>0 {
+        // Only the chosen applications ride the tunnel here, so the YouTube exception is theirs
+        // alone: everything else is direct anyway and must stay so.
+        rules=append(rules,obj{"type":"field","domain":proxiedDespiteRussianAddress,"process":apps,"outboundTag":"proxy-node"})
+    }
+    if geo {
+        rules=append(rules,
+            obj{"type":"field","domain":[]string{"geosite:category-ru"},"outboundTag":"direct"},
+            obj{"type":"field","ip":[]string{"geoip:ru"},"outboundTag":"direct"},
+        )
+    }
+    if o.SplitMode == "OnlySelected" { appRule() }
     rules=append(rules,obj{"type":"field","network":"tcp,udp","outboundTag":fallback})
     dns:=strings.TrimPrefix(o.DNS,"udp://")
     strategy:="UseIPv4"; if o.IPv6 { strategy="UseIP" }
@@ -177,19 +299,23 @@ func buildConfig(r Request, port int, user, password string) obj {
     //
     // Asking for a v6 address and v6 routes while the app's own setting says IPv6 is off was
     // wrong on its own terms too. Now the switch means what it says.
-    gateway:=[]string{"172.31.255.1/30"}
+    gateway:=[]string{tunGatewayV4}
     routes:=[]string{"0.0.0.0/1","128.0.0.0/1"}
     if o.IPv6 {
-        gateway=append(gateway,"fdfe:dcba:9876::1/126")
+        gateway=append(gateway,tunGatewayV6)
         routes=append(routes,"::/1","8000::/1")
     }
     return obj{
         "log":obj{"loglevel":"none"},
-        "stats":obj{}, "policy":obj{"system":obj{"statsOutboundUplink":true,"statsOutboundDownlink":true}},
+        "stats":obj{},
+        "policy":obj{
+            "levels":obj{"0":obj{"connIdle":connIdleSeconds,"uplinkOnly":halfClosedSeconds,"downlinkOnly":halfClosedSeconds}},
+            "system":obj{"statsOutboundUplink":true,"statsOutboundDownlink":true},
+        },
         "dns":obj{"servers":[]string{dns},"queryStrategy":strategy,"tag":"dns-in"},
         "inbounds":[]obj{
             {"tag":"tun-in","protocol":"tun","settings":obj{"name":"Yumi","desc":"Yumi VPN","mtu":o.MTU,
-                "gateway":gateway, "dns":[]string{"172.31.255.2"},
+                "gateway":gateway, "dns":[]string{tunDNSV4},
                 "autoSystemRoutingTable":routes,"autoOutboundsInterface":"auto"},
                 "sniffing":obj{"enabled":true,"destOverride":[]string{"http","tls","quic"},"routeOnly":true}},
             {"tag":"probe-in","protocol":"http","listen":"127.0.0.1","port":port,"settings":obj{"accounts":[]obj{{"user":user,"pass":password}}}},

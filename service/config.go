@@ -244,8 +244,12 @@ const (
     halfClosedSeconds = 30
 )
 
-func buildConfig(r Request, port int, user, password string, geo bool) obj {
+func buildConfig(r Request, port int, user, password string, geo bool, outbound ...string) obj {
     o := *r.Options
+    // "auto" lets the core guess the physical adapter by name, and it can guess VirtualBox
+    // Host-Only over a localized Wi-Fi; the supervisor passes the real default-route interface.
+    outboundInterface := "auto"
+    if len(outbound) > 0 && outbound[0] != "" { outboundInterface = outbound[0] }
     proxy := obj{}; for k,v := range r.Outbound { proxy[k] = v }; proxy["tag"] = "proxy-node"
     rules := []obj{
         {"type":"field", "inboundTag":[]string{"dns-in","probe-in"}, "outboundTag":"proxy-node"},
@@ -316,7 +320,7 @@ func buildConfig(r Request, port int, user, password string, geo bool) obj {
         "inbounds":[]obj{
             {"tag":"tun-in","protocol":"tun","settings":obj{"name":"Yumi","desc":"Yumi VPN","mtu":o.MTU,
                 "gateway":gateway, "dns":[]string{tunDNSV4},
-                "autoSystemRoutingTable":routes,"autoOutboundsInterface":"auto"},
+                "autoSystemRoutingTable":routes,"autoOutboundsInterface":outboundInterface},
                 "sniffing":obj{"enabled":true,"destOverride":[]string{"http","tls","quic"},"routeOnly":true}},
             {"tag":"probe-in","protocol":"http","listen":"127.0.0.1","port":port,"settings":obj{"accounts":[]obj{{"user":user,"pass":password}}}},
         },

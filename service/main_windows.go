@@ -147,7 +147,9 @@ func (s *supervisor) connect(r Request) error {
     initial:=Status{Version:1,State:"connecting",NodeID:r.NodeID,ProbePort:port,ProbeUser:randomSecret(),ProbePassword:randomSecret()}
     s.mu.Lock();dir:=s.geoDir;s.mu.Unlock()
     geo:=r.Options.BypassRussia && inspectGeo(dir).Ready
-    config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword,geo)
+    // Resolved before the TUN routes exist; if it cannot be, the core's own guess is still used.
+    outbound,_:=outboundInterface()
+    config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword,geo,outbound)
     exe,err:=os.Executable();if err!=nil{return errors.New("worker_unavailable")}
     child:=exec.Command(exe,"--worker")
     child.SysProcAttr=&syscall.SysProcAttr{HideWindow:true}

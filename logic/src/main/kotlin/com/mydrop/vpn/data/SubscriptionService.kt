@@ -55,7 +55,7 @@ data class DeviceIdentity(
 class SubscriptionService(
     private val logs: LogRepository,
     private val strings: Strings,
-    private val userAgent: String = "Yumi/0.2.0 (Windows)",
+    private val userAgent: String = "Yumi/0.2.1 (Windows)",
     private val identity: () -> DeviceIdentity? = { null },
     /**
      * How to reach the running tunnel from inside this process, or null when there is none.

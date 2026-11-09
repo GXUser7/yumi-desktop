@@ -7,6 +7,7 @@ import com.mydrop.vpn.data.*
 import com.mydrop.vpn.pairing.*
 import com.yumi.desktop.model.*
 import com.yumi.desktop.platform.*
+import com.yumi.desktop.update.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -14,12 +15,20 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
 
-class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val directory: File = DesktopPlatform.dataDirectory()) {
-    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+class DesktopModel(
+    val backend: TunnelBackend = WindowsTunnelBackend(),
+    val directory: File = DesktopPlatform.dataDirectory(),
+    val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+) {
     val message = MutableStateFlow<String?>(null)
     val settings = SettingsRepository(directory, scope)
     val profiles = ProfileRepository(directory, scope)
     val desktop = JsonStore(File(directory, "desktop.json"), DesktopSettings.serializer(), DesktopSettings(), scope)
+    val updates = DesktopUpdater(
+        scope, GitHubUpdates(File(directory, "updates"), HttpsUpdateTransport(AppVersion)), desktop.state, AppVersion,
+        installed = DesktopPlatform.installedDirectory() != null,
+        automatic = backend is WindowsTunnelBackend && System.getProperty("jpackage.app-path") != null,
+    )
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)
     val status = MutableStateFlow(ServiceStatus(state = "unavailable"))
@@ -38,7 +47,9 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     }
     private val commands = Mutex()
     private val subscriptions = Mutex()
+    private val probes = Mutex()
     private var speedJob: Job? = null
+    private var startupConnectPending = desktop.value.connectOnLaunch
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
         DeviceIdentity(settings.value.deviceId, System.getProperty("os.name"), System.getProperty("os.version"), "Yumi Desktop")
     }, probeEndpoint = { status.value.probe() })
@@ -55,7 +66,10 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
         if (names != desktop.value.applications) desktop.update { it.copy(applications = names) }
         scope.launch {
             while (isActive) {
-                commands.withLock { updateStatus(backend.request(ServiceRequest(command = "status"))) }
+                commands.withLock {
+                    updateStatus(backend.request(ServiceRequest(command = "status")))
+                    connectOnStartup()
+                }
                 afterStatus()
                 delay(1000)
             }
@@ -106,6 +120,14 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     private var geoWasReady = false
     private var geoSeen = false
 
+    private suspend fun connectOnStartup() {
+        if (!startupConnectPending || status.value.state == "unavailable") return
+        startupConnectPending = false
+        if (desktop.value.connectOnLaunch && status.value.state == "disconnected" && profiles.selectedNode() != null) {
+            connectSelected()
+        }
+    }
+
     /** Fetches the routing databases again; the service reports progress on the status. */
     fun updateGeo() = action {
         commands.withLock { updateStatus(backend.request(ServiceRequest(command = "geo_update"))) }
@@ -144,6 +166,7 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     }
     fun toggleConnection() = action {
         commands.withLock {
+            startupConnectPending = false
             cancelSpeed()
             if (status.value.state in listOf("connected", "connecting")) {
                 updateStatus(backend.request(ServiceRequest(command = "disconnect")))
@@ -175,6 +198,7 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
             if (next.launchAtLogin != desktop.value.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
             val loweringShield = desktop.value.killSwitch && !next.killSwitch
             desktop.update { next }
+            if (!next.connectOnLaunch) startupConnectPending = false
             if (reconnect && status.value.state == "connected") { cancelSpeed(); connectSelected() }
             // Switching the kill switch off while it holds a dead tunnel means "give me my
             // internet back", not "next time": the block comes down now.
@@ -257,9 +281,24 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
         }
     }
     fun ping() = action {
+        if (!probes.tryLock()) return@action
         busy.value = true
-        try { LatencyTester().measureAll(profiles.nodes, settings.value.pingMode) { profiles.recordLatency(it) } }
-        finally { busy.value = false }
+        try {
+            coroutineScope {
+                val pending = java.util.concurrent.ConcurrentLinkedQueue<LatencyResult>()
+                fun flush() {
+                    val batch = buildList { while (true) add(pending.poll() ?: break) }
+                    if (batch.isNotEmpty()) profiles.recordLatencies(batch)
+                }
+                val writer = launch { while (isActive) { delay(200); flush() } }
+                try {
+                    LatencyTester().measureAll(profiles.nodes, settings.value.pingMode) { pending.add(it) }
+                } finally {
+                    writer.cancelAndJoin()
+                    flush()
+                }
+            }
+        } finally { busy.value = false; probes.unlock() }
     }
     fun startPairing() {
         localAddresses.value = DesktopPlatform.localAddresses()

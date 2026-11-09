@@ -53,7 +53,7 @@ class DemoBackend : TunnelBackend {
 }
 
 /** A subscription's worth of made-up servers, written where the model will read them. */
-fun seedDemo(directory: File) {
+fun seedDemo(directory: File, nodeCount: Int = 6) {
     directory.listFiles()?.forEach { it.deleteRecursively() }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     try {
@@ -91,16 +91,23 @@ fun seedDemo(directory: File) {
                 subscriptionId = subscription.id,
             ).identified()
         }
+        val many = List(nodeCount) { index ->
+            val node = servers[index % servers.size]
+            if (index < servers.size) node else node.copy(
+                id = "", name = "${node.name} · ${index + 1}", server = "192.0.${index / 250}.${index % 250 + 1}",
+            ).identified()
+        }
         profiles.applySubscriptionUpdate(
             subscription.id,
-            servers,
+            many,
             SubscriptionUserInfo(uploadBytes = 4_100_000_000, downloadBytes = 61_300_000_000, totalBytes = 200_000_000_000, expiresAtEpochSeconds = System.currentTimeMillis() / 1000 + 23 * 86_400),
             "Yumi Cloud",
             null,
         )
         profiles.selectNode(servers.first().id)
         val now = System.currentTimeMillis()
-        listOf(38, 46, 61, 97, 142, 214).zip(servers).forEach { (millis, node) -> profiles.recordLatency(LatencyResult(node.id, millis, now)) }
+        val latencies = listOf(38, 46, 61, 97, 142, 214)
+        profiles.recordLatencies(many.mapIndexed { index, node -> LatencyResult(node.id, latencies[index % latencies.size], now) })
     } finally {
         scope.cancel()
     }

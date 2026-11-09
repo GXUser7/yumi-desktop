@@ -11,7 +11,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
@@ -20,20 +19,20 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.drawscope.withTransform
-import androidx.compose.ui.graphics.layer.GraphicsLayer
-import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
-import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.graphics.shapes.Morph
 import androidx.graphics.shapes.RoundedPolygon
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.LayoutDirection
 import kotlin.math.ceil
 import kotlin.math.min
 import kotlin.math.sin
@@ -72,13 +71,17 @@ const val PageGlassAlpha = 0.84f
 /** The scene under the window, recorded once per frame for every pane of glass to show. */
 @Stable
 class BackdropState {
-    internal var frost: GraphicsLayer? = null
+    internal var scene by mutableStateOf<SceneFrame?>(null)
+    internal val frost get() = scene?.frost
     /** How many times smaller [frost] is recorded than the window. */
     internal var shrink = 8f
-    /** Bumped every time [frost] is recorded; read by glass in its draw pass so it redraws with it. */
+    /** Published frame count, used by the rendering regression test. */
     internal var frame by mutableLongStateOf(0L)
+    private var generation = 0L
+    // Publish from the producer, never from draw: drawing must not schedule its own next frame.
+    internal fun recorded() { frame = ++generation }
     /** The pointer, as -1..1 across the window, for parallax and the light. */
-    internal var pointer by mutableStateOf(Offset.Zero)
+    internal var pointer = Offset.Zero
 }
 
 val LocalBackdrop = staticCompositionLocalOf<BackdropState?> { null }
@@ -104,7 +107,10 @@ val LocalWindowMotion = staticCompositionLocalOf { WindowMotion() }
  * behind by their inertia — the nearer ones more — then swing back and settle. That is when matte
  * glass earns its keep, because it is moving colour under it that shows it is glass at all.
  */
+private data class ScenePose(val dx: FloatArray, val dy: FloatArray, val turn: FloatArray)
+
 private class SceneMotion(count: Int) {
+    fun pose() = ScenePose(dx.copyOf(), dy.copyOf(), turn.copyOf())
     val dx = FloatArray(count)
     val dy = FloatArray(count)
     val vx = FloatArray(count)
@@ -186,14 +192,15 @@ fun Modifier.glass(shape: Shape, tint: Color): Modifier = composed {
         .drawBehind {
             val frost = backdrop?.frost
             if (backdrop != null && frost != null) {
-                @Suppress("UNUSED_VARIABLE") val frame = backdrop.frame
                 val at = origin.value
                 translate(-at.x, -at.y) {
-                    scale(backdrop.shrink, backdrop.shrink, pivot = Offset.Zero) { drawLayer(frost) }
+                    scale(backdrop.shrink, backdrop.shrink, pivot = Offset.Zero) { drawImage(frost) }
                 }
             }
             drawRect(tint)
         }
+        // Keep text, charts and controls recorded independently of the moving glass behind them.
+        .graphicsLayer()
 }
 
 /* ── The scene ────────────────────────────────────────────────────────────────────────────── */
@@ -211,8 +218,8 @@ private class SceneShape(
     val spin: Float,
     val morphSeconds: Float = 0f,
 ) {
-    val morph = Morph(from, to ?: from)
-    val path = Path()
+    val morph = to?.let { Morph(from, it) }
+    val path = Path().also { if (to == null) Morph(from, from).toPath(0f, it) }
 }
 
 /** YouCloud's scene, laid out for a window that is wider than it is tall. */
@@ -225,7 +232,7 @@ private fun sceneShapes() = listOf(
     SceneShape(MaterialShapes.Pill, MaterialShapes.Sunny, cx = 0.22f, cy = 0.96f, size = 0.42f, depth = 0.95f, spin = -3f, morphSeconds = 14f),
 )
 
-private class ScenePalette(val ground: Color, val body: Color, val light: Color, val dark: Color, val darkTheme: Boolean)
+private data class ScenePalette(val ground: Color, val body: Color, val light: Color, val dark: Color, val darkTheme: Boolean)
 
 @Composable
 private fun scenePalette(): ScenePalette {
@@ -257,112 +264,135 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
     val state = remember { BackdropState() }
     val palette = scenePalette()
     val shapes = remember { sceneShapes() }
-    val focused = LocalWindowInfo.current.isWindowFocused
+    val focused = LocalUiFrameProbe.current != null || LocalWindowInfo.current.isWindowFocused
+    val active = LocalAnimationsActive.current
+    val running = animated && active
     val window = LocalWindowMotion.current
-    val density = LocalDensity.current.density
+    val density = LocalDensity.current
     val motion = remember { SceneMotion(shapes.size) }
-    var seconds by remember { mutableFloatStateOf(0f) }
-    var light by remember { mutableStateOf(Offset(-0.55f, -0.75f)) }
-    // The window's shorter side, for how far a shape may be thrown; a holder, not state, because
-    // it is written while drawing.
-    val unit = remember { floatArrayOf(800f) }
+    val timeline = remember { floatArrayOf(0f) }
+    val lighting = remember { arrayOf(Offset(-0.55f, -0.75f)) }
+    var dimensions by remember { mutableStateOf(IntSize.Zero) }
+    val dispatcher = LocalBackdropDispatcher.current
 
-    LaunchedEffect(animated, focused) {
-        if (!animated) return@LaunchedEffect
-        var last = 0L
-        var lastX = window.x
-        var lastY = window.y
-        var wasKnown = window.known
-        while (true) {
-            withInfiniteAnimationFrameNanos { now ->
-                val dt = if (last == 0L) 0f else ((now - last) / 1e9f).coerceAtMost(0.1f)
-                last = now
-                seconds += dt
-                // How far the window moved since the last frame, in pixels. The first position the
-                // listener reports is where the window opened, not a move.
-                val x = window.x
-                val y = window.y
-                val moved = window.known && wasKnown
-                val movedX = if (moved) (x - lastX) * density else 0f
-                val movedY = if (moved) (y - lastY) * density else 0f
-                lastX = x; lastY = y; wasKnown = window.known
-                motion.step(dt, movedX, movedY, shapes, unit[0] * 0.3f)
-                // The light follows the pointer, eased, so it swings rather than jumps.
-                val target = Offset(-0.55f + state.pointer.x * 0.35f, -0.75f + state.pointer.y * 0.3f)
-                light = light + (target - light) * 0.08f
+    DisposableEffect(state) {
+        onDispose { state.scene?.close(); state.scene = null }
+    }
+    LaunchedEffect(dimensions, palette, density, running, focused, active) {
+        if (dimensions.width <= 0 || dimensions.height <= 0) return@LaunchedEffect
+        if (!active && state.scene != null) return@LaunchedEffect
+        var ownedRenderer: SceneRenderer? = null
+        var pending: SceneFrame? = null
+        try {
+            withContext(dispatcher) { ownedRenderer = SceneRenderer(dimensions, density) }
+            val renderer = checkNotNull(ownedRenderer)
+            var last = 0L
+            var lastX = window.x
+            var lastY = window.y
+            var wasKnown = window.known
+            while (isActive) {
+                val started = withInfiniteAnimationFrameNanos { now ->
+                    val dt = if (last == 0L || !running) 0f else ((now - last) / 1e9f).coerceIn(0f, 0.1f)
+                    last = now
+                    timeline[0] += dt
+                    val x = window.x
+                    val y = window.y
+                    val moved = running && window.known && wasKnown
+                    motion.step(dt, if (moved) (x - lastX) * density.density else 0f,
+                        if (moved) (y - lastY) * density.density else 0f, shapes, min(dimensions.width, dimensions.height) * 0.3f)
+                    lastX = x; lastY = y; wasKnown = window.known
+                    val target = Offset(-0.55f + state.pointer.x * 0.35f, -0.75f + state.pointer.y * 0.3f)
+                    lighting[0] += (target - lighting[0]) * (1f - kotlin.math.exp(-2.5f * dt))
+                    now
+                }
+                val time = timeline[0]
+                val light = lighting[0].normalised()
+                val pointer = state.pointer
+                val pose = motion.pose()
+                withContext(dispatcher) { pending = renderer.render(palette, time, light, pointer, pose) }
+                val previous = state.scene
+                state.scene = checkNotNull(pending)
+                pending = null
+                state.shrink = renderer.shrink
+                state.recorded()
+                previous?.close()
+                if (!running) awaitCancellation()
+                val lightMoving = (Offset(-0.55f + pointer.x * 0.35f, -0.75f + pointer.y * 0.3f) - lighting[0]).getDistance() > 0.005f
+                val interval = when { motion.active || lightMoving -> 0L; focused -> 33_333_333L; else -> 100_000_000L }
+                val remaining = (started + interval - System.nanoTime()) / 1_000_000L
+                if (remaining > 0) delay(remaining)
             }
-            // Every frame while something swings — a window being dragged is the moment the
-            // glass is looked at hardest — and a gentle 30 or 10 a second while it only drifts.
-            when {
-                motion.active -> Unit
-                focused -> delay(33)
-                else -> delay(100)
-            }
+        } finally {
+            withContext(NonCancellable + dispatcher) { pending?.close(); ownedRenderer?.close() }
         }
     }
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val position = event.changes.firstOrNull()?.position ?: continue
-                        state.pointer = Offset(
-                            (position.x / size.width.coerceAtLeast(1)) * 2f - 1f,
-                            (position.y / size.height.coerceAtLeast(1)) * 2f - 1f,
-                        )
-                    }
-                }
+    Box(Modifier.fillMaxSize().onSizeChanged { dimensions = it }.pointerInput(running) {
+        if (!running) return@pointerInput
+        awaitPointerEventScope {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val position = event.changes.firstOrNull()?.position ?: continue
+                state.pointer = Offset((position.x / size.width.coerceAtLeast(1)) * 2f - 1f,
+                    (position.y / size.height.coerceAtLeast(1)) * 2f - 1f)
             }
-            .drawWithCache {
-                val farLayer = obtainGraphicsLayer()
-                val nearLayer = obtainGraphicsLayer()
-                val frostLayer = obtainGraphicsLayer()
-                // The far shapes four times smaller and blurred 8 dp, the near ones twice and 3 dp,
-                // both stretched back over the ground: soft shapes lose nothing by it, and a
-                // full-window blur per frame was most of what the scene cost.
-                val farBlur = 8.dp.toPx() / 4f
-                val nearBlur = 3.dp.toPx() / 2f
-                farLayer.renderEffect = BlurEffect(farBlur, farBlur, TileMode.Decal)
-                nearLayer.renderEffect = BlurEffect(nearBlur, nearBlur, TileMode.Decal)
-                val shrink = shrinkFor(FrostBlur.toPx())
-                state.shrink = shrink
-                frostLayer.renderEffect = BlurEffect(FrostBlur.toPx() / shrink, FrostBlur.toPx() / shrink, TileMode.Clamp)
-                state.frost = frostLayer
-                val farIndices = shapes.indices.filter { shapes[it].depth < 0.6f }
-                val nearIndices = shapes.indices.filter { shapes[it].depth >= 0.6f }
-                unit[0] = min(size.width, size.height)
-                val full = size
-                val pixels = density
-                onDrawBehind {
-                    val time = seconds
-                    val lightNow = light.normalised()
-                    val pointer = state.pointer
-                    farLayer.record(scaled(size, 4f)) {
-                        scale(0.25f, 0.25f, pivot = Offset.Zero) { drawScene(shapes, farIndices, palette, time, lightNow, pointer, motion, full, pixels) }
-                    }
-                    nearLayer.record(scaled(size, 2f)) {
-                        scale(0.5f, 0.5f, pivot = Offset.Zero) { drawScene(shapes, nearIndices, palette, time, lightNow, pointer, motion, full, pixels) }
-                    }
-                    drawRect(palette.ground)
-                    scale(4f, 4f, pivot = Offset.Zero) { drawLayer(farLayer) }
-                    scale(2f, 2f, pivot = Offset.Zero) { drawLayer(nearLayer) }
-                    // What glass shows: the same picture, eight times smaller and blurred again.
-                    frostLayer.record(scaled(size, shrink)) {
-                        scale(1f / shrink, 1f / shrink, pivot = Offset.Zero) {
-                            drawRect(palette.ground)
-                            scale(4f, 4f, pivot = Offset.Zero) { drawLayer(farLayer) }
-                            scale(2f, 2f, pivot = Offset.Zero) { drawLayer(nearLayer) }
-                        }
-                    }
-                    state.frame = state.frame + 1
-                }
-            },
-    ) {
+        }
+    }) {
+        Box(Modifier.matchParentSize().graphicsLayer().drawBehind {
+            val scene = state.scene
+            if (scene == null) drawRect(palette.ground)
+            else scale(2f, 2f, pivot = Offset.Zero) { drawImage(scene.image) }
+        })
         CompositionLocalProvider(LocalBackdrop provides state, content = content)
     }
+}
+
+/** CPU raster work runs away from the UI thread; a new frame is published only when complete. */
+internal val LocalBackdropDispatcher = staticCompositionLocalOf<CoroutineDispatcher> { Dispatchers.Default }
+
+internal class SceneFrame(val image: ImageBitmap, val frost: ImageBitmap) : AutoCloseable {
+    override fun close() { image.asSkiaBitmap().close(); frost.asSkiaBitmap().close() }
+}
+
+private class SceneRenderer(dimensions: IntSize, private val density: Density) : AutoCloseable {
+    private val full = Size(dimensions.width.toFloat(), dimensions.height.toFloat())
+    private val shapes = sceneShapes()
+    private val farIndices = shapes.indices.filter { shapes[it].depth < 0.6f }
+    private val nearIndices = shapes.indices.filter { shapes[it].depth >= 0.6f }
+    private val far = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
+    private val near = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
+    private val scene = SceneBuffer()
+    private val frost = FrostBuffer()
+    val shrink = shrinkFor(FrostBlur.value * density.density)
+    init {
+        far.prepare(scaled(full, 4f), 8f * density.density / 4f)
+        near.prepare(scaled(full, 2f), 3f * density.density / 2f)
+        scene.prepare(scaled(full, 2f))
+        frost.prepare(scaled(full, shrink), FrostBlur.value * density.density / shrink)
+    }
+    fun render(palette: ScenePalette, time: Float, light: Offset, pointer: Offset, pose: ScenePose): SceneFrame {
+        val pixels = density.density
+        val farImage = far.record(density, LayoutDirection.Ltr) {
+            scale(0.25f, 0.25f, Offset.Zero) { drawScene(shapes, farIndices, palette, time, light, pointer, pose, full, pixels) }
+        }
+        val nearImage = near.record(density, LayoutDirection.Ltr) {
+            scale(0.5f, 0.5f, Offset.Zero) { drawScene(shapes, nearIndices, palette, time, light, pointer, pose, full, pixels) }
+        }
+        try {
+            val image = scene.record(density, LayoutDirection.Ltr) {
+                drawRect(palette.ground)
+                scale(2f, 2f, Offset.Zero) { drawImage(farImage) }
+                drawImage(nearImage)
+            }
+            try {
+                val frosted = frost.record(density, LayoutDirection.Ltr) {
+                    scale(2f / shrink, 2f / shrink, Offset.Zero) { drawImage(image) }
+                }
+                return SceneFrame(image, frosted)
+            } catch (error: Throwable) { image.asSkiaBitmap().close(); throw error }
+        } finally { farImage.asSkiaBitmap().close(); nearImage.asSkiaBitmap().close() }
+    }
+    override fun close() { far.close(); near.close(); scene.close(); frost.close() }
 }
 
 private fun shrinkFor(blurPx: Float): Float = (blurPx / 6f).toInt().coerceIn(1, 8).toFloat()
@@ -386,7 +416,7 @@ private fun DrawScope.drawScene(
     time: Float,
     light: Offset,
     pointer: Offset,
-    motion: SceneMotion,
+    motion: ScenePose,
     full: Size,
     density: Float,
 ) {
@@ -404,8 +434,10 @@ private fun DrawScope.drawScene(
             shape.cy * full.height - pointer.y * parallax + sin(time * 0.35f + i * 1.7f) * 6f * density * shape.depth + motion.dy[i],
         )
         val progress = if (shape.morphSeconds > 0f) (sin(time / shape.morphSeconds * 2f * Math.PI.toFloat()) + 1f) / 2f else 0f
-        shape.path.reset()
-        shape.morph.toPath(progress, shape.path)
+        shape.morph?.let { morph ->
+            shape.path.reset()
+            morph.toPath(progress, shape.path)
+        }
         val angle = time * shape.spin + i * 37f + motion.turn[i]
 
         val bodyColor = lerp(palette.ground, palette.body, 0.45f + 0.55f * shape.depth)

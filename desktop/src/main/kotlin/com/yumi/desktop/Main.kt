@@ -20,11 +20,13 @@ import java.io.RandomAccessFile
 import javax.imageio.ImageIO
 
 fun main(args: Array<String>) {
-    val demo = "--ui-demo" in args
+    val benchmark = "--ui-benchmark" in args
+    val preview = "--ui-preview" in args
+    val demo = "--ui-demo" in args || benchmark || preview
     val smoke = "--ui-smoke" in args || demo
     if(smoke) System.setProperty("yumi.dataDir",File(if(demo) ".local/ui-demo" else ".local/ui-smoke").absolutePath)
     val directory = DesktopPlatform.dataDirectory()
-    if(demo) seedDemo(directory)
+    if(demo) seedDemo(directory, if (benchmark) 600 else 6)
     val lockFile = RandomAccessFile(File(directory,"instance.lock"),"rw")
     val lock = lockFile.channel.tryLock()
     if(lock==null){File(directory,"activate").writeText(System.nanoTime().toString());lockFile.close();return}
@@ -39,10 +41,38 @@ fun main(args: Array<String>) {
     application {
         var visible by remember{mutableStateOf("--tray" !in args)}
         var smokePage by remember{mutableStateOf(Page.Connect)}
+        val frameProbe = remember { if (benchmark) UiFrameProbe() else null }
         val scope=rememberCoroutineScope()
         val settings by model.settings.settings.collectAsState()
         val status by model.status.collectAsState()
-        val close = { scope.launch { model.close();lock.release();lockFile.close();exitApplication() };Unit }
+        var closing by remember { mutableStateOf(false) }
+        suspend fun launchReadyUpdate(): Boolean {
+            val ready = model.updates.readyToInstall() ?: return false
+            return withContext(Dispatchers.IO) { DesktopPlatform.installUpdate(ready.file) }
+        }
+        val close = {
+            if (!closing) {
+                closing = true
+                scope.launch {
+                    try {
+                        if (!smoke && model.desktop.value.autoUpdate && model.updates.installed) runCatching { launchReadyUpdate() }
+                        model.close()
+                    } finally { lock.release(); lockFile.close(); exitApplication() }
+                }
+            }
+            Unit
+        }
+        val installUpdate = {
+            if (!closing) {
+                closing = true
+                scope.launch {
+                    if (launchReadyUpdate()) {
+                        try { model.close() } finally { lock.release(); lockFile.close(); exitApplication() }
+                    } else closing = false
+                }
+            }
+            Unit
+        }
         // The app's own mark, the one the phone wears, as the window icon, the tray icon and —
         // through the .ico beside it in the build script — the icon on the executable itself.
         val icon=remember(::yumiMark)
@@ -78,12 +108,24 @@ fun main(args: Array<String>) {
                 window.addComponentListener(listener)
                 onDispose { window.removeComponentListener(listener) }
             }
-            CompositionLocalProvider(LocalWindowMotion provides windowMotion) { YumiApp(model,smokePage) }
+            CompositionLocalProvider(
+                LocalWindowMotion provides windowMotion,
+                LocalAnimationsActive provides (visible && !windowState.isMinimized),
+                LocalUiFrameProbe provides frameProbe,
+            ) { YumiApp(model,smokePage, onInstallUpdate = installUpdate) }
+            if (benchmark) DisposableEffect(window) {
+                val detach = checkNotNull(frameProbe).attach(window)
+                onDispose(detach)
+            }
             LaunchedEffect(Unit) {
                 val activation=File(directory,"activate");var stamp=activation.lastModified()
                 while(isActive){delay(500);val next=activation.lastModified();if(next!=stamp){stamp=next;visible=true;window.toFront();window.requestFocus()}}
             }
-            if(smoke) LaunchedEffect(Unit) {
+            if(benchmark) LaunchedEffect(Unit) {
+                benchmarkUi(model, checkNotNull(frameProbe), { smokePage = it }, { visible = it })
+                close()
+            }
+            if(smoke && !benchmark && !preview) LaunchedEffect(Unit) {
                 val output=File(".local/screenshots").also(File::mkdirs)
                 val prefix=if(demo) "demo" else "smoke"
                 if(demo){delay(1500);model.toggleConnection();delay(3500)}

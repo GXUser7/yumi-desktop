@@ -35,6 +35,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,7 +91,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     Settings("Настройки", "Settings", Icons.Rounded.Settings),
 }
 
-@Composable fun YumiApp(model: DesktopModel, initialPage: Page = Page.Connect) {
+@Composable fun YumiApp(model: DesktopModel, initialPage: Page = Page.Connect, onInstallUpdate: () -> Unit = {}) {
     val settings by model.settings.settings.collectAsState()
     val desktop by model.desktop.state.collectAsState()
     val notice by model.message.collectAsState()
@@ -115,7 +117,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
                                 Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
                                 Page.Routing -> RoutingPage(model)
                                 Page.Speed -> SpeedPage(model)
-                                Page.Settings -> SettingsPage(model)
+                                Page.Settings -> SettingsPage(model, onInstallUpdate)
                             }
                         }
                     }
@@ -206,58 +208,82 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 }
 
 /**
- * The tunnel's state, always on screen: a cookie in the state's colour on a glass circle, turning
- * while the tunnel is being raised. The one place the window says what the tunnel is doing while
- * the user is on another page.
+ * The tunnel's state on every page: the expressive cookie while busy, rounded Material shields
+ * when settled, and a warning triangle whose tooltip explains a failure.
  */
 @OptIn(ExperimentalFoundationApi::class)
-@Composable private fun TunnelCookie(m: DesktopModel, status: ServiceStatus, onClick: () -> Unit) {
+@Composable internal fun TunnelCookie(m: DesktopModel, status: ServiceStatus, onClick: () -> Unit) {
     val semantic = LocalSemanticColors.current
+    val busy = status.state == "connecting" || status.state == "disconnecting"
+    val connected = status.state == "connected"
+    val blocked = status.killSwitch && !connected && !busy
+    val failed = status.state == "failed" || status.state == "unavailable" || !status.error.isNullOrBlank() || blocked
     val color = when {
-        status.state == "connected" -> semantic.connected
-        status.state == "connecting" || status.state == "disconnecting" -> semantic.connecting
-        status.killSwitch -> MaterialTheme.colorScheme.tertiary
-        status.state == "unavailable" || status.state == "failed" -> MaterialTheme.colorScheme.error
+        failed -> MaterialTheme.colorScheme.error
+        connected -> semantic.connected
+        busy -> semantic.connecting
         else -> MaterialTheme.colorScheme.outline
     }
     val label = when {
-        status.state == "connected" -> m.text("Защищено", "Protected")
+        failed -> buildList {
+            val error = status.error?.takeIf { it.isNotBlank() }
+            add(when {
+                error != null -> serviceError(m, error, includeUnknown = status.detail.isNullOrBlank())
+                status.state == "unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
+                status.state == "failed" -> m.text("Не удалось запустить туннель.", "Could not start the tunnel.")
+                else -> m.text("VPN отключён.", "VPN is disconnected.")
+            })
+            status.detail?.trim()?.takeIf { it.isNotEmpty() && it !in this }?.let { add(it) }
+            if (blocked) add(m.text("Килл свитч удерживает интернет. Открой подключение, чтобы снять блокировку.", "The kill switch is holding traffic. Open Connection to lift the block."))
+        }.joinToString("\n\n")
+        connected -> m.text("Защищено", "Protected")
         status.state == "connecting" -> m.text("Подключение…", "Connecting…")
-        status.killSwitch -> m.text("Килл свитч держит интернет", "Kill switch is holding traffic")
+        status.state == "disconnecting" -> m.text("Отключение…", "Disconnecting…")
         else -> m.text("Не защищено", "Unprotected")
     }
     val interaction = remember { MutableInteractionSource() }
-    val spin = rememberInfiniteTransition(label = "cookie")
-    val angle by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(6000, easing = LinearEasing)), label = "cookie-angle")
+    val angle = if (busy && !failed && LocalAnimationsActive.current) {
+        val spin = rememberInfiniteTransition(label = "cookie")
+        spin.animateFloat(0f, 360f, infiniteRepeatable(tween(6000, easing = LinearEasing)), label = "cookie-angle")
+    } else null
     TooltipArea(
-        tooltip = { HoverLabel(label) },
+        tooltip = {
+            Surface(shape = RowShape, color = MaterialTheme.colorScheme.inverseSurface, shadowElevation = 6.dp) {
+                Text(label, Modifier.widthIn(max = 360.dp).padding(horizontal = 16.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.inverseOnSurface)
+            }
+        },
         delayMillis = 250,
         tooltipPlacement = TooltipPlacement.ComponentRect(Alignment.CenterEnd, Alignment.CenterEnd, DpOffset(14.dp, 0.dp)),
     ) {
         Box(
             Modifier
                 .size(56.dp)
+                .testTag("tunnel-status")
+                .semantics { contentDescription = label }
                 .pressMorph(interaction)
                 .glass(CircleShape, glassTint())
-                .clickable(interaction, indication = null, onClick = onClick),
+                .clickable(interaction, indication = null, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
             val animated by animateColorAsState(color, colorTween(), label = "cookie-color")
-            val busy = status.state == "connecting" || status.state == "disconnecting"
-            Box(
+            if (busy && !failed) Box(
                 Modifier
                     .size(24.dp)
-                    .graphicsLayerRotation(if (busy || status.state == "connected") angle else 0f)
+                    .testTag("tunnel-status-busy")
+                    .graphicsLayer { rotationZ = angle?.value ?: 0f }
                     .clip(MaterialShapes.Cookie9Sided.toShape())
                     .background(animated),
+            )
+            else Icon(
+                imageVector = when { failed -> Icons.Rounded.Warning; connected -> Icons.Rounded.GppGood; else -> Icons.Rounded.GppBad },
+                contentDescription = null,
+                modifier = Modifier.size(26.dp).testTag(when { failed -> "tunnel-status-error"; connected -> "tunnel-status-connected"; else -> "tunnel-status-idle" }),
+                tint = animated,
             )
         }
     }
 }
-
-private fun Modifier.graphicsLayerRotation(degrees: Float) = this.then(
-    Modifier.graphicsLayer { rotationZ = degrees },
-)
 
 /* ── Shared bits ──────────────────────────────────────────────────────────────────────────── */
 
@@ -731,22 +757,30 @@ private val ReadingWidth = 860.dp
     val profiles by m.profiles.state.collectAsState()
     val busy by m.busy.collectAsState()
     var query by remember { mutableStateOf("") }
-    val matches = remember(profiles.visibleNodes, query) { profiles.visibleNodes.filter { it.name.contains(query, true) } }
+    val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
+    val matches = remember(visibleNodes, query) {
+        if (query.isBlank()) visibleNodes else visibleNodes.filter { it.name.contains(query, true) }
+    }
     val grid = rememberLazyGridState()
+    val frameProbe = LocalUiFrameProbe.current
+    DisposableEffect(grid, frameProbe) {
+        frameProbe?.grid = grid
+        onDispose { frameProbe?.grid = null }
+    }
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         PageTitle(
             m.strings.get(R.string.servers_title),
             m.strings.get(
                 R.string.servers_subtitle,
-                m.strings.plural(R.plurals.servers, profiles.visibleNodes.size),
+                m.strings.plural(R.plurals.servers, visibleNodes.size),
                 m.strings.plural(R.plurals.sources, profiles.subscriptions.size),
             ),
         ) {
-            AccentButton(m.strings.get(R.string.servers_measure_latency), icon = Icons.Rounded.Bolt, enabled = !busy && profiles.visibleNodes.isNotEmpty()) { m.ping() }
+            AccentButton(m.strings.get(R.string.servers_measure_latency), icon = Icons.Rounded.Bolt, enabled = !busy && visibleNodes.isNotEmpty()) { m.ping() }
         }
         Box(Modifier.glass(PillShape, glassTint()).fillMaxWidth()) {
-            GlassField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search)
+            GlassField(query, { query = it }, Modifier.fillMaxWidth().testTag("server-search"), placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search)
         }
         if (busy) LinearWavyProgressIndicator(Modifier.fillMaxWidth())
         if (matches.isEmpty()) EmptyState(
@@ -758,7 +792,7 @@ private val ReadingWidth = 860.dp
             LazyVerticalGrid(
                 columns = GridCells.Adaptive(300.dp),
                 state = grid,
-                modifier = Modifier.fillMaxSize().padding(end = 12.dp),
+                modifier = Modifier.fillMaxSize().padding(end = 12.dp).testTag("server-grid"),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -777,6 +811,7 @@ private val ReadingWidth = 860.dp
     val ring by animateColorAsState(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent, colorTween(), label = "server-ring")
     Column(
         Modifier
+            .testTag("server-card-${node.id}")
             .pressMorph(interaction)
             .glass(TileShape, glassTint(if (hovered || selected) 0.9f else GlassAlpha))
             .border(1.5.dp, ring, TileShape)
@@ -802,7 +837,7 @@ private val ReadingWidth = 860.dp
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             ProtocolPlate(node.protocol)
-            node.desktopBadges.take(2).forEach { Plate(it) }
+            remember(node) { node.desktopBadges.take(2) }.forEach { Plate(it) }
             Spacer(Modifier.weight(1f))
             LatencyLabel(m, latency)
         }
@@ -1246,7 +1281,7 @@ private val ReadingWidth = 860.dp
 
 /* ── Settings ─────────────────────────────────────────────────────────────────────────────── */
 
-@Composable private fun SettingsPage(m: DesktopModel) {
+@Composable private fun SettingsPage(m: DesktopModel, onInstallUpdate: () -> Unit) {
     val settings by m.settings.settings.collectAsState()
     val desktop by m.desktop.state.collectAsState()
     val adapters by m.adapters.collectAsState()
@@ -1264,6 +1299,8 @@ private val ReadingWidth = 860.dp
 
     ScrollingColumn {
         PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later")
+
+        UpdatePanel(m, desktop, onInstallUpdate)
 
         GlassPanel(Modifier.fillMaxWidth()) {
             SectionTitle(m.text("Защита", "Protection"), m.text("Килл свитч", "Kill switch"))
@@ -1348,6 +1385,11 @@ private val ReadingWidth = 860.dp
         GlassPanel(Modifier.fillMaxWidth()) {
             SectionTitle(m.text("Поведение", "Behavior"))
             SwitchRow(m.text("Запускать при входе в Windows", "Launch at Windows sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
+            SwitchRow(
+                m.text("Подключать VPN при запуске", "Connect VPN on launch"),
+                desktop.connectOnLaunch,
+                m.text("После запуска Yumi подключится к выбранному серверу, когда служба будет готова.", "After Yumi starts, connect to the selected server when the service is ready."),
+            ) { m.changeDesktop(desktop.copy(connectOnLaunch = it)) }
             SwitchRow(m.text("Обновлять подписки автоматически", "Refresh subscriptions automatically"), settings.subscriptionAutoUpdate) { m.changeSettings({ s -> s.copy(subscriptionAutoUpdate = it) }) }
             if (settings.subscriptionAutoUpdate) ChoiceRow(
                 m.text("Как часто", "How often"),
@@ -1496,7 +1538,12 @@ private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
 
 /* ── Words for the service's error codes ──────────────────────────────────────────────────── */
 
-private fun serviceError(m: DesktopModel, code: String) = when (code) {
+private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean = false) = when (code) {
+    "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
+    "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
+    "service_unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
+    "platform_not_supported" -> m.text("VPN-туннель поддерживается только в Windows.", "The VPN tunnel is supported only on Windows.")
+    "worker_stopped" -> m.text("Ядро VPN неожиданно остановилось.", "The VPN core stopped unexpectedly.")
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
     "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")
     "kill_switch_failed" -> m.text("Не удалось включить килл свитч, поэтому туннель не поднят. Выключи его в настройках, чтобы подключиться без него.", "The kill switch could not be raised, so the tunnel was not started. Turn it off in Settings to connect without it.")
@@ -1504,5 +1551,5 @@ private fun serviceError(m: DesktopModel, code: String) = when (code) {
         m.text("Выбранный адаптер недоступен. Подключи его или выбери «Автоматически» в настройках.", "The selected adapter is unavailable. Connect it or choose Automatic in Settings.")
     "invalid_configuration", "forbidden_field", "unsupported_protocol" ->
         m.text("Конфигурация сервера не поддерживается ядром.", "The server configuration is not supported by the core.")
-    else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.")
+    else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.") + if (includeUnknown) "\n\n$code" else ""
 }

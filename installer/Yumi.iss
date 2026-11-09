@@ -1,4 +1,4 @@
-#define AppVersion "0.2.2"
+#define AppVersion "0.2.4"
 #define AppImage "..\desktop\build\compose\binaries\main\app\Yumi"
 [Setup]
 AppId={{E8CB03D0-C852-4375-BF1B-A83F09E118B7}
@@ -47,15 +47,37 @@ Name: "{autodesktop}\Yumi Desktop"; Filename: "{app}\Yumi.exe"; Tasks: desktopic
 Filename: "{app}\Yumi.exe"; Description: "{cm:LaunchProgram,Yumi Desktop}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
+function OpenProcess(Access: LongWord; Inherit: Boolean; Pid: LongWord): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(Handle: THandle; Milliseconds: LongWord): LongWord;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(Handle: THandle): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var Code: Integer;
+var Code: Integer; Pid: Integer; Handle: THandle; WaitResult: LongWord;
 begin
   Result := '';
+  { An accepted update first lets the app disconnect and exit, releasing its JVM files. }
+  if ExpandConstant('{param:YUMIUPDATE|0}') = '1' then begin
+    Pid := StrToIntDef(ExpandConstant('{param:YUMIPID|0}'), 0);
+    if Pid > 0 then begin
+      Handle := OpenProcess($00100000, False, Pid);
+      if Handle <> 0 then begin
+        WaitResult := WaitForSingleObject(Handle, 30000);
+        CloseHandle(Handle);
+        if WaitResult <> 0 then begin
+          Result := 'Close Yumi Desktop and retry the update.';
+          Exit;
+        end;
+      end;
+    end;
+  end;
   { Stop only Yumi before replacing its service binary. Profiles live outside the installation. }
   if FileExists(ExpandConstant('{app}\service\yumi-service.exe')) then
     if not Exec(ExpandConstant('{app}\service\yumi-service.exe'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
@@ -113,6 +135,8 @@ begin
     if not Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall add rule name="Yumi Desktop Pairing" dir=in action=allow program="' + ExpandConstant('{app}\Yumi.exe') + '" enable=yes profile=private,public remoteip=localsubnet protocol=TCP', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
       RaiseException('Yumi was installed, but its local-network pairing rule could not be added.');
   end;
+  if (CurStep = ssDone) and (ExpandConstant('{param:YUMIUPDATE|0}') = '1') then
+    ExecAsOriginalUser(ExpandConstant('{app}\Yumi.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

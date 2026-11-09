@@ -13,6 +13,10 @@ import com.mydrop.vpn.core.net.isNumericAddress
     val domains: List<String> = emptyList(),
     val networks: List<String> = emptyList(),
     val launchAtLogin: Boolean = false,
+    /** Connect the selected server once the service is ready after application startup. */
+    val connectOnLaunch: Boolean = false,
+    /** Check GitHub in the background and download verified updates. Installation is explicit. */
+    val autoUpdate: Boolean = true,
     /** Kept here rather than in the shared [com.mydrop.vpn.core.model.AppSettings]: the phone
      *  takes its accent from the system wallpaper, so this is a window's answer to a question a
      *  phone does not ask. */

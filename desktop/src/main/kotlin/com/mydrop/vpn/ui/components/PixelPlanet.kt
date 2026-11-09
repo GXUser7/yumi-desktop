@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.graphics.shapes.RoundedPolygon
 import com.mydrop.vpn.core.model.WorldMap
+import com.yumi.desktop.LocalAnimationsActive
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -410,11 +411,15 @@ private const val MAX_STEP_SECONDS = 0.05
 
 /** Ticks [Planet] once per frame, and counts the frames so that the figure redraws with them. */
 @Composable
-private fun rememberPlanetTicks(): State<Long> = produceState(0L) {
-    while (true) {
-        withInfiniteAnimationFrameMillis { frame ->
-            Planet.tick(frame)
-            value += 1
+private fun rememberPlanetTicks(): State<Long> {
+    val active = LocalAnimationsActive.current
+    return produceState(0L, active) {
+        if (!active) return@produceState
+        while (true) {
+            withInfiniteAnimationFrameMillis { frame ->
+                Planet.tick(frame)
+                value += 1
+            }
         }
     }
 }

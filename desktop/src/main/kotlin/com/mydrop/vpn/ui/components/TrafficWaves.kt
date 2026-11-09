@@ -11,7 +11,6 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
@@ -24,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import kotlin.math.PI
 import kotlin.math.ln
 import kotlin.math.sin
+import com.yumi.desktop.LocalAnimationsActive
 
 /**
  * The traffic figure: soft bands drifting across the tunnel's main shape.
@@ -52,12 +52,12 @@ fun TrafficWaves(
     // Rates arrive in one-second steps, so the swell is eased across a step and a half rather than
     // a step: matching the sampling exactly means the surface arrives at each new value just as
     // the next one lands, which is a series of lurches rather than a swell.
-    val downSwell by animateFloatAsState(
+    val downSwell = animateFloatAsState(
         targetValue = if (warming) maxOf(downloadPace, 0.45f) else downloadPace,
         animationSpec = tween(1600, easing = LinearEasing),
         label = "download-swell",
     )
-    val upSwell by animateFloatAsState(
+    val upSwell = animateFloatAsState(
         targetValue = if (warming) maxOf(uploadPace, 0.3f) else uploadPace,
         animationSpec = tween(1600, easing = LinearEasing),
         label = "upload-swell",
@@ -65,10 +65,6 @@ fun TrafficWaves(
 
     val bands = remember { defaultBands() }
     val elapsed = rememberSeconds()
-    val down = rememberUpdatedState(downSwell)
-    val up = rememberUpdatedState(upSwell)
-    val downInk = rememberUpdatedState(downloadColor)
-    val upInk = rememberUpdatedState(uploadColor)
     val path = remember { Path() }
 
     Canvas(modifier = modifier.fillMaxSize()) {
@@ -78,8 +74,8 @@ fun TrafficWaves(
         val stroke = 1.5.dp.toPx()
 
         bands.forEach { band ->
-            val swell = if (band.upload) up.value else down.value
-            val ink = if (band.upload) upInk.value else downInk.value
+            val swell = if (band.upload) upSwell.value else downSwell.value
+            val ink = if (band.upload) uploadColor else downloadColor
             drawBand(band, time, swell, ink, path, stroke)
         }
     }
@@ -177,12 +173,17 @@ private const val TWO_PI = (PI * 2).toFloat()
 
 /** Seconds since the figure first drew, rebased so Float keeps frame-level precision. */
 @Composable
-private fun rememberSeconds(): State<Float> = produceState(0f) {
-    var origin = 0L
-    while (true) {
-        withInfiniteAnimationFrameMillis { frame ->
-            if (origin == 0L) origin = frame
-            value = (frame - origin) / 1000f
+private fun rememberSeconds(): State<Float> {
+    val active = LocalAnimationsActive.current
+    return produceState(0f, active) {
+        if (!active) return@produceState
+        val resumedAt = value
+        var origin = 0L
+        while (true) {
+            withInfiniteAnimationFrameMillis { frame ->
+                if (origin == 0L) origin = frame
+                value = resumedAt + (frame - origin) / 1000f
+            }
         }
     }
 }

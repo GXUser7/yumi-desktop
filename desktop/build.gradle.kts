@@ -16,6 +16,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
     testImplementation(kotlin("test"))
     testImplementation(compose.desktop.uiTestJUnit4)
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
 compose.desktop {
     application {
@@ -23,7 +24,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Msi)
             packageName = "Yumi"
-            packageVersion = "0.2.2"
+            packageVersion = "0.2.4"
             includeAllModules = true
             windows { menu = true; shortcut = true; upgradeUuid = "e8cb03d0-c852-4375-bf1b-a83f09e118b7"
                 iconFile.set(project.file("icon/yumi.ico")) }

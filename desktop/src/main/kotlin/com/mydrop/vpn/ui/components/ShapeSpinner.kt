@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.graphics.shapes.Morph
 import kotlin.math.floor
+import com.yumi.desktop.LocalAnimationsActive
 
 /**
  * The handshake indicator: six Material shapes morphing one into the next, forever.
@@ -93,12 +94,17 @@ fun ShapeSpinner(
  * leaves less than frame-level precision, which shows up as stutter.
  */
 @Composable
-private fun rememberFrameMillis(): State<Long> = produceState(0L) {
-    var origin = 0L
-    while (true) {
-        withInfiniteAnimationFrameMillis { frame ->
-            if (origin == 0L) origin = frame
-            value = frame - origin
+private fun rememberFrameMillis(): State<Long> {
+    val active = LocalAnimationsActive.current
+    return produceState(0L, active) {
+        if (!active) return@produceState
+        val resumedAt = value
+        var origin = 0L
+        while (true) {
+            withInfiniteAnimationFrameMillis { frame ->
+                if (origin == 0L) origin = frame
+                value = resumedAt + frame - origin
+            }
         }
     }
 }

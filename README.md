@@ -24,6 +24,9 @@ glass over them, and dragging the window knocks them about on springs.
   server or the core falls over.
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
 * **Seven palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
+* **Connect on launch**, optionally, to the server you selected; off until you enable it in Settings.
+* **Updates in Settings** — background checks and verified downloads, progress and cancellation,
+  then restart now or install on exit. Windows asks for permission to replace the app and service.
 
 | | |
 |:-:|:-:|
@@ -136,6 +139,18 @@ To run the application alone, without the service — every screen works, only c
 `./gradlew.bat :desktop:run --args="--ui-smoke"` walks every screen in both themes and writes
 screenshots to `.local/screenshots`, against a stub service that can never connect;
 `--ui-demo` does the same with made-up servers and a stand-in service that pretends to connect.
+
+`--ui-preview` opens an interactive demo without the screenshot tour. `--ui-benchmark` uses 600
+made-up servers and measures actual Direct3D window renders: the planet, waves, two scroll speeds,
+frozen backdrop and tray. Results go to `desktop/.local/performance/benchmark.tsv` when run via
+Gradle. These modes use isolated data and never connect the real tunnel. See
+[`docs/performance.md`](docs/performance.md) for the comparison and its limits.
+
+Automatic updates run in packaged builds: a check after 15 seconds and every four hours. Installed
+copies download the newest numeric Windows release (including Yumi's published betas), verify its
+size and published SHA-256, and offer installation. **Update automatically** controls background
+checks/downloads and installation on exit; manual checks remain available. A development or portable
+copy offers the release page. Profiles and settings stay in their existing data directory.
 
 Every push builds the installer on GitHub Actions (`.github/workflows/installer.yml`) exactly as
 `build.ps1` does, tests included, and keeps it as a workflow artifact. Pushing a tag `v<version>`

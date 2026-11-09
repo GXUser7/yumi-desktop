@@ -23,6 +23,10 @@ interesting half of it.
 - [ ] The connect button is inert while there is no server. It must not be pressable.
 - [ ] Close the window with the ✕. It goes to the tray and keeps running; the tray icon reopens it.
 - [ ] Exit from the tray menu. The window and the process both go.
+- [ ] Settings → Behavior → Connect VPN on launch is off on an existing installation unless enabled.
+      Enable it with a selected server, exit and reopen: one connection to that server. With the
+      service starting late it waits; after a manual disconnect it stays disconnected. Disable the
+      setting and relaunch: no connection. An empty server list never connects.
 
 ## Subscriptions
 
@@ -111,13 +115,36 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 - [ ] Drag the window across the screen: the shapes behind the glass lag, swing back and settle.
       With "Live backdrop" off they stay still and the app uses no CPU at rest.
 - [ ] Hovering a dock button names it; the page you are on is the accent square.
+- [ ] The tunnel indicator is a rotating cookie while connecting/disconnecting, a checked shield
+      when connected and a crossed shield when disconnected. A failure or unavailable service
+      shows a warning triangle; hover reveals the reason and core details. A failed tunnel whose
+      kill switch is holding traffic also explains the block. Clicking opens Connection.
 - [ ] Drag the window to its minimum size: everything stays usable.
 - [ ] Server names show their country flags, and the ⚡ and ⭐ providers decorate names with are
       coloured — all of them, consistently.
 - [ ] Switch to English. Every screen changes, including units and relative times.
+- [ ] With 600 or more servers, scroll to the end and back, search for the last server and select it.
+      Only nearby cards should be composed; names, flags, latency and selection remain correct.
+- [ ] Minimize and restore, then hide in the tray and reopen: continuous animation sleeps and resumes
+      without a jump. With the live backdrop off, pointer motion leaves the scene still.
+
+## Application updates
+
+- [ ] Settings shows the running version, Check for updates and Update automatically on an installed
+      copy. A development copy explains the mode and links to the release when a newer one exists.
+- [ ] Newer published Windows release: background download, changing progress, cancellation and retry.
+      A draft, older version or release without installer/checksum is never installed.
+- [ ] A failed network request leaves a downloaded update intact. A bad/truncated installer is rejected.
+- [ ] Restart and update: declining UAC leaves the installation and profiles unchanged. Yumi
+      disconnects and exits when the installer is launched; the installer
+      waits for the old process, replaces the application/service, and launches the new version with
+      the same subscriptions/settings. With automatic updates on, a ready update also installs on exit.
+- [ ] With automatic updates off there is no background download or installation on exit; manual
+      Check, Download and Restart and update still work.
 
 ## What must never happen
 
-- [ ] The tunnel comes up without being asked — on launch, on wake, on a subscription refresh.
+- [ ] The tunnel comes up on launch with Connect VPN on launch disabled, or unexpectedly on wake or
+      a subscription refresh.
 - [ ] A server is selected by anything other than the user.
 - [ ] The application makes a network request naming a server to anything but that server.

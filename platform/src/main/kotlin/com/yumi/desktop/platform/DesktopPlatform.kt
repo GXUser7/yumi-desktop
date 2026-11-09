@@ -188,6 +188,28 @@ object DesktopPlatform {
         return File(launcher.parentFile, "service\\yumi-service.exe").takeIf { it.isFile }
     }
 
+    fun installedDirectory(): File? {
+        val launcher = System.getProperty("jpackage.app-path")?.let(::File) ?: return null
+        return launcher.parentFile.takeIf { File(it, "unins000.exe").isFile && serviceExecutable() != null }
+    }
+
+    /** The installer handles elevation and relaunch; exit only after Windows starts it. */
+    fun installUpdate(file: File): Boolean {
+        val directory = installedDirectory() ?: return false
+        if (!isWindows || !file.isFile) return false
+        return runCatching {
+            val request = ShellAPI.SHELLEXECUTEINFO()
+            request.lpVerb = "open"
+            request.lpFile = file.absolutePath
+            request.lpParameters = "/SILENT /NORESTART /YUMIUPDATE=1 /YUMIPID=${ProcessHandle.current().pid()} /DIR=\"${directory.absolutePath}\""
+            request.nShow = WinUser.SW_SHOWNORMAL
+            request.fMask = SEE_MASK_NOCLOSEPROCESS
+            if (!Shell32.INSTANCE.ShellExecuteEx(request)) return false
+            request.hProcess?.let { Kernel32.INSTANCE.CloseHandle(it) }
+            true
+        }.getOrDefault(false)
+    }
+
     /**
      * This account's SID, asked of the service binary rather than worked out here.
      *

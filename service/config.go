@@ -29,6 +29,17 @@ type Options struct {
     // Russian sites and addresses go around the tunnel, by the geo databases, whatever the
     // application rules say. Inert until the databases have been downloaded.
     BypassRussia bool `json:"bypassRussia"`
+    // The physical adapter the core sends proxy traffic out of. Empty means the adapter Windows
+    // itself uses for its default route; anything else is a name from the service's own adapter
+    // list, as Xray compares it against Go's interface name.
+    OutboundAdapter string `json:"outboundAdapter"`
+}
+
+// One physical adapter the core could use to reach the internet, for the settings screen.
+type Adapter struct {
+    Name string `json:"name"`
+    Address string `json:"address,omitempty"`
+    Default bool `json:"default,omitempty"`
 }
 type Request struct {
     Version int `json:"version"`
@@ -64,6 +75,8 @@ type Status struct {
     // The worker's adapter, reported to the supervisor and never past it: the kill switch has to
     // let this interface through and the supervisor strips it before answering the app.
     TunLUID uint64 `json:"tunLuid,omitempty"`
+    // Only answered for the "adapters" command; the once-a-second status poll does not carry them.
+    Adapters []Adapter `json:"adapters,omitempty"`
 }
 
 const maxFrame = 1024 * 1024
@@ -75,7 +88,7 @@ func decodeRequest(data []byte) (Request, error) {
     if len(data) > maxFrame { return r, errors.New("frame_too_large") }
     if err := d.Decode(&r); err != nil { return r, errors.New("invalid_request") }
     if r.Version != 1 { return r, errors.New("unsupported_version") }
-    switch r.Command { case "status", "disconnect", "geo_update": return r, nil; case "connect": default: return r, errors.New("unknown_command") }
+    switch r.Command { case "status", "disconnect", "geo_update", "adapters": return r, nil; case "connect": default: return r, errors.New("unknown_command") }
     if r.Options == nil || r.NodeID == "" || len(r.NodeID) > 128 { return r, errors.New("invalid_options") }
     if err := validateOptions(*r.Options); err != nil { return r, err }
     if err := validateOutbound(r.Outbound); err != nil { return r, err }
@@ -84,6 +97,9 @@ func decodeRequest(data []byte) (Request, error) {
 
 func validateOptions(o Options) error {
     if o.MTU < 1280 || o.MTU > 9000 || (o.SplitMode != "ExceptSelected" && o.SplitMode != "OnlySelected") { return errors.New("invalid_options") }
+    if len(o.OutboundAdapter) > 256 || strings.ContainsAny(o.OutboundAdapter, "\x00\r\n") || ownAdapter(o.OutboundAdapter) {
+        return errors.New("invalid_adapter")
+    }
     if len(o.Applications)+len(o.Domains)+len(o.Networks) > 1024 { return errors.New("too_many_rules") }
     for _, p := range o.Applications {
         if !validApplication(p) { return errors.New("invalid_application") }
@@ -99,6 +115,12 @@ func validateOptions(o Options) error {
         if err != nil || u.User != nil || !validHost(u.Hostname()) || (u.Scheme != "https" && u.Scheme != "tcp" && u.Scheme != "udp") { return errors.New("invalid_dns") }
     } else if !validHost(o.DNS) { return errors.New("invalid_dns") }
     return nil
+}
+
+// Yumi's own adapter is never a way out. The prefix form covers the per-connection names older
+// builds used; both the route picker and request validation need this answer.
+func ownAdapter(name string) bool {
+    return name != "" && (strings.EqualFold(name, "Yumi") || strings.HasPrefix(strings.ToLower(name), "yumi-"))
 }
 
 func validHost(h string) bool {

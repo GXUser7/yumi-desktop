@@ -65,6 +65,7 @@ func (s *supervisor) snapshot() Status {
     status.GeoReady=geo.Ready;status.GeoBytes=geo.Bytes;status.GeoUpdatedAt=geo.UpdatedAt
     status.KillSwitch=s.shieldUp.Load()
     status.TunLUID=0
+    status.Adapters=nil
     return status
 }
 
@@ -148,7 +149,13 @@ func (s *supervisor) connect(r Request) error {
     s.mu.Lock();dir:=s.geoDir;s.mu.Unlock()
     geo:=r.Options.BypassRussia && inspectGeo(dir).Ready
     // Resolved before the TUN routes exist; if it cannot be, the core's own guess is still used.
-    outbound,_:=outboundInterface()
+    // A hand-picked adapter is different: if it is gone or down, saying so is better than coming
+    // up with an interface that carries nothing.
+    outbound, outboundErr := outboundInterface(r.Options.OutboundAdapter)
+    if outboundErr != nil {
+        if r.Options.OutboundAdapter != "" { return errorWithDetail{"adapter_unavailable", outboundErr} }
+        outbound = ""
+    }
     config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword,geo,outbound)
     exe,err:=os.Executable();if err!=nil{return errors.New("worker_unavailable")}
     child:=exec.Command(exe,"--worker")
@@ -188,6 +195,11 @@ func (s *supervisor) connect(r Request) error {
 
 func (s *supervisor) handle(r Request) Status {
     if r.Command=="status" { return s.snapshot() }
+    if r.Command=="adapters" {
+        s.mu.Lock();status:=s.status;s.mu.Unlock()
+        status.Adapters=adapterList();status.TunLUID=0;status.KillSwitch=s.shieldUp.Load()
+        return status
+    }
     s.commands.Lock();defer s.commands.Unlock()
     switch r.Command {
     case "disconnect":s.stop();s.releaseShield()

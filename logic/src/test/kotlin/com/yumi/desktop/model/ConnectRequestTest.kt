@@ -32,4 +32,13 @@ class ConnectRequestTest {
         val request = ConnectRequestFactory.create(server("a.example.com"), AppSettings(mtu = 1500), desktop)
         assertEquals(listOf("chrome.exe", "Telegram.exe"), request.options!!.applications)
     }
+
+    @Test fun chosenAdapterTravelsWithTheRequest() {
+        val request = ConnectRequestFactory.create(
+            server("a.example.com"),
+            AppSettings(mtu = 1500),
+            DesktopSettings(outboundAdapter = "Беспроводная сеть"),
+        )
+        assertEquals("Беспроводная сеть", request.options!!.outboundAdapter)
+    }
 }

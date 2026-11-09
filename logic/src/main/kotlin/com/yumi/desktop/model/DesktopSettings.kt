@@ -23,6 +23,9 @@ import com.mydrop.vpn.core.net.isNumericAddress
     /** Russian sites and addresses around the tunnel, by the geo databases, above every
      *  application rule. Inert until the databases are downloaded. */
     val bypassRussia: Boolean = true,
+    /** The physical adapter the core sends proxy traffic out of; empty follows the Windows
+     *  default route. A name from the tunnel service's own adapter list. */
+    val outboundAdapter: String = "",
     /** The shapes behind the glass drift. Off holds them still and costs nothing at all. */
     val liveBackdrop: Boolean = true,
 )

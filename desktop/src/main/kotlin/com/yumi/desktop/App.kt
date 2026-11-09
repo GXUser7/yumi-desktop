@@ -1249,9 +1249,18 @@ private val ReadingWidth = 860.dp
 @Composable private fun SettingsPage(m: DesktopModel) {
     val settings by m.settings.settings.collectAsState()
     val desktop by m.desktop.state.collectAsState()
+    val adapters by m.adapters.collectAsState()
     var dns by remember(settings.remoteDns) { mutableStateOf(settings.remoteDns) }
     var mtu by remember(settings.mtu) { mutableStateOf(settings.mtu.toString()) }
     var invalid by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { m.refreshAdapters() }
+    // A saved adapter that has since been unplugged stays visible, so the choice reads as a
+    // choice rather than silently reverting to Automatic.
+    val adapterChoices = remember(adapters, desktop.outboundAdapter) {
+        (listOf("") + adapters.map { it.name }).let { options ->
+            if (desktop.outboundAdapter.isNotEmpty() && desktop.outboundAdapter !in options) options + desktop.outboundAdapter else options
+        }.distinct()
+    }
 
     ScrollingColumn {
         PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later")
@@ -1281,7 +1290,12 @@ private val ReadingWidth = 860.dp
         }
 
         GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(m.text("Соединение и DNS", "Connection and DNS"))
+            SectionTitle(
+                m.text("Соединение и DNS", "Connection and DNS"),
+                trailing = {
+                    QuietButton(m.text("Обновить", "Refresh"), icon = Icons.Rounded.Refresh) { m.refreshAdapters() }
+                },
+            )
             GlassField(dns, { dns = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("DNS-резолвер", "DNS resolver"), isError = invalid)
             Text(
                 m.text("DoH (https://), TCP, UDP или IP-адрес. Без автоматической замены резолвера.", "DoH (https://), TCP, UDP or an IP address. No automatic resolver substitution."),
@@ -1290,6 +1304,29 @@ private val ReadingWidth = 860.dp
             )
             GlassField(mtu, { mtu = it; invalid = false }, Modifier.width(220.dp), label = "MTU · 1280–9000", isError = invalid)
             SwitchRow("IPv6", settings.enableIpv6) { m.changeSettings({ s -> s.copy(enableIpv6 = it) }, true) }
+            ChoiceRow(
+                m.text("Откуда брать интернет", "Where the internet comes from"),
+                adapterChoices,
+                desktop.outboundAdapter,
+                { name ->
+                    if (name.isEmpty()) m.text("Автоматически", "Automatic")
+                    else adapters.firstOrNull { it.name == name }?.let { adapter ->
+                        val title = adapter.name + if (adapter.default) m.text(" · основной", " · default") else ""
+                        if (adapter.address != null) "$title · ${adapter.address}" else title
+                    } ?: name
+                },
+            ) { name ->
+                // A live tunnel has to move onto the new interface now, not at the next connect.
+                m.changeDesktop(desktop.copy(outboundAdapter = name), true)
+            }
+            Text(
+                m.text(
+                    "Автоматически — адаптер основного маршрута Windows. Выбери вручную, если интернет уходит не через тот адаптер или туннель не поднимается.",
+                    "Automatic follows the Windows default route. Pick one by hand when traffic leaves through the wrong adapter or the tunnel will not start.",
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             AccentButton(m.text("Сохранить соединение", "Save connection settings")) {
                 val value = mtu.toIntOrNull()
                 val resolver = runCatching {
@@ -1463,6 +1500,8 @@ private fun serviceError(m: DesktopModel, code: String) = when (code) {
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
     "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")
     "kill_switch_failed" -> m.text("Не удалось включить килл свитч, поэтому туннель не поднят. Выключи его в настройках, чтобы подключиться без него.", "The kill switch could not be raised, so the tunnel was not started. Turn it off in Settings to connect without it.")
+    "adapter_unavailable", "invalid_adapter" ->
+        m.text("Выбранный адаптер недоступен. Подключи его или выбери «Автоматически» в настройках.", "The selected adapter is unavailable. Connect it or choose Automatic in Settings.")
     "invalid_configuration", "forbidden_field", "unsupported_protocol" ->
         m.text("Конфигурация сервера не поддерживается ядром.", "The server configuration is not supported by the core.")
     else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.")

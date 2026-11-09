@@ -23,6 +23,8 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)
     val status = MutableStateFlow(ServiceStatus(state = "unavailable"))
+    /** The physical adapters the service can send traffic out of, for the settings screen. */
+    val adapters = MutableStateFlow<List<NetworkAdapter>>(emptyList())
     val traffic = MutableStateFlow(TrafficStats.Zero)
     val busy = MutableStateFlow(false)
     val speed = MutableStateFlow(SpeedTestState())
@@ -107,6 +109,11 @@ class DesktopModel(val backend: TunnelBackend = WindowsTunnelBackend(), val dire
     /** Fetches the routing databases again; the service reports progress on the status. */
     fun updateGeo() = action {
         commands.withLock { updateStatus(backend.request(ServiceRequest(command = "geo_update"))) }
+    }
+
+    /** Reads the adapters again: networks are plugged in and out while the window stays open. */
+    fun refreshAdapters() = action {
+        commands.withLock { adapters.value = backend.request(ServiceRequest(command = "adapters")).adapters }
     }
 
     /**

@@ -313,12 +313,18 @@ fun SwitchRow(title: String, checked: Boolean, hint: String? = null, enabled: Bo
     }
 }
 
-/** One choice out of a few, as pills: the chosen one in the accent, the rest a quiet plate. */
+/** One choice out of a few, as pills: the chosen one in the accent, the rest a quiet plate.
+ *  Wraps rather than overflowing: adapter names are as long as Windows says they are. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun <T> ChoiceRow(label: String?, options: List<T>, selected: T, text: @Composable (T) -> String, onSelect: (T) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         if (label != null) Kicker(label)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             options.forEach { option ->
                 val chosen = option == selected
                 val interaction = remember { MutableInteractionSource() }

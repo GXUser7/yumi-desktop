@@ -19,6 +19,17 @@ import kotlinx.serialization.json.*
     val killSwitch: Boolean = false,
     /** Russian sites go direct by the geo databases, above the application rules. */
     val bypassRussia: Boolean = true,
+    /** The physical adapter the core sends proxy traffic out of; empty follows the Windows
+     *  default route. The service names adapters the way Xray does. */
+    val outboundAdapter: String = "",
+)
+
+/** One physical adapter the service could send proxy traffic out of. */
+@Serializable data class NetworkAdapter(
+    val name: String,
+    val address: String? = null,
+    /** The adapter Windows itself uses for its default route. */
+    val default: Boolean = false,
 )
 @Serializable data class ServiceRequest(
     val version: Int = 1,
@@ -48,6 +59,8 @@ import kotlinx.serialization.json.*
     val geoUpdatedAt: Long = 0,
     val geoBytes: Long = 0,
     val geoError: String? = null,
+    /** Answered only for the "adapters" command; the status poll leaves it empty. */
+    val adapters: List<NetworkAdapter> = emptyList(),
 ) {
     fun probe() = if (state == "connected" && probePort > 0) ProbeEndpoint(probePort, probeUser, probePassword) else null
 }
@@ -61,9 +74,18 @@ object ConnectRequestFactory {
         val document = XrayConfigFactory.build(listOf(server), server, settings.copy(routingMode = RoutingMode.Global), geoAvailable = false)
         val outbound = Json.parseToJsonElement(document.json).jsonObject.getValue("outbounds").jsonArray.first().jsonObject
         return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
-            options = TunnelOptions(settings.mtu, settings.enableIpv6, settings.bypassLan, settings.remoteDns,
-                desktop.splitMode, desktop.applications.map(RuleValidation::application).distinct(),
-                desktop.domains.map(RuleValidation::domain), desktop.networks.map(RuleValidation::network),
-                killSwitch = desktop.killSwitch, bypassRussia = desktop.bypassRussia))
+            options = TunnelOptions(
+                mtu = settings.mtu,
+                ipv6 = settings.enableIpv6,
+                bypassLan = settings.bypassLan,
+                dns = settings.remoteDns,
+                splitMode = desktop.splitMode,
+                applications = desktop.applications.map(RuleValidation::application).distinct(),
+                domains = desktop.domains.map(RuleValidation::domain),
+                networks = desktop.networks.map(RuleValidation::network),
+                killSwitch = desktop.killSwitch,
+                bypassRussia = desktop.bypassRussia,
+                outboundAdapter = desktop.outboundAdapter,
+            ))
     }
 }

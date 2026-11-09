@@ -31,6 +31,12 @@ func TestJVMRequestsAgainstPinnedCore(t *testing.T) {
 
 func fixture() Request { return Request{Version:1,Command:"connect",NodeID:"fixture",Outbound:obj{"protocol":"socks","settings":obj{"servers":[]any{obj{"address":"192.0.2.1","port":float64(1080)}}}},Options:&Options{MTU:1500,DNS:"https://1.1.1.1/dns-query",BypassLAN:true,SplitMode:"ExceptSelected"}} }
 
+func TestOptionsAcceptAChosenAdapterButNeverItsOwnTunnel(t *testing.T) {
+	base:=*fixture().Options
+	for _,name:=range []string{"","Wi-Fi","Ethernet 4","Беспроводная сеть"}{base.OutboundAdapter=name;if err:=validateOptions(base);err!=nil{t.Fatalf("%q refused: %v",name,err)}}
+	for _,name:=range []string{"Yumi","yumi","Yumi-1234","bad\nname",strings.Repeat("x",257)}{base.OutboundAdapter=name;if err:=validateOptions(base);err==nil{t.Fatalf("%q accepted",name)}}
+}
+
 /*
 Databases of the right shape, holding one entry each — enough for the core to resolve every geo
 reference the document makes, which it does while parsing. Written with the core's own types, so a

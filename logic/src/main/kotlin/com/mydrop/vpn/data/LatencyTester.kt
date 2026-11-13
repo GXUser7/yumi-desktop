@@ -3,6 +3,10 @@ package com.mydrop.vpn.data
 import com.mydrop.vpn.core.model.LatencyResult
 import com.mydrop.vpn.core.model.PingMode
 import com.mydrop.vpn.core.model.ProxyNode
+import java.io.Closeable
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.ensureActive
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -43,6 +47,7 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
             val measurements = ArrayList<Int>(samples)
 
             repeat(samples) {
+                ensureActive()
                 probe(node, mode)?.let(measurements::add)
             }
 
@@ -58,7 +63,7 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
         }
 
     /** One probe. Returns the round trip in milliseconds, or null if it did not answer. */
-    private fun probe(node: ProxyNode, mode: PingMode): Int? {
+    private suspend fun probe(node: ProxyNode, mode: PingMode): Int? {
         val start = System.nanoTime()
         val ok = when {
             node.protocol.isQuicBased -> quicProbe(node)
@@ -68,9 +73,17 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
         return if (ok) ((System.nanoTime() - start) / 1_000_000).toInt() else null
     }
 
-    private fun tcpHandshake(node: ProxyNode): Boolean = runCatching {
-        Socket().use { it.connect(InetSocketAddress(node.server, node.port), TIMEOUT) }
-    }.isSuccess
+    private suspend fun tcpHandshake(node: ProxyNode): Boolean = probeSocket(Socket()) {
+        it.connect(InetSocketAddress(node.server, node.port), TIMEOUT)
+    }
+
+    /** Cancellation closes an in-flight socket, rather than waiting for its timeout. */
+    private suspend fun <S : Closeable> probeSocket(socket: S, block: (S) -> Unit): Boolean =
+        suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { runCatching { socket.close() } }
+            val success = socket.use { runCatching { block(it) }.isSuccess }
+            continuation.resume(success)
+        }
 
     /**
      * Connect plus a full TLS handshake. Costs two or three round trips instead of one, and in
@@ -80,17 +93,14 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
      * Certificates are not validated: see [probeSocketFactory] for why that is the only setting
      * under which this mode measures anything at all.
      */
-    private fun tlsHandshake(node: ProxyNode): Boolean = runCatching {
-        Socket().use { raw ->
-            raw.connect(InetSocketAddress(node.server, node.port), TIMEOUT)
-            val name = node.tls?.serverName?.takeIf(String::isNotEmpty) ?: node.server
-            (probeSocketFactory.createSocket(raw, name, node.port, false)
-                as SSLSocket).use { tls ->
-                tls.soTimeout = TIMEOUT
-                tls.startHandshake()
-            }
+    private suspend fun tlsHandshake(node: ProxyNode): Boolean = probeSocket(Socket()) { raw ->
+        raw.connect(InetSocketAddress(node.server, node.port), TIMEOUT)
+        val name = node.tls?.serverName?.takeIf(String::isNotEmpty) ?: node.server
+        (probeSocketFactory.createSocket(raw, name, node.port, false) as SSLSocket).use { tls ->
+            tls.soTimeout = TIMEOUT
+            tls.startHandshake()
         }
-    }.isSuccess
+    }
 
     /**
      * A factory that trusts every chain, for probes only.
@@ -121,18 +131,13 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
      * drop it, and endpoints with obfuscation (Hysteria2's salamander, say) will not answer at
      * all, so those still read as unreachable.
      */
-    private fun quicProbe(node: ProxyNode): Boolean = runCatching {
-        DatagramSocket().use { socket ->
-            socket.soTimeout = TIMEOUT
-            val address = InetAddress.getByName(node.server)
-            val packet = versionNegotiationProbe()
-            socket.send(DatagramPacket(packet, packet.size, address, node.port))
-
-            val reply = ByteArray(1500)
-            socket.receive(DatagramPacket(reply, reply.size))
-            true
-        }
-    }.getOrDefault(false)
+    private suspend fun quicProbe(node: ProxyNode): Boolean = probeSocket(DatagramSocket()) { socket ->
+        socket.soTimeout = TIMEOUT
+        val address = InetAddress.getByName(node.server)
+        val packet = versionNegotiationProbe()
+        socket.send(DatagramPacket(packet, packet.size, address, node.port))
+        socket.receive(DatagramPacket(ByteArray(1500), 1500))
+    }
 
     private fun versionNegotiationProbe(): ByteArray {
         val packet = ByteArray(QUIC_DATAGRAM_SIZE)

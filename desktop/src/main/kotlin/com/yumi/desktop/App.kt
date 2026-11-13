@@ -2,6 +2,7 @@ package com.yumi.desktop
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
@@ -17,6 +18,9 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -37,6 +41,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -68,13 +74,7 @@ import kotlinx.coroutines.delay
 /** Screen margin, and the gap between the dock, the main column and the aside. */
 private val Inset = 18.dp
 
-/**
- * Where the mark starts beside the dock — and, being the same number, where every page's title
- * starts too, so the two read along one line.
- */
-internal val HeadlineTop = 26.dp
-
-/** The tile's own inner rim; see [ConnectPage] for why the tunnel screen starts higher by it. */
+/** Inner padding of the connection headline tile. */
 private val TileRim = 18.dp
 
 /** Corner radius of the flow figure: the phone's, and the scale's extra-extra-large. */
@@ -103,21 +103,31 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     YumiTheme(settings, desktop.palette) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             ExpressiveBackdrop(animated = desktop.liveBackdrop) {
-                Row(Modifier.fillMaxSize().padding(Inset), horizontalArrangement = Arrangement.spacedBy(Inset)) {
-                    Dock(model, page) { page = it }
-                    Box(Modifier.weight(1f).fillMaxHeight()) {
-                        AnimatedContent(
-                            targetState = page,
-                            transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) },
-                            label = "page",
-                        ) { shown ->
-                            when (shown) {
-                                Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
-                                Page.Servers -> ServersPage(model)
-                                Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
-                                Page.Routing -> RoutingPage(model)
-                                Page.Speed -> SpeedPage(model)
-                                Page.Settings -> SettingsPage(model, onInstallUpdate)
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val compact = maxHeight < 700.dp || maxWidth < 846.dp
+                    val dense = compact && maxHeight < 600.dp
+                    val targetInset = if (compact) 12.dp else Inset
+                    val inset by animateDpAsState(targetInset, tween(220), label = "window-inset")
+                    val compactTop = minOf(CompactContentTop,
+                        (maxHeight - targetInset * 2 - 8.dp - if (dense) 356.dp else 396.dp).coerceAtLeast(160.dp))
+                    Row(Modifier.fillMaxSize().padding(inset).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(inset)) {
+                        CompositionLocalProvider(LocalCompactLayout provides compact, LocalDenseLayout provides dense, LocalCompactContentTop provides compactTop) {
+                            Dock(model, page, compact) { page = it }
+                            Box(Modifier.weight(1f).fillMaxHeight().testTag("page-content")) {
+                                AnimatedContent(
+                                    targetState = page,
+                                    transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) },
+                                    label = "page",
+                                ) { shown ->
+                                    when (shown) {
+                                        Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
+                                        Page.Servers -> ServersPage(model)
+                                        Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
+                                        Page.Routing -> RoutingPage(model)
+                                        Page.Speed -> SpeedPage(model)
+                                        Page.Settings -> SettingsPage(model, onInstallUpdate)
+                                    }
+                                }
                             }
                         }
                     }
@@ -140,46 +150,46 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 
 /* ── The dock ─────────────────────────────────────────────────────────────────────────────── */
 
-/**
- * YouCloud's floating toolbar, stood on its end.
- *
- * Not a column the height of the window with a logo at the top and a list down it — that is the
- * shape of every admin panel ever made. The pages live in a pill of glass only as tall as they
- * are, as round buttons; the one you are on fills with the accent.
- * Settings stands apart in a glass circle of its own, as it does on the phone. The mark sits above
- * on the page's title line, and the tunnel's state below as a cookie that is never out of sight.
- * Names come up beside the buttons on hover.
- */
-@Composable private fun Dock(m: DesktopModel, page: Page, onSelect: (Page) -> Unit) {
+/** The three islands keep the same positions on every page, rather than following its content. */
+@Composable private fun Dock(m: DesktopModel, page: Page, compact: Boolean, onSelect: (Page) -> Unit) {
     val status by m.status.collectAsState()
-    Column(
-        Modifier.width(72.dp).fillMaxHeight().padding(top = HeadlineTop - 4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        YumiMark(plate = MaterialTheme.colorScheme.primary, glyph = MaterialTheme.colorScheme.onPrimary, size = 44.dp)
-        Spacer(Modifier.weight(1f))
-        Column(
-            Modifier.glass(PillShape, glassTint()).padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Page.entries.filter { it != Page.Settings }.forEach { item ->
-                DockButton(m.text(item.ru, item.en), item.icon, item == page, Modifier.testTag("nav-${item.name}")) { onSelect(item) }
+    val dense = LocalDenseLayout.current
+    val button by animateDpAsState(if (dense) 40.dp else if (compact) 44.dp else 56.dp, tween(220), label = "dock-button-size")
+    val endButton by animateDpAsState(if (dense) 40.dp else if (compact) 44.dp else 56.dp, tween(220), label = "dock-end-button")
+    val padding by animateDpAsState(if (dense) 6.dp else 8.dp, tween(220), label = "dock-padding")
+    val gap by animateDpAsState(if (dense) 12.dp else if (compact) 16.dp else 24.dp, tween(220), label = "dock-gap")
+    val groupGap by animateDpAsState(if (dense) 8.dp else 12.dp, tween(220), label = "dock-group-gap")
+    val itemGap by animateDpAsState(if (compact) 3.dp else 6.dp, tween(220), label = "dock-item-gap")
+    val navigationTop by animateDpAsState(if (compact) LocalCompactContentTop.current else RegularPageHeaderHeight + 12.dp, tween(220), label = "dock-top")
+    val island = endButton + 16.dp
+    BoxWithConstraints(Modifier.width(island).fillMaxHeight().testTag("sidebar")) {
+        Box(Modifier.align(Alignment.TopCenter).size(endButton).testTag("app-mark"), contentAlignment = Alignment.Center) {
+            YumiMark(plate = MaterialTheme.colorScheme.primary, glyph = MaterialTheme.colorScheme.onPrimary, size = endButton)
+        }
+        val groupHeight = button * 5 + itemGap * 4 + padding * 2 + groupGap + island
+        val top = navigationTop.coerceAtMost((maxHeight - groupHeight - island - gap).coerceAtLeast(endButton + gap))
+        Column(Modifier.align(Alignment.TopCenter).offset(y = top), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                Modifier.width(island).testTag("nav-panel").glass(PillShape, glassTint()).padding(vertical = padding),
+                verticalArrangement = Arrangement.spacedBy(itemGap), horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Page.entries.filter { it != Page.Settings }.forEach { item ->
+                    DockButton(m.text(item.ru, item.en), item.icon, item == page, Modifier.testTag("nav-${item.name}"), button) { onSelect(item) }
+                }
+            }
+            Spacer(Modifier.height(groupGap))
+            Box(Modifier.testTag("settings-island").glass(CircleShape, glassTint()).padding(8.dp)) {
+                DockButton(m.text(Page.Settings.ru, Page.Settings.en), Page.Settings.icon, page == Page.Settings, Modifier.testTag("nav-Settings"), endButton) {
+                    onSelect(Page.Settings)
+                }
             }
         }
-        Spacer(Modifier.height(12.dp))
-        Box(Modifier.glass(CircleShape, glassTint()).padding(8.dp)) {
-            DockButton(m.text(Page.Settings.ru, Page.Settings.en), Page.Settings.icon, page == Page.Settings, Modifier.testTag("nav-Settings")) {
-                onSelect(Page.Settings)
-            }
-        }
-        Spacer(Modifier.weight(1f))
-        TunnelCookie(m, status) { onSelect(Page.Connect) }
+        Box(Modifier.align(Alignment.BottomCenter)) { TunnelCookie(m, status, size = island) { onSelect(Page.Connect) } }
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
-@Composable private fun DockButton(label: String, icon: ImageVector, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+@Composable private fun DockButton(label: String, icon: ImageVector, selected: Boolean, modifier: Modifier = Modifier, size: Dp = 56.dp, onClick: () -> Unit) {
     TooltipArea(
         tooltip = { HoverLabel(label) },
         delayMillis = 350,
@@ -191,7 +201,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     ) {
         // The page you are on is a filled circle — the dock is a column of circles, and a square
         // among them read as a different kind of thing rather than as the chosen one.
-        PanelIconButton(icon, label, modifier, checked = selected, checkedCorner = 50, onClick = onClick)
+        PanelIconButton(icon, label, modifier, checked = selected, size = size, checkedCorner = 50, onClick = onClick)
     }
 }
 
@@ -212,7 +222,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
  * when settled, and a warning triangle whose tooltip explains a failure.
  */
 @OptIn(ExperimentalFoundationApi::class)
-@Composable internal fun TunnelCookie(m: DesktopModel, status: ServiceStatus, onClick: () -> Unit) {
+@Composable internal fun TunnelCookie(m: DesktopModel, status: ServiceStatus, size: Dp = 56.dp, onClick: () -> Unit) {
     val semantic = LocalSemanticColors.current
     val busy = status.state == "connecting" || status.state == "disconnecting"
     val connected = status.state == "connected"
@@ -258,7 +268,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     ) {
         Box(
             Modifier
-                .size(56.dp)
+                .size(size)
                 .testTag("tunnel-status")
                 .semantics { contentDescription = label }
                 .pressMorph(interaction)
@@ -333,7 +343,7 @@ private val ProxyNode.desktopBadges get() = badges.filterNot { it.startsWith("Au
         Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(end = 14.dp, bottom = 12.dp)) {
             Column(
                 Modifier.widthIn(max = ReadingWidth),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
                 content = content,
             )
         }
@@ -369,37 +379,91 @@ private val ReadingWidth = 860.dp
         }
     }
 
-    // Started this much above the page's own inset so that the headline tile's rim gives it back:
-    // the word inside the tile lands on the line every other page's title starts on.
-    BoxWithConstraints(Modifier.fillMaxSize().padding(top = HeadlineTop - TileRim)) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val narrow = LocalCompactLayout.current || maxWidth < 720.dp
         val tight = maxHeight < 640.dp
-        Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Box(Modifier.fillMaxWidth().glass(PanelShape, glassTint())) {
-                    Headline(m, status, node, tight, Modifier.padding(TileRim + 4.dp))
+        val entry = remember { Animatable(1f) }
+        val initialized = remember { booleanArrayOf(false) }
+        LaunchedEffect(narrow) {
+            if (initialized[0]) {
+                entry.snapTo(0.7f)
+                entry.animateTo(1f, tween(220))
+            } else initialized[0] = true
+        }
+        // One layout at a time: two crossfading planets share a camera and fight over its size.
+        // Drop the temporary layer after the transition so normal frames keep the direct path.
+        Box(Modifier.fillMaxSize().then(if (entry.isRunning || entry.value < 1f) Modifier.graphicsLayer {
+            alpha = entry.value
+            translationY = (1f - entry.value) * 8.dp.toPx()
+        } else Modifier)) {
+            if (narrow) {
+                CompactConnectPage(m, status, traffic, node, profiles.latencies[node?.id], onServers, onPair)
+            } else {
+                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Box(Modifier.fillMaxWidth().height(pageHeaderHeight()).testTag("page-header").glass(PanelShape, glassTint())) {
+                            Headline(m, status, node, tight, Modifier.padding(if (LocalCompactLayout.current) TileRim else TileRim + 4.dp))
+                        }
+                        FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
+                    }
+                    Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        ServerRow(m, node, profiles.latencies[node?.id], onServers)
+                        ControlTile(m, status, node != null, Modifier.weight(1f), m::toggleConnection)
+                        when {
+                            // A kill switch holding a dead tunnel is the one thing on this screen the user
+                            // must not miss: their internet is off on purpose, and here is how to turn it on.
+                            status.killSwitch && status.state != "connected" && status.state != "connecting" -> TroubleNote(
+                                Icons.Rounded.GppMaybe,
+                                m.text("Интернет закрыт килл свитчем", "The kill switch is holding traffic"),
+                                m.text(
+                                    "Туннель не работает, поэтому всё, что шло бы мимо него, заблокировано. Переподключись или сними блокировку.",
+                                    "The tunnel is down, so everything that would leave around it is blocked. Reconnect, or lift the block.",
+                                ),
+                                Modifier.fillMaxWidth(),
+                                action = m.text("Снять блокировку", "Lift the block"),
+                                onAction = { m.releaseKillSwitch() },
+                            )
+                            status.state in listOf("failed", "unavailable") -> ConnectionProblem(m, status)
+                            node == null -> TransferCard(m, onPair)
+                            else -> SessionTile(m, traffic, download.values, upload.values)
+                        }
+                    }
                 }
-                FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
             }
+        }
+    }
+}
+
+/** A small window keeps the same hierarchy without squeezing two poster columns together. */
+@Composable private fun CompactConnectPage(
+    m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, node: ProxyNode?, latency: LatencyResult?,
+    onServers: () -> Unit, onPair: () -> Unit,
+) {
+    val groupHeight by animateDpAsState(LocalCompactContentTop.current - 12.dp, tween(220), label = "compact-connection-height")
+    Column(Modifier.fillMaxSize().testTag("compact-connect"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(Modifier.fillMaxWidth().height(groupHeight), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                ServerRow(m, node, profiles.latencies[node?.id], onServers)
-                ControlTile(m, status, node != null, Modifier.weight(1f), m::toggleConnection)
-                when {
-                    // A kill switch holding a dead tunnel is the one thing on this screen the user
-                    // must not miss: their internet is off on purpose, and here is how to turn it on.
-                    status.killSwitch && status.state != "connected" && status.state != "connecting" -> TroubleNote(
-                        Icons.Rounded.GppMaybe,
-                        m.text("Интернет закрыт килл свитчем", "The kill switch is holding traffic"),
-                        m.text(
-                            "Туннель не работает, поэтому всё, что шло бы мимо него, заблокировано. Переподключись или сними блокировку.",
-                            "The tunnel is down, so everything that would leave around it is blocked. Reconnect, or lift the block.",
-                        ),
-                        Modifier.fillMaxWidth(),
-                        action = m.text("Снять блокировку", "Lift the block"),
-                        onAction = { m.releaseKillSwitch() },
-                    )
-                    node == null -> TransferCard(m, onPair)
-                    else -> SessionTile(m, traffic, download.values, upload.values)
+                Box(Modifier.weight(1f).fillMaxWidth().testTag("page-header").glass(PanelShape, glassTint())) {
+                    Headline(m, status, node, true, Modifier.padding(12.dp), compact = true)
                 }
+                ServerButton(m, node, latency, Modifier.fillMaxWidth().height(64.dp), true, onServers)
+            }
+            Box(Modifier.weight(1f).fillMaxHeight().testTag("compact-control")) {
+                ControlTile(m, status, node != null, Modifier.fillMaxSize(), m::toggleConnection)
+            }
+        }
+        FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
+        if (status.killSwitch && status.state !in listOf("connected", "connecting")) {
+            QuietButton(m.text("Снять блокировку интернета", "Lift the network block"), Modifier.fillMaxWidth(), Icons.Rounded.GppMaybe) { m.releaseKillSwitch() }
+        } else if (status.state in listOf("failed", "unavailable")) {
+            ConnectionProblem(m, status)
+        } else if (node == null) {
+            QuietButton(m.text("Перенести с телефона", "Transfer from phone"), Modifier.fillMaxWidth(), Icons.Rounded.QrCodeScanner, onClick = onPair)
+        } else {
+            val semantic = LocalSemanticColors.current
+            Row(Modifier.fillMaxWidth().glass(TileShape, glassTint()).padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_download), m.strings.rate(traffic.downloadBytesPerSecond), semantic.download) }
+                Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_upload), m.strings.rate(traffic.uploadBytesPerSecond), semantic.upload) }
             }
         }
     }
@@ -468,7 +532,7 @@ private val ReadingWidth = 860.dp
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (node != null) Text(rememberEmojiText(node.name, 15.sp), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (node != null) Text(rememberEmojiText(node.name, 15.sp), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
             else Text(m.text("Выбрать", "Choose"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
             Text(value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = ink, maxLines = 1)
         } else Column(
@@ -484,13 +548,13 @@ private val ReadingWidth = 860.dp
     }
 }
 
-@Composable private fun Headline(m: DesktopModel, status: ServiceStatus, node: ProxyNode?, tight: Boolean, modifier: Modifier) {
+@Composable private fun Headline(m: DesktopModel, status: ServiceStatus, node: ProxyNode?, tight: Boolean, modifier: Modifier, compact: Boolean = false) {
     val semantic = LocalSemanticColors.current
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(status.state, status.connectedAt) {
         while (status.state == "connected") {
             now = System.currentTimeMillis()
-            delay(500)
+            delay(1000)
         }
     }
     val connected = status.state == "connected"
@@ -522,19 +586,8 @@ private val ReadingWidth = 860.dp
             secondary = m.strings.get(R.string.connect_tunnel_secondary)
         }
     }
-    // Only what the tiles beside this one cannot say: a handshake that failed, a service that is not
-    // installed or belongs to someone else.
-    val subtitle = when {
-        status.state == "unavailable" -> when (status.error) {
-            "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
-            "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
-            else -> m.text("Установите Yumi вместе с VPN-службой, чтобы подключаться.", "Install Yumi with its tunnel service to connect.")
-        }
-        status.state == "failed" -> status.error?.let { serviceError(m, it) }
-        else -> null
-    }
     val ink = if (connected) semantic.connected else MaterialTheme.colorScheme.onSurface
-    val poster = if (tight) MaterialTheme.typography.displayMedium else MaterialTheme.typography.displayLarge
+    val poster = pagePosterStyle(compact || LocalCompactLayout.current, tight)
     Column(modifier) {
         Kicker(
             when {
@@ -542,7 +595,21 @@ private val ReadingWidth = 860.dp
                 else -> m.text("Туннель", "Tunnel")
             },
         )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
+        if (compact) {
+            val label = when (status.state) {
+                "connected" -> primary
+                "connecting" -> m.text("Подключение", "Connecting")
+                "disconnecting" -> m.text("Отключение", "Disconnecting")
+                "failed" -> m.text("Ошибка подключения", "Connection failed")
+                "unavailable" -> m.text("Служба недоступна", "Service unavailable")
+                else -> m.text("VPN выключен", "VPN is off")
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(label, Modifier.weight(1f), style = poster, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (connected) Text(secondary, style = poster.copy(fontSize = 20.sp, lineHeight = 26.sp, fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
+            }
+        } else {
         Text(primary, style = poster, color = ink, maxLines = 1)
         // Keyed on the state, never on the text: keying on the text would crossfade the whole line
         // once a second while the timer ticks. Tabular figures keep it from twitching sideways.
@@ -554,23 +621,32 @@ private val ReadingWidth = 860.dp
         ) { _ ->
             Text(secondary, style = poster.copy(fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
         }
-        if (subtitle != null) {
-            Spacer(Modifier.height(if (tight) 8.dp else 12.dp))
-            Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        }
-        // The one failure the user can put right from here: the service is running and simply does
-        // not admit this account.
-        if (status.state == "unavailable" && status.error == "service_denied") {
-            Spacer(Modifier.height(12.dp))
-            AccentButton(m.text("Переназначить службу на меня", "Register the service to me")) { m.repairService() }
-        }
-        // What the core itself said, under the sentence that categorises it.
-        val detail = status.detail?.takeIf { status.state == "failed" && it.isNotBlank() }
-        if (detail != null) {
-            Spacer(Modifier.height(8.dp))
-            Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
     }
+}
+
+/** Keep diagnostics outside the fixed poster, so the dock grid also holds for service errors. */
+@Composable private fun ConnectionProblem(m: DesktopModel, status: ServiceStatus) {
+    // Only what the tiles beside this one cannot say: a handshake that failed, a service that is not
+    // installed or belongs to someone else.
+    val subtitle = when {
+        status.state == "unavailable" -> when (status.error) {
+            "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
+            "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
+            else -> m.text("Установите Yumi вместе с VPN-службой, чтобы подключаться.", "Install Yumi with its tunnel service to connect.")
+        }
+        status.state == "failed" -> status.error?.let { serviceError(m, it) }
+        else -> null
+    }
+    TroubleNote(
+        Icons.Rounded.Warning,
+        if (status.state == "failed") m.text("Не удалось подключиться", "Could not connect") else m.text("Служба недоступна", "Service unavailable"),
+        subtitle,
+        Modifier.fillMaxWidth(),
+        action = if (status.state == "unavailable" && status.error == "service_denied") m.text("Переназначить службу на меня", "Register the service to me") else null,
+        onAction = { m.repairService() },
+        detail = status.detail?.takeIf { status.state == "failed" && it.isNotBlank() },
+    )
 }
 
 @Composable private fun FlowFigure(m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, node: ProxyNode?, modifier: Modifier) {
@@ -582,7 +658,7 @@ private val ReadingWidth = 860.dp
     // and the gaps between the cells are left open, so the shapes drifting behind the window show
     // through the ocean, blurred, and move under it when the window is dragged.
     val veil by animateFloatAsState(if (running) 0.62f else 0.5f, colorTween(), label = "figure-veil")
-    Box(modifier.glass(FigureShape, glassTint(veil))) {
+    Box(modifier.testTag("flow-figure").glass(FigureShape, glassTint(veil))) {
         when (settings.visualizer) {
             Visualizer.Waves -> TrafficWaves(
                 downloadBytesPerSecond = traffic.downloadBytesPerSecond,
@@ -592,9 +668,7 @@ private val ReadingWidth = 860.dp
                 warming = warming,
             )
             Visualizer.Planet -> {
-                val mask = remember {
-                    runCatching { checkNotNull(DesktopModel::class.java.getResourceAsStream("/world_land.bin")).use { it.readBytes() } }.getOrElse { ByteArray(0) }
-                }
+                val mask = WorldLandMask
                 // The flag in the server's own name is its country code. Nothing is asked of the
                 // network to find out where a server is.
                 val place = remember(node?.name) { node?.name?.let(WorldMap::countryCodeOf)?.let(WorldMap::centroidOf) }
@@ -755,91 +829,104 @@ private val ReadingWidth = 860.dp
 
 @Composable private fun ServersPage(m: DesktopModel) {
     val profiles by m.profiles.state.collectAsState()
-    val busy by m.busy.collectAsState()
+    val pinging by m.pinging.collectAsState()
+    val status by m.status.collectAsState()
     var query by remember { mutableStateOf("") }
     val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
     val matches = remember(visibleNodes, query) {
-        if (query.isBlank()) visibleNodes else visibleNodes.filter { it.name.contains(query, true) }
+        if (query.isBlank()) visibleNodes else visibleNodes.filter { it.name.contains(query.trim(), true) }
     }
-    val grid = rememberLazyGridState()
+    val sources = remember(profiles.subscriptions) { profiles.subscriptions.associate { it.id to (it.remoteTitle ?: it.name) } }
+    val list = rememberLazyListState()
     val frameProbe = LocalUiFrameProbe.current
-    DisposableEffect(grid, frameProbe) {
-        frameProbe?.grid = grid
-        onDispose { frameProbe?.grid = null }
+    DisposableEffect(list, frameProbe) {
+        frameProbe?.servers = list
+        onDispose { frameProbe?.servers = null }
     }
 
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         PageTitle(
             m.strings.get(R.string.servers_title),
-            m.strings.get(
-                R.string.servers_subtitle,
+            m.strings.get(R.string.servers_subtitle,
                 m.strings.plural(R.plurals.servers, visibleNodes.size),
-                m.strings.plural(R.plurals.sources, profiles.subscriptions.size),
-            ),
-        ) {
-            AccentButton(m.strings.get(R.string.servers_measure_latency), icon = Icons.Rounded.Bolt, enabled = !busy && visibleNodes.isNotEmpty()) { m.ping() }
-        }
-        Box(Modifier.glass(PillShape, glassTint()).fillMaxWidth()) {
-            GlassField(query, { query = it }, Modifier.fillMaxWidth().testTag("server-search"), placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search)
-        }
-        if (busy) LinearWavyProgressIndicator(Modifier.fillMaxWidth())
-        if (matches.isEmpty()) EmptyState(
-            Icons.Rounded.Dns,
-            m.strings.get(if (query.isBlank()) R.string.servers_empty else R.string.servers_empty_filtered),
-            m.strings.get(if (query.isBlank()) R.string.servers_empty_hint else R.string.servers_empty_filtered_hint),
+                m.strings.plural(R.plurals.sources, profiles.subscriptions.size)),
+            description = m.text("Выбери сервер и проверь задержку перед подключением.", "Choose a server and check its latency before connecting."),
+            controlsBelow = true,
         )
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(300.dp),
-                state = grid,
-                modifier = Modifier.fillMaxSize().padding(end = 12.dp).testTag("server-grid"),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                items(matches, key = { it.id }) { node ->
-                    ServerCard(m, node, node.id == profiles.selectedNodeId, profiles.latencies[node.id])
+        Row(Modifier.fillMaxWidth().height(if (LocalCompactLayout.current) 64.dp else 48.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f).glass(PillShape, glassTint())) {
+                GlassField(query, { query = it }, Modifier.fillMaxWidth().testTag("server-search"),
+                    placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search,
+                    containerColor = Color.Transparent, singleLineHeight = 48.dp)
+            }
+            AccentButton(
+                if (pinging) m.text("Заново", "Restart") else m.text("Пинг", "Ping"),
+                Modifier.testTag("ping-servers"),
+                icon = if (pinging) Icons.Rounded.Refresh else Icons.Rounded.Bolt,
+                enabled = visibleNodes.isNotEmpty(),
+            ) { m.ping() }
+        }
+        Box(Modifier.weight(1f).fillMaxWidth().glass(PanelShape, glassTint()).testTag("server-panel")) {
+            Column(Modifier.fillMaxSize()) {
+                Row(Modifier.fillMaxWidth().padding(start = 22.dp, end = 30.dp, top = 18.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Kicker(m.text("Сервер", "Server"), Modifier.weight(1f))
+                    if (pinging) Text(m.text("Проверяем…", "Measuring…"), Modifier.padding(end = 16.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                    Kicker(m.text("Задержка", "Latency"))
+                }
+                // Fixed height: restarting a probe never shifts the list under the pointer.
+                Box(Modifier.fillMaxWidth().height(2.dp)) {
+                    if (pinging) LinearProgressIndicator(Modifier.fillMaxSize())
+                    else HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                }
+                if (matches.isEmpty()) Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                    Text(m.strings.get(if (query.isBlank()) R.string.servers_empty_hint else R.string.servers_empty_filtered_hint),
+                        style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                } else Box(Modifier.weight(1f)) {
+                    LazyColumn(
+                        state = list,
+                        modifier = Modifier.fillMaxSize().padding(end = 12.dp).testTag("server-list"),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        items(matches, key = { it.id }, contentType = { "server" }) { node ->
+                            ServerListRow(m, node, node.id == profiles.selectedNodeId,
+                                node.id == status.nodeId && status.state == "connected", profiles.latencies[node.id], sources[node.subscriptionId])
+                        }
+                    }
+                    VerticalScrollbar(rememberScrollbarAdapter(list), Modifier.align(Alignment.CenterEnd).fillMaxHeight().padding(vertical = 10.dp))
                 }
             }
-            VerticalScrollbar(rememberScrollbarAdapter(grid), Modifier.align(Alignment.CenterEnd).fillMaxHeight())
         }
     }
 }
 
-@Composable private fun ServerCard(m: DesktopModel, node: ProxyNode, selected: Boolean, latency: LatencyResult?) {
+@Composable private fun ServerListRow(m: DesktopModel, node: ProxyNode, selected: Boolean, connected: Boolean, latency: LatencyResult?, source: String?) {
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
-    val ring by animateColorAsState(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent, colorTween(), label = "server-ring")
-    Column(
-        Modifier
-            .testTag("server-card-${node.id}")
-            .pressMorph(interaction)
-            .glass(TileShape, glassTint(if (hovered || selected) 0.9f else GlassAlpha))
-            .border(1.5.dp, ring, TileShape)
+    val scheme = MaterialTheme.colorScheme
+    val details = remember(node, source) { (listOf(node.protocol.label) + node.desktopBadges + listOfNotNull(source)).distinct().joinToString(" · ") }
+    Row(
+        Modifier.fillMaxWidth().testTag("server-card-${node.id}")
+            .semantics { this.selected = selected }
+            .clip(RowShape)
+            .background(when { selected -> scheme.primary.copy(alpha = 0.12f); hovered -> scheme.onSurface.copy(alpha = 0.05f); else -> Color.Transparent })
             .hoverable(interaction)
-            .clickable(interaction, indication = null) { m.selectNode(node.id) }
-            .padding(18.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .clickable(interaction, indication = null, role = androidx.compose.ui.semantics.Role.RadioButton) { m.selectNode(node.id) }
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(
-                rememberEmojiText(node.name, 15.sp),
-                Modifier.weight(1f),
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 2,
-                minLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            // A cookie with a check: what the design marks "done / chosen" with.
-            if (selected) Box(
-                Modifier.size(26.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(MaterialTheme.colorScheme.primary),
-                contentAlignment = Alignment.Center,
-            ) { Icon(Icons.Rounded.Check, m.text("Выбран", "Chosen"), Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary) }
+        Box(Modifier.size(28.dp).clip(CircleShape)
+            .then(if (selected) Modifier.background(scheme.primary) else Modifier.border(1.5.dp, scheme.outlineVariant, CircleShape)), contentAlignment = Alignment.Center) {
+            if (selected) Icon(Icons.Rounded.Check, m.text("Выбран", "Selected"), Modifier.size(18.dp), tint = scheme.onPrimary)
         }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            ProtocolPlate(node.protocol)
-            remember(node) { node.desktopBadges.take(2) }.forEach { Plate(it) }
-            Spacer(Modifier.weight(1f))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text(rememberEmojiText(node.name, 17.sp), style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(details, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Column(Modifier.width(92.dp), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
             LatencyLabel(m, latency)
+            if (connected) Text(m.text("Подключён", "Connected"), style = MaterialTheme.typography.labelSmall, color = LocalSemanticColors.current.connected)
         }
     }
 }
@@ -852,8 +939,9 @@ private val ReadingWidth = 860.dp
     var remove by remember { mutableStateOf<Subscription?>(null) }
     val grid = rememberLazyGridState()
 
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        PageTitle(m.strings.get(R.string.subscriptions_title), m.strings.plural(R.plurals.sources, profiles.subscriptions.size)) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        PageTitle(m.strings.get(R.string.subscriptions_title), m.strings.plural(R.plurals.sources, profiles.subscriptions.size),
+            description = m.text("Обновляй серверы и проверяй остаток трафика по подпискам.", "Refresh servers and check the remaining subscription traffic.")) {
             PanelIconButton(Icons.Rounded.Refresh, m.strings.get(R.string.action_refresh), Modifier.glass(CircleShape, glassTint()), enabled = !busy) { m.refreshAll() }
             QuietButton(m.text("С телефона", "From phone"), icon = Icons.Rounded.QrCodeScanner, onClick = onPair)
             AccentButton(m.strings.get(R.string.action_add), icon = Icons.Rounded.Add, onClick = onAdd)
@@ -959,11 +1047,12 @@ private val ReadingWidth = 860.dp
     LaunchedEffect(Unit) { if (known.isEmpty()) m.discoverApps() }
 
     ScrollingColumn {
-        PageTitle(m.text("Туннелирование", "Split tunneling"), m.text("Что идёт через VPN, а что мимо", "What goes through the VPN, and what goes around it"))
+        PageTitle(m.text("Туннелирование", "Split tunneling"), m.text("Что идёт через VPN, а что мимо", "What goes through the VPN, and what goes around it"),
+            description = m.text("Выбери, какие приложения, сайты и сети должны идти через VPN. Остальной трафик может идти напрямую. Добавляй домены и подсети без ручного редактирования конфигурации.", "Choose which apps, websites and networks use the VPN. Other traffic can go directly. Add domains and subnets without editing configuration files."))
 
         GlassPanel(Modifier.fillMaxWidth()) {
             SectionTitle(m.text("Куда направлять трафик", "Where traffic goes"), m.text("Направление", "Direction"))
-            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(Modifier.fillMaxWidth().height(if (status.state in listOf("failed", "unavailable")) 196.dp else 160.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 ModeCard(
                     Modifier.weight(1f).fillMaxHeight(),
                     Icons.Rounded.Shield,
@@ -1154,7 +1243,7 @@ private val ReadingWidth = 860.dp
     val running = speed.running
     val accent = if (speed.phase == SpeedPhase.Upload) semantic.upload else semantic.download
 
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         PageTitle(
             m.strings.get(R.string.speed_title),
             when {
@@ -1164,6 +1253,7 @@ private val ReadingWidth = 860.dp
                 status.state == "connected" -> m.text("Через VPN", "Through the tunnel")
                 else -> m.text("Напрямую — туннель выключен, это канал самого ПК", "Direct — the tunnel is off, this is your PC's own link")
             },
+            description = m.text("Измерь скорость загрузки и отдачи, задержку и стабильность канала. При включённом VPN тест проходит через выбранный сервер. Чем ниже задержка и джиттер, тем стабильнее соединение.", "Measure download, upload, latency and stability. With VPN enabled, the test uses your connected server. Lower latency and jitter mean a steadier connection."),
         )
         if (speed.hasResult && !running) {
             SpeedResult(m.strings.get(R.string.connect_rate_download), Icons.Rounded.ArrowDownward, m.strings.megabits(speed.downloadBytesPerSecond), speed.downloadSeries, semantic.download, Modifier.weight(1f))
@@ -1298,7 +1388,8 @@ private val ReadingWidth = 860.dp
     }
 
     ScrollingColumn {
-        PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later")
+        PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later",
+            description = m.text("Выбери оформление и поведение приложения, настрой защиту и обновления. Здесь можно сменить палитру, настроить запуск вместе с системой и проверить новую версию. Подписки и выбранный сервер сохранятся.", "Choose the appearance, app behavior, protection and updates. Change the palette, configure startup and check for a new version. Your subscriptions and selected server are preserved."))
 
         UpdatePanel(m, desktop, onInstallUpdate)
 
@@ -1421,33 +1512,35 @@ private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
  * The palettes, shown as what they are: swatches in each scheme's own accent. The chosen one turns
  * into a cookie with a check — the design's mark for "this one".
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable private fun PaletteRow(m: DesktopModel, settings: AppSettings, desktop: DesktopSettings) {
     val dark = isDark(settings)
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(Modifier.fillMaxWidth().testTag("palette-picker"), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Kicker(m.text("Палитра", "Palette") + " · " + m.text(desktop.palette.ru, desktop.palette.en))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Palette.entries.forEach { option ->
                 val scheme = remember(option, dark) { option.scheme(dark) }
                 val chosen = option == desktop.palette
                 val interaction = remember { MutableInteractionSource() }
                 val size by animateDpAsState(if (chosen) 50.dp else 42.dp, Springs.toggle(), label = "swatch")
-                Box(
-                    Modifier
-                        .size(50.dp)
-                        .testTag("palette-${option.name}"),
-                    contentAlignment = Alignment.Center,
+                val label = m.text(option.ru, option.en)
+                Column(
+                    Modifier.width(72.dp).testTag("palette-${option.name}")
+                        .pressMorph(interaction)
+                        .clip(RoundedCornerShape(16.dp))
+                        .semantics { selected = chosen; contentDescription = label }
+                        .clickable(interaction, indication = null, role = androidx.compose.ui.semantics.Role.RadioButton) { m.changeDesktop(desktop.copy(palette = option)) },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Box(
-                        Modifier
-                            .size(size)
-                            .pressMorph(interaction)
-                            .clip(if (chosen) MaterialShapes.Cookie9Sided.toShape() else CircleShape)
-                            .background(scheme.primary)
-                            .clickable(interaction, indication = null) { m.changeDesktop(desktop.copy(palette = option)) },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (chosen) Icon(Icons.Rounded.Check, m.text(option.ru, option.en), Modifier.size(20.dp), tint = scheme.onPrimary)
+                    Box(Modifier.size(50.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(size).clip(if (chosen) MaterialShapes.Cookie9Sided.toShape() else CircleShape).background(scheme.primary), contentAlignment = Alignment.Center) {
+                            if (chosen) Icon(Icons.Rounded.Check, null, Modifier.size(20.dp), tint = scheme.onPrimary)
+                        }
                     }
+                    Text(label, style = MaterialTheme.typography.labelSmall,
+                        color = if (chosen) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
@@ -1552,4 +1645,8 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
     "invalid_configuration", "forbidden_field", "unsupported_protocol" ->
         m.text("Конфигурация сервера не поддерживается ядром.", "The server configuration is not supported by the core.")
     else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.") + if (includeUnknown) "\n\n$code" else ""
+}
+
+private val WorldLandMask: ByteArray by lazy {
+    checkNotNull(DesktopModel::class.java.getResourceAsStream("/world_land.bin")).use { it.readBytes() }
 }

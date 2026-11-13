@@ -80,7 +80,7 @@ data class ProxyNode(
                     group.members.forEach { append(it.id).append(',') }
                 }
                 val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
-                return digest.take(12).joinToString("") { "%02x".format(it) }
+                return java.util.HexFormat.of().formatHex(digest, 0, 12)
             }
             val seed = buildString {
                 append(scope).append('|')
@@ -91,7 +91,7 @@ data class ProxyNode(
                 append('|').append(node.dialDiscriminator())
             }
             val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
-            return digest.take(12).joinToString("") { "%02x".format(it) }
+            return java.util.HexFormat.of().formatHex(digest, 0, 12)
         }
 
         /**

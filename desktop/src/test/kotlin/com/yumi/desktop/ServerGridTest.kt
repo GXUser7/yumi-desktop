@@ -27,7 +27,7 @@ class ServerGridTest {
                 }
                 val cards = SemanticsMatcher("server cards") { it.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("server-card-") == true }
                 assertTrue(onAllNodes(cards).fetchSemanticsNodes().size in 1..100, "Only nearby cards should be composed")
-                onNodeWithTag("server-grid").performScrollToIndex(599)
+                onNodeWithTag("server-list").performScrollToIndex(599)
                 onNodeWithTag("server-card-${last.id}").assertIsDisplayed()
                 onNode(hasSetTextAction() and hasAnyAncestor(hasTestTag("server-search"))).performTextInput("600")
                 onNodeWithTag("server-card-${last.id}").assertIsDisplayed().performClick()

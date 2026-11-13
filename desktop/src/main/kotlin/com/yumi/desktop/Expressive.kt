@@ -22,6 +22,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
@@ -118,29 +119,53 @@ fun SectionTitle(title: String, kicker: String? = null, trailing: @Composable Ro
     }
 }
 
-/**
- * The title every page opens with, in place of a title bar: Unbounded, the size YouCloud sets its
- * page titles. Actions sit at the title's end — a window has no thumb to put them under.
- */
+internal val RegularPageHeaderHeight = 184.dp
+internal val CompactContentTop = 172.dp
+internal val LocalCompactLayout = staticCompositionLocalOf { false }
+internal val LocalDenseLayout = staticCompositionLocalOf { false }
+internal val LocalCompactContentTop = staticCompositionLocalOf { CompactContentTop }
+
+@Composable internal fun pageHeaderHeight(): Dp =
+    animateDpAsState(if (LocalCompactLayout.current) LocalCompactContentTop.current - 88.dp else RegularPageHeaderHeight, tween(220), label = "page-header-height").value
+
+@Composable internal fun pagePosterStyle(compact: Boolean = LocalCompactLayout.current, tight: Boolean = false): androidx.compose.ui.text.TextStyle {
+    val size by animateFloatAsState(if (compact) 26f else if (tight) 36f else 46f, tween(220), label = "page-title-size")
+    val line by animateFloatAsState(if (compact) 32f else if (tight) 44f else 54f, tween(220), label = "page-title-line")
+    return MaterialTheme.typography.displayLarge.copy(fontSize = size.sp, lineHeight = line.sp)
+}
+
+/** A single header island, on the same grid as the connection poster. */
 @Composable
-fun PageTitle(title: String, subtitle: String? = null, actions: @Composable RowScope.() -> Unit = {}) {
-    Row(Modifier.fillMaxWidth().padding(top = HeadlineTop, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.displaySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (subtitle != null) {
-                Spacer(Modifier.height(10.dp))
-                // Through the flag pass as well: a speed test's subtitle names the server it went
-                // through, and that name carries a flag like any other.
-                Text(
-                    rememberEmojiText(subtitle, 14.sp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+fun PageTitle(title: String, subtitle: String? = null, description: String? = null, controlsBelow: Boolean = false, actions: (@Composable RowScope.() -> Unit)? = null) {
+    val compact = LocalCompactLayout.current
+    val baseHeight = pageHeaderHeight()
+    val extraHeight by animateDpAsState(if (compact && !controlsBelow && actions == null) 76.dp else 0.dp, tween(220), label = "page-description-height")
+    val headerHeight = baseHeight + extraHeight
+    val poster = pagePosterStyle()
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val stackActions = actions != null && maxWidth < 850.dp
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(Modifier.fillMaxWidth().height(headerHeight).testTag("page-header")
+                .glass(PanelShape, glassTint()).padding(if (compact) 12.dp else 22.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    Text(rememberEmojiText((subtitle ?: "Yumi Desktop").uppercase(), 12.sp),
+                        style = KickerStyle, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
+                    Text(title, Modifier.testTag("page-title"), style = poster,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (description != null && (!compact || (!controlsBelow && actions == null))) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(description, style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (compact) 3 else 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                if (!stackActions && actions != null) Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically, content = actions)
             }
+            if (stackActions) Row(Modifier.fillMaxWidth().height(64.dp), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically, content = checkNotNull(actions))
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically, content = actions)
     }
 }
 
@@ -287,7 +312,7 @@ fun PanelIconButton(
             .clickable(interaction, indication = null, enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, contentDescription, Modifier.size(24.dp), tint = content)
+        Icon(icon, contentDescription, Modifier.size(if (size < 40.dp) 20.dp else 24.dp), tint = content)
     }
 }
 
@@ -369,6 +394,8 @@ fun GlassField(
     minLines: Int = 1,
     isError: Boolean = false,
     shape: androidx.compose.ui.graphics.Shape = if (singleLine) PillShape else RowShape,
+    containerColor: Color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (isLightTheme()) 0.05f else 0.07f),
+    singleLineHeight: Dp? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
     val ring by animateColorAsState(
@@ -394,10 +421,11 @@ fun GlassField(
                 Row(
                     Modifier
                         .fillMaxWidth()
+                        .then(if (singleLine && singleLineHeight != null) Modifier.height(singleLineHeight) else Modifier)
                         .clip(shape)
-                        .background(MaterialTheme.colorScheme.onSurface.copy(alpha = if (isLightTheme()) 0.05f else 0.07f))
+                        .background(containerColor)
                         .border(BorderStroke(1.5.dp, ring), shape)
-                        .padding(horizontal = 18.dp, vertical = if (singleLine) 13.dp else 14.dp),
+                        .padding(horizontal = 18.dp, vertical = if (singleLine && singleLineHeight != null) 0.dp else if (singleLine) 13.dp else 14.dp),
                     verticalAlignment = if (singleLine) Alignment.CenterVertically else Alignment.Top,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {

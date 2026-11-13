@@ -1,9 +1,6 @@
 package com.mydrop.vpn.ui.components
 
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
+import androidx.compose.animation.core.withInfiniteAnimationFrameNanos
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -21,6 +18,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import kotlin.math.PI
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.sin
 import com.yumi.desktop.LocalAnimationsActive
@@ -49,41 +47,32 @@ fun TrafficWaves(
     val downloadPace = paceOf(downloadBytesPerSecond)
     val uploadPace = paceOf(uploadBytesPerSecond)
 
-    // Rates arrive in one-second steps, so the swell is eased across a step and a half rather than
-    // a step: matching the sampling exactly means the surface arrives at each new value just as
-    // the next one lands, which is a series of lurches rather than a swell.
-    val downSwell = animateFloatAsState(
-        targetValue = if (warming) maxOf(downloadPace, 0.45f) else downloadPace,
-        animationSpec = tween(1600, easing = LinearEasing),
-        label = "download-swell",
-    )
-    val upSwell = animateFloatAsState(
-        targetValue = if (warming) maxOf(uploadPace, 0.3f) else uploadPace,
-        animationSpec = tween(1600, easing = LinearEasing),
-        label = "upload-swell",
-    )
-
     val bands = remember { defaultBands() }
-    val elapsed = rememberSeconds()
+    val motion = remember { WaveMotion(bands) }
+    val frames = rememberWaveFrames(motion)
+    val active = LocalAnimationsActive.current
     val path = remember { Path() }
 
     Canvas(modifier = modifier.fillMaxSize()) {
         // Everything animated is read here, in the draw scope, so a frame costs a redraw rather
         // than a recomposition of the screen around the figure.
-        val time = elapsed.value
+        motion.advance(frames.value,
+            if (warming) maxOf(downloadPace, 0.45f) else downloadPace,
+            if (warming) maxOf(uploadPace, 0.3f) else uploadPace,
+            active)
         val stroke = 1.5.dp.toPx()
 
-        bands.forEach { band ->
-            val swell = if (band.upload) upSwell.value else downSwell.value
+        bands.forEachIndexed { index, band ->
+            val swell = if (band.upload) motion.upSwell else motion.downSwell
             val ink = if (band.upload) uploadColor else downloadColor
-            drawBand(band, time, swell, ink, path, stroke)
+            drawBand(band, motion.phaseAt(index), swell, ink, path, stroke)
         }
     }
 }
 
 private fun DrawScope.drawBand(
     band: Band,
-    time: Float,
+    drift: Float,
     swell: Float,
     ink: Color,
     path: Path,
@@ -95,7 +84,6 @@ private fun DrawScope.drawBand(
     // idle tunnel — but it barely moves until traffic arrives.
     val amplitude = height * band.amplitude * (0.12f + swell * 0.88f)
     val baseline = height * band.baseline
-    val drift = time * band.speed * (0.25f + swell * 0.75f)
 
     path.reset()
     path.moveTo(0f, baseline)
@@ -143,7 +131,7 @@ private fun waveAt(fraction: Float, drift: Float, band: Band): Float {
     return primary * 0.68f + secondary * 0.32f
 }
 
-private class Band(
+internal class Band(
     val baseline: Float,
     val amplitude: Float,
     val frequency: Float,
@@ -163,7 +151,7 @@ private class Band(
  * doing its job — and since traffic arrives in one-second steps, every step landed as a lurch.
  * The figure has to say idle / working / working hard, and that survives a calmer swing.
  */
-private fun defaultBands(): List<Band> = listOf(
+internal fun defaultBands(): List<Band> = listOf(
     Band(0.46f, 0.070f, 1.1f, 0.90f, 0f, 0.32f, 0.60f, upload = false),
     Band(0.62f, 0.055f, 1.7f, 0.64f, 2.1f, 0.24f, 0.45f, upload = false),
     Band(0.78f, 0.040f, 1.4f, -0.76f, 4.0f, 0.22f, 0.50f, upload = true),
@@ -171,20 +159,44 @@ private fun defaultBands(): List<Band> = listOf(
 
 private const val TWO_PI = (PI * 2).toFloat()
 
-/** Seconds since the figure first drew, rebased so Float keeps frame-level precision. */
-@Composable
-private fun rememberSeconds(): State<Float> {
-    val active = LocalAnimationsActive.current
-    return produceState(0f, active) {
-        if (!active) return@produceState
-        val resumedAt = value
-        var origin = 0L
-        while (true) {
-            withInfiniteAnimationFrameMillis { frame ->
-                if (origin == 0L) origin = frame
-                value = resumedAt + (frame - origin) / 1000f
-            }
+/** Only displayed time advances the waves; hidden time is never replayed on return. */
+internal class WaveMotion(private val bands: List<Band>) {
+    var downSwell = 0f
+        private set
+    var upSwell = 0f
+        private set
+    private val phases = DoubleArray(bands.size)
+    private var previousFrame: Long? = null
+
+    fun pause() { previousFrame = null }
+    fun phaseAt(index: Int): Float = phases[index].toFloat()
+
+    fun advance(frameNanos: Long, downloadTarget: Float, uploadTarget: Float, active: Boolean = true) {
+        if (!active) { pause(); return }
+        val previous = previousFrame
+        previousFrame = frameNanos
+        if (previous == null) return
+        val dt = ((frameNanos - previous) / 1_000_000_000.0).coerceIn(0.0, 0.05)
+        // A smooth approach measured in visible time also keeps amplitude from jumping after sleep.
+        val blend = (1.0 - exp(-dt / 0.4)).toFloat()
+        downSwell += (downloadTarget.coerceIn(0f, 1f) - downSwell) * blend
+        upSwell += (uploadTarget.coerceIn(0f, 1f) - upSwell) * blend
+        bands.forEachIndexed { index, band ->
+            val swell = if (band.upload) upSwell else downSwell
+            // Integrate velocity. Multiplying all elapsed time by today's traffic speed
+            // retimes hours of history during each change of the throughput.
+            phases[index] = (phases[index] + dt * band.speed * (0.25 + swell * 0.75)) % (PI * 10)
         }
+    }
+}
+
+@Composable
+private fun rememberWaveFrames(motion: WaveMotion): State<Long> {
+    val active = LocalAnimationsActive.current
+    return produceState(0L, active, motion) {
+        motion.pause()
+        if (!active) return@produceState
+        while (true) withInfiniteAnimationFrameNanos { value = it }
     }
 }
 

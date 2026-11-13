@@ -20,7 +20,7 @@ import com.yumi.desktop.model.Palette
 @Composable fun YumiTheme(settings: AppSettings, palette: Palette = Palette.Glacier, content: @Composable () -> Unit) {
     val dark = isDark(settings)
     var colors = palette.scheme(dark)
-    if (dark && settings.amoled) colors = colors.toAmoled(palette.hue)
+    if (dark && settings.amoled) colors = colors.toAmoled(palette.hue, palette.chroma)
     // The tunnel state, the traffic waves and the control's outline all read their colour from
     // here rather than from a constant beside them, so a palette change moves them with everything
     // else. The latency ramp is the deliberate exception — there the colour is the measurement.
@@ -38,13 +38,13 @@ import com.yumi.desktop.model.Palette
  * palette, which is not what a switch about the backlight is for. A hue-less palette (the
  * original ice) keeps its own hand-picked greys.
  */
-private fun ColorScheme.toAmoled(hue: Float?): ColorScheme = copy(
+internal fun ColorScheme.toAmoled(hue: Float?, chroma: Float = 1f): ColorScheme = copy(
     background = Color.Black,
     surface = Color.Black,
     surfaceDim = Color.Black,
     surfaceContainerLowest = Color.Black,
-    surfaceContainerLow = hue?.let { Color.hsl(it, 0.30f, 0.042f) } ?: Color(0xFF0A0A0C),
-    surfaceContainer = hue?.let { Color.hsl(it, 0.28f, 0.072f) } ?: Color(0xFF121215),
-    surfaceContainerHigh = hue?.let { Color.hsl(it, 0.26f, 0.108f) } ?: Color(0xFF1B1B1F),
-    surfaceContainerHighest = hue?.let { Color.hsl(it, 0.24f, 0.145f) } ?: Color(0xFF242429),
+    surfaceContainerLow = hue?.let { Color.hsl(it, 0.30f * chroma, 0.042f) } ?: Color(0xFF0A0A0C),
+    surfaceContainer = hue?.let { Color.hsl(it, 0.28f * chroma, 0.072f) } ?: Color(0xFF121215),
+    surfaceContainerHigh = hue?.let { Color.hsl(it, 0.26f * chroma, 0.108f) } ?: Color(0xFF1B1B1F),
+    surfaceContainerHighest = hue?.let { Color.hsl(it, 0.24f * chroma, 0.145f) } ?: Color(0xFF242429),
 )

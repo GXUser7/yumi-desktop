@@ -1,6 +1,6 @@
 package com.mydrop.vpn.ui.components
 
-import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
+import androidx.compose.animation.core.withInfiniteAnimationFrameNanos
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialShapes
@@ -11,6 +11,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.asSkiaBitmap
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
@@ -23,6 +24,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.graphics.shapes.RoundedPolygon
 import com.mydrop.vpn.core.model.WorldMap
 import com.yumi.desktop.LocalAnimationsActive
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -129,6 +131,9 @@ private fun bakeStrip(mask: ByteArray, sea: Color, land: Color, gap: Color): Ima
             canvas.drawRect(left, top, left + CELL_PIXELS - 1f, top + CELL_PIXELS - 1f, paint)
         }
     }
+    // This atlas is never painted again. Otherwise Skia must defensively copy the mutable
+    // bitmap every time Compose creates an Image for either scrolling copy of the world.
+    image.asSkiaBitmap().setImmutable()
     return image
 }
 
@@ -154,7 +159,7 @@ private fun RoundedPolygon.toComposePath(): Path {
  * can be redirected mid-flight without a seam, and the tunnel changing servers under a running
  * animation is exactly that.
  */
-private class MapCamera {
+internal class MapCamera {
     var stripWidth = 0f
         private set
     var stripHeight = 0f
@@ -197,14 +202,24 @@ private class MapCamera {
     ) {
         if (width <= 0f || height <= 0f) return
 
-        val zoomTarget = if (connected) CONNECTED_ZOOM else IDLE_ZOOM
+        // Spring towards a pixel-aligned target too, rather than rounding by up to half
+        // a cell after the spring settles (which makes the whole map jump at the end).
+        val idlePitch = planetCellPitch(height, IDLE_ZOOM.toFloat(), ROWS, settled = true)
+        val targetPitch = planetCellPitch(height, (if (connected) CONNECTED_ZOOM else IDLE_ZOOM).toFloat(), ROWS, settled = true)
+        val idleZoom = idlePitch * ROWS / height.toDouble()
+        val zoomTarget = targetPitch * ROWS / height.toDouble()
         zoomSpeed += (-STIFFNESS * (zoom - zoomTarget) - DAMPING * zoomSpeed) * step
         // Floored at the idle zoom, so the strip is never shorter than the window. A spring
         // relaxing out of the connected zoom overshoots below its target, and a strip a hair
         // shorter than the window is what turns the clamp below inside out.
-        zoom = (zoom + zoomSpeed * step).coerceAtLeast(IDLE_ZOOM)
+        zoom = (zoom + zoomSpeed * step).coerceAtLeast(idleZoom)
 
-        stripHeight = (height * zoom).toFloat()
+        // At rest, each baked cell must occupy an integer number of device pixels.
+        // Scaling a 4px cell to e.g. 7.3px alternates thin/thick gaps as it scrolls,
+        // producing the crawling/shimmering grid most visible on a real monitor.
+        val settled = abs(height * zoom / ROWS - targetPitch) < 0.001 && abs(zoomSpeed) < 0.01
+        val pitch = planetCellPitch(height, zoom.toFloat(), ROWS, settled)
+        stripHeight = pitch * ROWS
         stripWidth = stripHeight * STRIP_ASPECT
 
         if (connected && latitude != null && longitude != null) {
@@ -347,7 +362,7 @@ private class PlanetState {
         private set
 
     private var pending = 0.0
-    private var lastFrameMillis = 0L
+    private var lastFrameNanos = 0L
     private var lastDrawnFrame = -1L
     private var stripKey: Any? = null
     private var stripImage: ImageBitmap? = null
@@ -361,11 +376,11 @@ private class PlanetState {
      * milliseconds is three frames at sixty hertz: enough to ride out a stutter, short enough that
      * a minute away resumes where it left off instead of fast-forwarding.
      */
-    fun tick(frameMillis: Long) {
+    fun tick(frameNanos: Long) {
         val step =
-            if (lastFrameMillis == 0L) 0.0
-            else ((frameMillis - lastFrameMillis) / 1000.0).coerceIn(0.0, MAX_STEP_SECONDS)
-        lastFrameMillis = frameMillis
+            if (lastFrameNanos == 0L) 0.0
+            else ((frameNanos - lastFrameNanos) / 1_000_000_000.0).coerceIn(0.0, MAX_STEP_SECONDS)
+        lastFrameNanos = frameNanos
         pending += step
         markerDegrees = (markerDegrees + (step * MARKER_DEGREES_PER_SECOND).toFloat()) % 360f
     }
@@ -416,10 +431,16 @@ private fun rememberPlanetTicks(): State<Long> {
     return produceState(0L, active) {
         if (!active) return@produceState
         while (true) {
-            withInfiniteAnimationFrameMillis { frame ->
+            withInfiniteAnimationFrameNanos { frame ->
                 Planet.tick(frame)
                 value += 1
             }
         }
     }
+}
+
+/** Physical pixels, independent of display density; transitions retain their smooth zoom. */
+internal fun planetCellPitch(height: Float, zoom: Float, rows: Int, settled: Boolean): Float {
+    val pitch = height * zoom / rows
+    return if (settled) pitch.roundToInt().coerceAtLeast(2).toFloat() else pitch.coerceAtLeast(2f)
 }

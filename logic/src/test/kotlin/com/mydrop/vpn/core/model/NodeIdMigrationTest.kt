@@ -32,6 +32,12 @@ class NodeIdMigrationTest {
     )
 
     @Test
+    fun `fast hexadecimal encoding preserves persisted node ids`() {
+        assertEquals("adc66df10842d6eb7affa2a2", ProxyNode.stableId(node("")))
+        assertEquals("08d705aecdd8fef2e38492a3", ProxyNode.stableId(node("", subscriptionId = null)))
+    }
+
+    @Test
     fun `a node whose id already matches its contents is left alone`() {
         val settled = node("x").identified()
         assertTrue(NodeIdMigration.remap(listOf(settled)).isEmpty())

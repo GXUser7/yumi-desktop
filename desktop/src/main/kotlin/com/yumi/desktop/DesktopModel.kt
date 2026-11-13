@@ -19,6 +19,7 @@ class DesktopModel(
     val backend: TunnelBackend = WindowsTunnelBackend(),
     val directory: File = DesktopPlatform.dataDirectory(),
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val measureLatency: suspend (ProxyNode, PingMode) -> LatencyResult = if (backend is DemoBackend) backend::measureLatency else LatencyTester()::measure,
 ) {
     val message = MutableStateFlow<String?>(null)
     val settings = SettingsRepository(directory, scope)
@@ -36,8 +37,9 @@ class DesktopModel(
     val adapters = MutableStateFlow<List<NetworkAdapter>>(emptyList())
     val traffic = MutableStateFlow(TrafficStats.Zero)
     val busy = MutableStateFlow(false)
+    val pinging = MutableStateFlow(false)
     val speed = MutableStateFlow(SpeedTestState())
-    val localAddresses = MutableStateFlow(DesktopPlatform.localAddresses())
+    val localAddresses = MutableStateFlow<List<LocalAddress>>(emptyList())
     val selectedAddress = MutableStateFlow(localAddresses.value.firstOrNull())
     val pairing = PairingReceiver({ selectedAddress.value?.address }, scope) { transfer ->
         val subscription = profiles.upsertSubscriptionSource(transfer.name, transfer.url, transfer.userAgentOverride, transfer.headers)
@@ -47,7 +49,8 @@ class DesktopModel(
     }
     private val commands = Mutex()
     private val subscriptions = Mutex()
-    private val probes = Mutex()
+    private val pingRequests = MutableStateFlow(0L)
+    private var connectionProbe: Job? = null
     private var speedJob: Job? = null
     private var startupConnectPending = desktop.value.connectOnLaunch
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
@@ -55,6 +58,15 @@ class DesktopModel(
     }, probeEndpoint = { status.value.probe() })
 
     init {
+        scope.launch {
+            pingRequests.filter { it > 0 }.collectLatest {
+                pinging.value = true
+                try { measureServers(profiles.nodes) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { message.value = text("Не удалось измерить задержку.", "Could not measure latency.") }
+                finally { pinging.value = false }
+            }
+        }
         if (settings.value.deviceId.isBlank()) settings.update {
             it.copy(deviceId = UUID.randomUUID().toString(), mtu = 1500, routingMode = RoutingMode.Global, autoFailover = false)
         }
@@ -163,6 +175,18 @@ class DesktopModel(
             if (next.connectedAt == old.connectedAt) (next.upload - old.upload).coerceAtLeast(0) else 0,
             if (next.connectedAt == old.connectedAt) (next.download - old.download).coerceAtLeast(0) else 0)
         status.value = next
+        if (next.state == "connected" && next.nodeId != null &&
+            (old.state != "connected" || old.nodeId != next.nodeId || old.connectedAt != next.connectedAt)) {
+            connectionProbe?.cancel()
+            val node = profiles.allNodes.firstOrNull { it.id == next.nodeId }
+            if (node != null) connectionProbe = scope.launch {
+                val result = measureLatency(node, settings.value.pingMode)
+                ensureActive()
+                if (profiles.allNodes.any { it.id == result.nodeId }) profiles.recordLatency(result)
+            }
+        } else if (next.state != "connected") {
+            connectionProbe?.cancel()
+        }
     }
     fun toggleConnection() = action {
         commands.withLock {
@@ -176,7 +200,9 @@ class DesktopModel(
     private suspend fun connectSelected() {
         val node = profiles.selectedNode()
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
-        updateStatus(ServiceStatus(state = "connecting", nodeId = node.id))
+        // Preserve geo/service metadata while the connect command is in flight. Dropping it
+        // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
+        updateStatus(status.value.copy(state = "connecting", nodeId = node.id, error = null, detail = null))
         val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
         updateStatus(backend.request(request))
     }
@@ -280,25 +306,40 @@ class DesktopModel(
             profiles.removeSubscription(id)
         }
     }
-    fun ping() = action {
-        if (!probes.tryLock()) return@action
-        busy.value = true
-        try {
-            coroutineScope {
-                val pending = java.util.concurrent.ConcurrentLinkedQueue<LatencyResult>()
-                fun flush() {
-                    val batch = buildList { while (true) add(pending.poll() ?: break) }
-                    if (batch.isNotEmpty()) profiles.recordLatencies(batch)
-                }
-                val writer = launch { while (isActive) { delay(200); flush() } }
-                try {
-                    LatencyTester().measureAll(profiles.nodes, settings.value.pingMode) { pending.add(it) }
-                } finally {
-                    writer.cancelAndJoin()
-                    flush()
-                }
+    /** collectLatest cancels and joins the previous sweep before starting this one. */
+    fun ping() { pingRequests.update { it + 1 } }
+
+    private suspend fun measureServers(nodes: List<ProxyNode>) = coroutineScope {
+        val pending = java.util.concurrent.ConcurrentLinkedQueue<LatencyResult>()
+        fun flush() {
+            val batch = buildList { while (true) add(pending.poll() ?: break) }
+            if (batch.isNotEmpty()) {
+                val ids = profiles.allNodes.mapTo(HashSet()) { it.id }
+                profiles.recordLatencies(batch.filter { it.nodeId in ids })
             }
-        } finally { busy.value = false; probes.unlock() }
+        }
+        val writer = launch { while (isActive) { delay(200); flush() } }
+        val mode = settings.value.pingMode
+        // A bounded worker pool also avoids creating thousands of waiting coroutines.
+        val remaining = java.util.concurrent.ConcurrentLinkedQueue(nodes)
+        try {
+            List(minOf(16, nodes.size)) {
+                launch {
+                    while (isActive) {
+                        val node = remaining.poll() ?: break
+                        val result = measureLatency(node, mode)
+                        ensureActive()
+                        pending.add(result)
+                    }
+                }
+            }.joinAll()
+            writer.cancelAndJoin()
+            ensureActive()
+            flush()
+        } finally {
+            writer.cancel()
+            // Cancelled sweeps deliberately discard their unfinished batch.
+        }
     }
     fun startPairing() {
         localAddresses.value = DesktopPlatform.localAddresses()

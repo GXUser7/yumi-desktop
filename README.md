@@ -11,8 +11,8 @@ glass over them, and dragging the window knocks them about on springs.
 * **Connect screen** — a poster headline that says what the tunnel is doing, a figure that shows
   what it is carrying (a scrolling pixel map of the world, or the traffic waves), and one loud
   control beside it.
-* **Servers** — a grid of glass cards with the protocol, the transport details that actually change
-  behaviour, and a latency reading you can act on. The server never changes by itself.
+* **Servers** — a readable list with protocol/transport details, source, selection and latency
+  aligned in each row. Ping can be restarted at any time; connecting probes that server automatically. The server never changes by itself.
 * **Subscriptions** — quota, expiry and refresh, or a QR transfer from Yumi on your phone over the
   local network.
 * **Split tunnelling** — pick applications from what is running and installed, with their icons, or
@@ -23,7 +23,7 @@ glass over them, and dragging the window knocks them about on springs.
 * **Kill switch** — from connect until disconnect nothing leaves around the tunnel, even when the
   server or the core falls over.
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
-* **Seven palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
+* **Fifteen palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
 * **Connect on launch**, optionally, to the server you selected; off until you enable it in Settings.
 * **Updates in Settings** — background checks and verified downloads, progress and cancellation,
   then restart now or install on exit. Windows asks for permission to replace the app and service.
@@ -138,19 +138,28 @@ To run the application alone, without the service — every screen works, only c
 
 `./gradlew.bat :desktop:run --args="--ui-smoke"` walks every screen in both themes and writes
 screenshots to `.local/screenshots`, against a stub service that can never connect;
-`--ui-demo` does the same with made-up servers and a stand-in service that pretends to connect.
+`--ui-demo` does the same with made-up servers and a stand-in service that pretends to connect. Add `--ui-idle` to keep it disconnected, `--ui-size=680x600` to
+check the compact layout, or `--ui-resize` to capture both layout transitions. The six pages share
+a header grid and fixed, separate navigation islands; a compact window gives half the width above
+the map to the connection control.
 
 `--ui-preview` opens an interactive demo without the screenshot tour. `--ui-benchmark` uses 600
 made-up servers and measures actual Direct3D window renders: the planet, waves, two scroll speeds,
 frozen backdrop and tray. Results go to `desktop/.local/performance/benchmark.tsv` when run via
 Gradle. These modes use isolated data and never connect the real tunnel. See
-[`docs/performance.md`](docs/performance.md) for the comparison and its limits.
+[`docs/performance.md`](docs/performance.md) for the earlier Windows comparison and
+[`docs/ui-performance-2026-11-13.md`](docs/ui-performance-2026-11-13.md) for the current layout,
+rendering changes, checks and measurement limits.
 
 Automatic updates run in packaged builds: a check after 15 seconds and every four hours. Installed
 copies download the newest numeric Windows release (including Yumi's published betas), verify its
 size and published SHA-256, and offer installation. **Update automatically** controls background
 checks/downloads and installation on exit; manual checks remain available. A development or portable
 copy offers the release page. Profiles and settings stay in their existing data directory.
+
+For appearance and resume checks, `:desktop:run --args="--ui-demo --ui-resume --ui-palettes"`
+hides and restores the window with the waves visualizer, then captures every palette in light,
+dark and AMOLED modes. See `TODO.md` for the requested work and its verification status.
 
 Every push builds the installer on GitHub Actions (`.github/workflows/installer.yml`) exactly as
 `build.ps1` does, tests included, and keeps it as a workflow artifact. Pushing a tag `v<version>`

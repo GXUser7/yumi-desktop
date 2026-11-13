@@ -9,10 +9,9 @@ import com.yumi.desktop.model.Palette
 /**
  * A [Palette] as a Material scheme, derived rather than tabulated.
  *
- * Every palette is the same set of saturations and lightnesses read at a different hue, so all of
- * them are one palette over and over. That is what keeps them consistent: tuning the accent tone
- * tunes it everywhere at once, and none of them can quietly drift into being darker or louder than
- * its neighbours because someone picked a nicer-looking hex for it.
+ * Every palette shares a tone ladder, with its own hue and chroma. New green/amber accents use
+ * a darker light-mode tone to keep white button labels readable. The seven original options
+ * retain their existing hues, chroma and lightnesses.
  *
  * They are pastel by construction. The accent sits at eighty per cent lightness and just over half
  * saturation in the dark scheme — bright enough to read as the one loud thing on a near-black
@@ -33,6 +32,8 @@ import com.yumi.desktop.model.Palette
 fun Palette.scheme(dark: Boolean): ColorScheme {
     val base = if (dark) MyDropDarkColors else MyDropLightColors
     val accent = hue ?: return base
+    fun tone(hue: Float, saturation: Float, lightness: Float) =
+        Color.hsl(hue, (saturation * chroma).coerceIn(0f, 1f), lightness)
     // Analogous rather than a second choice: the secondary is a chip container and a "connecting"
     // state, so it has to sit beside the accent without being mistaken for it. Twenty-six degrees
     // and no further — at forty the rose palette's chips came out brown, which reads as a leftover
@@ -43,44 +44,44 @@ fun Palette.scheme(dark: Boolean): ColorScheme {
 
     val accents = if (dark) {
         base.copy(
-            primary = Color.hsl(accent, 0.55f, 0.80f),
-            onPrimary = Color.hsl(accent, 0.72f, 0.13f),
-            primaryContainer = Color.hsl(accent, 0.30f, 0.25f),
-            onPrimaryContainer = Color.hsl(accent, 0.62f, 0.90f),
-            inversePrimary = Color.hsl(accent, 0.48f, 0.44f),
-            surfaceTint = Color.hsl(accent, 0.55f, 0.80f),
+            primary = tone(accent, 0.55f, 0.80f),
+            onPrimary = tone(accent, 0.72f, 0.13f),
+            primaryContainer = tone(accent, 0.30f, 0.25f),
+            onPrimaryContainer = tone(accent, 0.62f, 0.90f),
+            inversePrimary = tone(accent, 0.48f, 0.44f),
+            surfaceTint = tone(accent, 0.55f, 0.80f),
 
-            secondary = Color.hsl(second, 0.52f, 0.76f),
-            onSecondary = Color.hsl(second, 0.80f, 0.13f),
-            secondaryContainer = Color.hsl(second, 0.30f, 0.27f),
-            onSecondaryContainer = Color.hsl(second, 0.70f, 0.88f),
+            secondary = tone(second, 0.52f, 0.76f),
+            onSecondary = tone(second, 0.80f, 0.13f),
+            secondaryContainer = tone(second, 0.30f, 0.27f),
+            onSecondaryContainer = tone(second, 0.70f, 0.88f),
 
-            tertiary = Color.hsl(partner, 0.42f, 0.70f),
-            onTertiary = Color.hsl(partner, 0.85f, 0.11f),
-            tertiaryContainer = Color.hsl(partner, 0.60f, 0.17f),
-            onTertiaryContainer = Color.hsl(partner, 0.66f, 0.80f),
+            tertiary = tone(partner, 0.42f, 0.70f),
+            onTertiary = tone(partner, 0.85f, 0.11f),
+            tertiaryContainer = tone(partner, 0.60f, 0.17f),
+            onTertiaryContainer = tone(partner, 0.66f, 0.80f),
         )
     } else {
         base.copy(
-            primary = Color.hsl(accent, 0.50f, 0.38f),
+            primary = tone(accent, 0.50f, lightAccent),
             onPrimary = Color.White,
-            primaryContainer = Color.hsl(accent, 0.58f, 0.90f),
-            onPrimaryContainer = Color.hsl(accent, 0.70f, 0.15f),
-            inversePrimary = Color.hsl(accent, 0.55f, 0.80f),
-            surfaceTint = Color.hsl(accent, 0.50f, 0.38f),
+            primaryContainer = tone(accent, 0.58f, 0.90f),
+            onPrimaryContainer = tone(accent, 0.70f, 0.15f),
+            inversePrimary = tone(accent, 0.55f, 0.80f),
+            surfaceTint = tone(accent, 0.50f, 0.38f),
 
-            secondary = Color.hsl(second, 0.50f, 0.34f),
+            secondary = tone(second, 0.50f, 0.34f),
             onSecondary = Color.White,
-            secondaryContainer = Color.hsl(second, 0.60f, 0.88f),
-            onSecondaryContainer = Color.hsl(second, 0.70f, 0.12f),
+            secondaryContainer = tone(second, 0.60f, 0.88f),
+            onSecondaryContainer = tone(second, 0.70f, 0.12f),
 
-            tertiary = Color.hsl(partner, 0.55f, 0.32f),
+            tertiary = tone(partner, 0.55f, 0.32f),
             onTertiary = Color.White,
-            tertiaryContainer = Color.hsl(partner, 0.55f, 0.86f),
-            onTertiaryContainer = Color.hsl(partner, 0.80f, 0.10f),
+            tertiaryContainer = tone(partner, 0.55f, 0.86f),
+            onTertiaryContainer = tone(partner, 0.80f, 0.10f),
         )
     }
-    return accents.withNeutrals(accent, ramp)
+    return accents.withNeutrals(accent, ramp, chroma)
 }
 
 /**
@@ -91,7 +92,7 @@ fun Palette.scheme(dark: Boolean): ColorScheme {
  * be visible in the room and not only on the buttons.
  */
 private class Tone(private val saturation: Float, private val lightness: Float) {
-    fun at(hue: Float) = Color.hsl(hue, saturation, lightness)
+    fun at(hue: Float, chroma: Float) = Color.hsl(hue, (saturation * chroma).coerceIn(0f, 1f), lightness)
 }
 
 private class Ramp(
@@ -147,22 +148,22 @@ private val LightRamp = Ramp(
     onInverse = Tone(0.35f, 0.950f),
 )
 
-private fun ColorScheme.withNeutrals(hue: Float, ramp: Ramp): ColorScheme = copy(
-    background = ramp.background.at(hue),
-    onBackground = ramp.onSurface.at(hue),
-    surface = ramp.background.at(hue),
-    onSurface = ramp.onSurface.at(hue),
-    surfaceDim = ramp.background.at(hue),
-    surfaceBright = ramp.bright.at(hue),
-    surfaceVariant = ramp.variant.at(hue),
-    onSurfaceVariant = ramp.onVariant.at(hue),
-    surfaceContainerLowest = ramp.lowest.at(hue),
-    surfaceContainerLow = ramp.low.at(hue),
-    surfaceContainer = ramp.container.at(hue),
-    surfaceContainerHigh = ramp.high.at(hue),
-    surfaceContainerHighest = ramp.highest.at(hue),
-    outline = ramp.outline.at(hue),
-    outlineVariant = ramp.outlineVariant.at(hue),
-    inverseSurface = ramp.inverse.at(hue),
-    inverseOnSurface = ramp.onInverse.at(hue),
+private fun ColorScheme.withNeutrals(hue: Float, ramp: Ramp, chroma: Float): ColorScheme = copy(
+    background = ramp.background.at(hue, chroma),
+    onBackground = ramp.onSurface.at(hue, chroma),
+    surface = ramp.background.at(hue, chroma),
+    onSurface = ramp.onSurface.at(hue, chroma),
+    surfaceDim = ramp.background.at(hue, chroma),
+    surfaceBright = ramp.bright.at(hue, chroma),
+    surfaceVariant = ramp.variant.at(hue, chroma),
+    onSurfaceVariant = ramp.onVariant.at(hue, chroma),
+    surfaceContainerLowest = ramp.lowest.at(hue, chroma),
+    surfaceContainerLow = ramp.low.at(hue, chroma),
+    surfaceContainer = ramp.container.at(hue, chroma),
+    surfaceContainerHigh = ramp.high.at(hue, chroma),
+    surfaceContainerHighest = ramp.highest.at(hue, chroma),
+    outline = ramp.outline.at(hue, chroma),
+    outlineVariant = ramp.outlineVariant.at(hue, chroma),
+    inverseSurface = ramp.inverse.at(hue, chroma),
+    inverseOnSurface = ramp.onInverse.at(hue, chroma),
 )

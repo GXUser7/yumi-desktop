@@ -1,11 +1,10 @@
 package com.yumi.desktop
 
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.ImageBitmap
+import org.jetbrains.skia.Image
 import androidx.compose.ui.graphics.asComposeCanvas
 import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
@@ -46,14 +45,14 @@ internal class FrostBuffer(private val mode: FilterTileMode = FilterTileMode.CLA
         }
     }
 
-    fun record(density: Density, direction: LayoutDirection, block: DrawScope.() -> Unit): ImageBitmap {
+    fun record(density: Density, direction: LayoutDirection, block: DrawScope.() -> Unit): Image {
         val raw = checkNotNull(source)
         val output = checkNotNull(blurred)
         raw.canvas.clear(0)
         scope.draw(density, direction, raw.canvas.asComposeCanvas(), Size(dimensions.width.toFloat(), dimensions.height.toFloat()), block)
         output.canvas.clear(0)
         raw.makeImageSnapshot().use { output.canvas.drawImage(it, 0f, 0f, paint) }
-        return output.makeImageSnapshot().use { it.toComposeImageBitmap() }
+        return output.makeImageSnapshot()
     }
 
     override fun close() {
@@ -76,11 +75,11 @@ internal class SceneBuffer : AutoCloseable {
         dimensions = size
     }
 
-    fun record(density: Density, direction: LayoutDirection, block: DrawScope.() -> Unit): ImageBitmap {
+    fun record(density: Density, direction: LayoutDirection, block: DrawScope.() -> Unit): Image {
         val output = checkNotNull(surface)
         output.canvas.clear(0)
         scope.draw(density, direction, output.canvas.asComposeCanvas(), Size(dimensions.width.toFloat(), dimensions.height.toFloat()), block)
-        return output.makeImageSnapshot().use { it.toComposeImageBitmap() }
+        return output.makeImageSnapshot()
     }
 
     override fun close() { surface?.close(); surface = null }

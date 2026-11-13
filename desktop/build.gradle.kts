@@ -24,7 +24,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Msi)
             packageName = "Yumi"
-            packageVersion = "0.2.4"
+            packageVersion = "0.2.5"
             includeAllModules = true
             windows { menu = true; shortcut = true; upgradeUuid = "e8cb03d0-c852-4375-bf1b-a83f09e118b7"
                 iconFile.set(project.file("icon/yumi.ico")) }

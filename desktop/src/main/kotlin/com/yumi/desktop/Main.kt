@@ -5,10 +5,12 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.res.loadSvgPainter
 import androidx.compose.ui.res.useResource
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.*
 import com.mydrop.vpn.core.model.ThemeMode
+import com.mydrop.vpn.core.model.Visualizer
 import com.yumi.desktop.model.*
 import com.yumi.desktop.platform.*
 import kotlinx.coroutines.*
@@ -20,6 +22,7 @@ import java.io.RandomAccessFile
 import javax.imageio.ImageIO
 
 fun main(args: Array<String>) {
+    val launchedAt = System.nanoTime()
     val benchmark = "--ui-benchmark" in args
     val preview = "--ui-preview" in args
     val demo = "--ui-demo" in args || benchmark || preview
@@ -41,7 +44,7 @@ fun main(args: Array<String>) {
     application {
         var visible by remember{mutableStateOf("--tray" !in args)}
         var smokePage by remember{mutableStateOf(Page.Connect)}
-        val frameProbe = remember { if (benchmark) UiFrameProbe() else null }
+        val frameProbe = remember { if (benchmark) UiFrameProbe(launchedAt) else null }
         val scope=rememberCoroutineScope()
         val settings by model.settings.settings.collectAsState()
         val status by model.status.collectAsState()
@@ -83,7 +86,10 @@ fun main(args: Array<String>) {
                 enabled=status.state!="unavailable",onClick={model.toggleConnection()})
             Separator();Item(model.text("Выйти","Exit"),onClick=close)
         }
-        val windowState=rememberWindowState(width=1280.dp,height=880.dp)
+        val captureSize = args.firstOrNull { it.startsWith("--ui-size=") }?.substringAfter('=')?.split('x')
+        val captureWidth = captureSize?.getOrNull(0)?.toIntOrNull()?.coerceIn(680, 2560) ?: 1280
+        val captureHeight = captureSize?.getOrNull(1)?.toIntOrNull()?.coerceIn(600, 1600) ?: 880
+        val windowState=rememberWindowState(width=captureWidth.dp,height=captureHeight.dp)
         Window(onCloseRequest={if(traySupported&&!smoke)visible=false else close()},visible=visible,title="Yumi Desktop",state=windowState,icon=icon) {
             LaunchedEffect(Unit){window.minimumSize=Dimension(680,600);if(smoke){window.isAlwaysOnTop=true;window.toFront()}}
             // The title bar is drawn by Windows, not by us, so the only way it stops being the one
@@ -128,13 +134,49 @@ fun main(args: Array<String>) {
             if(smoke && !benchmark && !preview) LaunchedEffect(Unit) {
                 val output=File(".local/screenshots").also(File::mkdirs)
                 val prefix=if(demo) "demo" else "smoke"
-                if(demo){delay(1500);model.toggleConnection();delay(3500)}
+                fun capture(name: String) {
+                    val rectangle=Rectangle(window.contentPane.locationOnScreen,window.contentPane.size)
+                    ImageIO.write(Robot().createScreenCapture(rectangle),"png",File(output,"$name.png"))
+                }
+                if(demo && "--ui-idle" !in args){delay(1500);model.toggleConnection();delay(3500)}
+                if ("--ui-resume" in args) {
+                    model.settings.update { it.copy(visualizer = Visualizer.Waves, themeMode = ThemeMode.Dark) }
+                    delay(1500)
+                    capture("waves-before-hide")
+                    visible = false
+                    delay(5000)
+                    visible = true
+                    delay(100)
+                    capture("waves-after-resume")
+                    delay(500)
+                    capture("waves-resumed-moving")
+                }
+                if ("--ui-palettes" in args) {
+                    model.settings.update { it.copy(visualizer = Visualizer.Waves) }
+                    for ((mode, amoled) in listOf(ThemeMode.Dark to false, ThemeMode.Dark to true, ThemeMode.Light to false)) {
+                        model.settings.update { it.copy(themeMode = mode, amoled = amoled) }
+                        for (palette in Palette.entries) {
+                            model.desktop.update { it.copy(palette = palette) }
+                            delay(400)
+                            capture("palette-${mode.name}-${if (amoled) "AMOLED" else "standard"}-${palette.name}")
+                        }
+                    }
+                }
+                if ("--ui-resume" in args || "--ui-palettes" in args) { close(); return@LaunchedEffect }
+                if ("--ui-resize" in args) {
+                    for ((width, height, name) in listOf(Triple(680, 600, "compact"), Triple(1280, 880, "wide"))) {
+                        windowState.size = DpSize(width.dp, height.dp)
+                        delay(90)
+                        capture("resize-$name-transition")
+                        delay(350)
+                        capture("resize-$name-settled")
+                    }
+                }
                 for(theme in listOf(ThemeMode.Dark,ThemeMode.Light)) {
                     model.settings.update{it.copy(themeMode=theme)}
                     for(page in Page.entries){
                         smokePage=page;delay(2000)
-                        val rectangle=Rectangle(window.contentPane.locationOnScreen,window.contentPane.size)
-                        ImageIO.write(Robot().createScreenCapture(rectangle),"png",File(output,"$prefix-${theme.name}-${page.name}.png"))
+                        capture("$prefix-${theme.name}-${page.name}")
                     }
                 }
                 close()

@@ -14,6 +14,8 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
+import org.jetbrains.skia.Image
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
@@ -75,6 +77,8 @@ class BackdropState {
     internal val frost get() = scene?.frost
     /** How many times smaller [frost] is recorded than the window. */
     internal var shrink = 8f
+    /** The current window, including the interval before a resized scene is ready. */
+    internal var viewport by mutableStateOf(IntSize.Zero)
     /** Published frame count, used by the rendering regression test. */
     internal var frame by mutableLongStateOf(0L)
     private var generation = 0L
@@ -194,7 +198,8 @@ fun Modifier.glass(shape: Shape, tint: Color): Modifier = composed {
             if (backdrop != null && frost != null) {
                 val at = origin.value
                 translate(-at.x, -at.y) {
-                    scale(backdrop.shrink, backdrop.shrink, pivot = Offset.Zero) { drawImage(frost) }
+                    scale(backdrop.viewport.width.toFloat() / frost.width, backdrop.viewport.height.toFloat() / frost.height,
+                        pivot = Offset.Zero) { drawSceneImage(frost) }
                 }
             }
             drawRect(tint)
@@ -327,7 +332,7 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
         }
     }
 
-    Box(Modifier.fillMaxSize().onSizeChanged { dimensions = it }.pointerInput(running) {
+    Box(Modifier.fillMaxSize().onSizeChanged { dimensions = it; state.viewport = it }.pointerInput(running) {
         if (!running) return@pointerInput
         awaitPointerEventScope {
             while (true) {
@@ -341,7 +346,7 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
         Box(Modifier.matchParentSize().graphicsLayer().drawBehind {
             val scene = state.scene
             if (scene == null) drawRect(palette.ground)
-            else scale(2f, 2f, pivot = Offset.Zero) { drawImage(scene.image) }
+            else scale(size.width / scene.image.width, size.height / scene.image.height, pivot = Offset.Zero) { drawSceneImage(scene.image) }
         })
         CompositionLocalProvider(LocalBackdrop provides state, content = content)
     }
@@ -350,8 +355,8 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
 /** CPU raster work runs away from the UI thread; a new frame is published only when complete. */
 internal val LocalBackdropDispatcher = staticCompositionLocalOf<CoroutineDispatcher> { Dispatchers.Default }
 
-internal class SceneFrame(val image: ImageBitmap, val frost: ImageBitmap) : AutoCloseable {
-    override fun close() { image.asSkiaBitmap().close(); frost.asSkiaBitmap().close() }
+internal class SceneFrame(val image: Image, val frost: Image) : AutoCloseable {
+    override fun close() { image.close(); frost.close() }
 }
 
 private class SceneRenderer(dimensions: IntSize, private val density: Density) : AutoCloseable {
@@ -381,16 +386,16 @@ private class SceneRenderer(dimensions: IntSize, private val density: Density) :
         try {
             val image = scene.record(density, LayoutDirection.Ltr) {
                 drawRect(palette.ground)
-                scale(2f, 2f, Offset.Zero) { drawImage(farImage) }
-                drawImage(nearImage)
+                scale(2f, 2f, Offset.Zero) { drawSceneImage(farImage) }
+                drawSceneImage(nearImage)
             }
             try {
                 val frosted = frost.record(density, LayoutDirection.Ltr) {
-                    scale(2f / shrink, 2f / shrink, Offset.Zero) { drawImage(image) }
+                    scale(2f / shrink, 2f / shrink, Offset.Zero) { drawSceneImage(image) }
                 }
                 return SceneFrame(image, frosted)
-            } catch (error: Throwable) { image.asSkiaBitmap().close(); throw error }
-        } finally { farImage.asSkiaBitmap().close(); nearImage.asSkiaBitmap().close() }
+            } catch (error: Throwable) { image.close(); throw error }
+        } finally { farImage.close(); nearImage.close() }
     }
     override fun close() { far.close(); near.close(); scene.close(); frost.close() }
 }
@@ -487,4 +492,14 @@ private fun rotated(v: Offset, degrees: Float): Offset {
     val c = kotlin.math.cos(r).toFloat()
     val s = kotlin.math.sin(r).toFloat()
     return Offset(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+/** Keep immutable Skia snapshots: converting each frame to ImageBitmap reads/copies every pixel. */
+private fun DrawScope.drawSceneImage(image: Image) {
+    drawIntoCanvas {
+        val width = image.width.toFloat()
+        val height = image.height.toFloat()
+        it.skiaCanvas.drawImageRect(image, 0f, 0f, width, height, 0f, 0f, width, height,
+            org.jetbrains.skia.SamplingMode.LINEAR, null, true)
+    }
 }

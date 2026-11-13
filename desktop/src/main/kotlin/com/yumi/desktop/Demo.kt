@@ -23,6 +23,14 @@ import java.io.File
  */
 
 class DemoBackend : TunnelBackend {
+    /** Demo probes remain local too, including the automatic probe after connecting. */
+    suspend fun measureLatency(node: ProxyNode, @Suppress("UNUSED_PARAMETER") mode: PingMode): LatencyResult {
+        kotlinx.coroutines.delay(120)
+        val values = listOf(38, 46, 61, 97, 142, 214)
+        val index = node.server.substringAfterLast('.').toIntOrNull()?.minus(11) ?: 0
+        return LatencyResult(node.id, values[Math.floorMod(index, values.size)], System.currentTimeMillis())
+    }
+
     private var state = "disconnected"
     private var nodeId: String? = null
     private var connectedAt = 0L

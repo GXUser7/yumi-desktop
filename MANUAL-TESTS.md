@@ -107,7 +107,7 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 
 ## Appearance
 
-- [ ] Each of the seven palettes repaints the whole window — background, cards, rail — not just the
+- [ ] Each of the fifteen palettes repaints the whole window — background, cards, rail — not just the
       accent.
 - [ ] Light and dark, and system-follows-Windows.
 - [ ] The title bar follows the theme, in both directions, without restarting the app.
@@ -127,6 +127,40 @@ both, and testing on a Public one is worth doing because that is what a laptop g
       Only nearby cards should be composed; names, flags, latency and selection remain correct.
 - [ ] Minimize and restore, then hide in the tray and reopen: continuous animation sleeps and resumes
       without a jump. With the live backdrop off, pointer motion leaves the scene still.
+
+## Shared grid, resizing and ping
+
+- [ ] Switch through all six pages: the separate logo, navigation pill and status circle stay in
+      place. In a wide window the logo aligns with the top of the header island, navigation starts
+      at the map/content row and the status circle ends at the bottom of the working area.
+- [ ] At 680×600, the left half above the full-width map contains the heading and server picker;
+      the right half is the connection button. Both end controls match in size and stay clear of
+      navigation. Resize in both directions: no centred page drift, empty bands or doubled map.
+- [ ] Server search uses the same white glass in the light theme and matches the ping button's
+      height. Long names wrap to two lines; protocol/source and latency remain readable.
+- [ ] Start a large ping sweep, then press Restart before it finishes. New probes start, old sockets
+      close and old unfinished batches do not overwrite the new readings. Repeat while refreshing
+      a subscription: ping stays available and subscription progress stays correct.
+- [ ] Connect to a chosen server, including with Connect on launch: its latency updates without
+      waiting for a manual sweep. Switching the connected server probes the new one; ordinary
+      status polls do not keep probing it. Disconnect during a slow probe: commands remain usable.
+- [ ] Check the moving pixel map at 100%, 125%, 150% and 200% Windows scaling. After zoom settles,
+      grid gaps keep the same thickness rather than crawling. The idle map still fills its figure
+      from top to bottom. Test both themes and resize while it moves.
+- [ ] Run the UI benchmark on the target Windows GPU and a 120 Hz display; compare active-scenario
+      FPS and p95/p99. A static screen, tray or software-rendered cloud run is not a 120 FPS result.
+
+## Wave resume and extended palettes
+
+- [ ] Use the waves visualizer while connected, hide to tray for at least ten minutes, then reopen:
+      the wave continues without a burst or an accelerated replay. Repeat after minimizing and
+      after putting the display to sleep. Check the first visible frames, not just the settled wave.
+- [ ] After a long session, start/stop a large transfer: amplitude/speed change smoothly; phase
+      must not jump as if all previous time had been recalculated at the new traffic speed.
+- [ ] All 15 named swatches fit the compact settings page by wrapping. Choose Cobalt, Forest,
+      Lime, Amber, Orchid, Graphite and Coffee; reopen the app and confirm the selection persists.
+- [ ] Check the new palettes in light, dark and AMOLED modes, including text, buttons, charts and
+      glass panels. Graphite containers stay neutral in AMOLED rather than turning blue.
 
 ## Application updates
 

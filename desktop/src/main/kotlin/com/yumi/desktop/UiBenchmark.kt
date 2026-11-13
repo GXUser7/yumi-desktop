@@ -7,7 +7,7 @@ import java.io.File
 import java.lang.management.ManagementFactory
 import com.sun.management.OperatingSystemMXBean
 import androidx.compose.foundation.gestures.animateScrollBy
-import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -23,11 +23,16 @@ import kotlinx.coroutines.launch
 val LocalUiFrameProbe = staticCompositionLocalOf<UiFrameProbe?> { null }
 
 /** Enabled only by --ui-benchmark. Measures actual window draws, without requesting extra frames. */
-class UiFrameProbe {
+class UiFrameProbe(private val launchedAt: Long = System.nanoTime()) {
+    private var firstFrame = true
     private val frames = ArrayList<Long>()
     private var recording = false
-    var grid: LazyGridState? = null
-    @Synchronized fun draw() { if (recording) frames.add(System.nanoTime()) }
+    var servers: LazyListState? = null
+    @Synchronized fun draw() {
+        val now = System.nanoTime()
+        if (firstFrame) { firstFrame = false; println("UI_BENCHMARK startup_ms=${(now - launchedAt) / 1e6}") }
+        if (recording) frames.add(now)
+    }
     @Synchronized fun start() { frames.clear(); recording = true }
     @Synchronized fun stop(): List<Long> { recording = false; return frames.toList() }
 
@@ -61,14 +66,14 @@ suspend fun benchmarkUi(model: DesktopModel, probe: UiFrameProbe, page: (Page) -
         model.settings.update { it.copy(visualizer = figure) }
         model.desktop.update { it.copy(liveBackdrop = live) }
         delay(2500)
-        if (scroll > 0f) { checkNotNull(probe.grid).scrollToItem(0); delay(1000) }
+        if (scroll > 0f) { checkNotNull(probe.servers).scrollToItem(0); delay(1000) }
         if (hidden) { visible(false); delay(1000) }
         val startCpu = cpu.processCpuTime
         val start = System.nanoTime()
         probe.start()
         coroutineScope {
             val scrolling = if (scroll > 0f) launch {
-                checkNotNull(probe.grid).animateScrollBy(scroll, tween(5000, easing = LinearEasing))
+                checkNotNull(probe.servers).animateScrollBy(scroll, tween(5000, easing = LinearEasing))
             } else null
             delay(5000)
             scrolling?.cancel()

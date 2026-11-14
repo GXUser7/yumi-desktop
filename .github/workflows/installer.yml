@@ -6,7 +6,7 @@ name: installer
 # a tag publishes it.
 #
 # A pushed tag v<version> — or a manual run given one in `release`, which creates the tag on the
-# commit it built — publishes a pre-release with the installer and its checksum attached,
+# commit it built — publishes a stable release for numeric tags, with the installer and its checksum attached,
 # described by docs/releases/v<version>.md with the SHA-256 appended. Without that file the release
 # stays a draft: nothing goes out under the project's name with notes nobody wrote.
 
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'Publish this build as the given tag, e.g. v0.2.0 (empty: build only)'
+        description: 'Publish this build as the given tag, e.g. v0.2.6 (empty: build only)'
         required: false
         default: ''
 
@@ -107,9 +107,13 @@ jobs:
           printf '\n### Проверка файла\n\n```\nSHA-256  %s\n```\n' "$checksum" >> release-notes.md
           # --target names the commit that was built; it creates the tag when a manual run
           # asked for one, and agrees with it when the run came from the tag itself.
+          release_flags=(--prerelease)
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            release_flags=(--prerelease=false --latest)
+          fi
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            $draft --prerelease \
-            --title "Yumi Desktop $version — бета" \
+            $draft "${release_flags[@]}" \
+            --title "Yumi Desktop $version" \
             --notes-file release-notes.md

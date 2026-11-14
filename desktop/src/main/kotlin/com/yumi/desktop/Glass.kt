@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.graphics.shapes.Morph
 import androidx.graphics.shapes.RoundedPolygon
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.LayoutDirection
 import kotlin.math.ceil
@@ -279,13 +280,16 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
     val lighting = remember { arrayOf(Offset(-0.55f, -0.75f)) }
     var dimensions by remember { mutableStateOf(IntSize.Zero) }
     val dispatcher = LocalBackdropDispatcher.current
+    val currentPalette by rememberUpdatedState(palette)
+    val currentRunning by rememberUpdatedState(running)
+    val currentActive by rememberUpdatedState(active)
+    val currentFocused by rememberUpdatedState(focused)
 
     DisposableEffect(state) {
         onDispose { state.scene?.close(); state.scene = null }
     }
-    LaunchedEffect(dimensions, palette, density, running, focused, active) {
+    LaunchedEffect(dimensions, density) {
         if (dimensions.width <= 0 || dimensions.height <= 0) return@LaunchedEffect
-        if (!active && state.scene != null) return@LaunchedEffect
         var ownedRenderer: SceneRenderer? = null
         var pending: SceneFrame? = null
         try {
@@ -296,13 +300,18 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
             var lastY = window.y
             var wasKnown = window.known
             while (isActive) {
+                if (!currentActive && state.scene != null) {
+                    snapshotFlow { currentActive }.first { it }
+                    last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
+                }
+                val animateFrame = currentRunning
                 val started = withInfiniteAnimationFrameNanos { now ->
-                    val dt = if (last == 0L || !running) 0f else ((now - last) / 1e9f).coerceIn(0f, 0.1f)
+                    val dt = if (last == 0L || !animateFrame) 0f else ((now - last) / 1e9f).coerceIn(0f, 0.1f)
                     last = now
                     timeline[0] += dt
                     val x = window.x
                     val y = window.y
-                    val moved = running && window.known && wasKnown
+                    val moved = animateFrame && window.known && wasKnown
                     motion.step(dt, if (moved) (x - lastX) * density.density else 0f,
                         if (moved) (y - lastY) * density.density else 0f, shapes, min(dimensions.width, dimensions.height) * 0.3f)
                     lastX = x; lastY = y; wasKnown = window.known
@@ -314,16 +323,22 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                 val light = lighting[0].normalised()
                 val pointer = state.pointer
                 val pose = motion.pose()
-                withContext(dispatcher) { pending = renderer.render(palette, time, light, pointer, pose) }
+                val renderedPalette = currentPalette
+                withContext(dispatcher) { pending = renderer.render(renderedPalette, time, light, pointer, pose) }
                 val previous = state.scene
                 state.scene = checkNotNull(pending)
                 pending = null
                 state.shrink = renderer.shrink
                 state.recorded()
                 previous?.close()
-                if (!running) awaitCancellation()
+                if (!currentRunning) {
+                    snapshotFlow { Triple(currentActive, currentRunning, currentPalette) }
+                        .first { (shown, moving, colors) -> shown && (moving || colors != renderedPalette) }
+                    last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
+                    continue
+                }
                 val lightMoving = (Offset(-0.55f + pointer.x * 0.35f, -0.75f + pointer.y * 0.3f) - lighting[0]).getDistance() > 0.005f
-                val interval = when { motion.active || lightMoving -> 0L; focused -> 33_333_333L; else -> 100_000_000L }
+                val interval = when { motion.active || lightMoving -> 0L; currentFocused -> 33_333_333L; else -> 100_000_000L }
                 val remaining = (started + interval - System.nanoTime()) / 1_000_000L
                 if (remaining > 0) delay(remaining)
             }
@@ -367,7 +382,7 @@ private class SceneRenderer(dimensions: IntSize, private val density: Density) :
     private val far = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
     private val near = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
     private val scene = SceneBuffer()
-    private val frost = FrostBuffer()
+    private val frost = FrostBuffer(retainedFrames = 2)
     val shrink = shrinkFor(FrostBlur.value * density.density)
     init {
         far.prepare(scaled(full, 4f), 8f * density.density / 4f)

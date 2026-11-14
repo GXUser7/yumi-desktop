@@ -15,11 +15,14 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
 
+enum class ConnectionHealth { Unchecked, Checking, Reachable, Unreachable }
+
 class DesktopModel(
     val backend: TunnelBackend = WindowsTunnelBackend(),
     val directory: File = DesktopPlatform.dataDirectory(),
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val measureLatency: suspend (ProxyNode, PingMode) -> LatencyResult = if (backend is DemoBackend) backend::measureLatency else LatencyTester()::measure,
+    private val checkTunnel: suspend (ProbeEndpoint) -> Boolean = TunnelHealthProbe()::reachable,
 ) {
     val message = MutableStateFlow<String?>(null)
     val settings = SettingsRepository(directory, scope)
@@ -33,9 +36,15 @@ class DesktopModel(
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)
     val status = MutableStateFlow(ServiceStatus(state = "unavailable"))
+    /** A running core is not proof that its server can carry traffic. Never changes the selected server. */
+    val connectionHealth = MutableStateFlow(ConnectionHealth.Unchecked)
+    val switching = MutableStateFlow(false)
     /** The physical adapters the service can send traffic out of, for the settings screen. */
     val adapters = MutableStateFlow<List<NetworkAdapter>>(emptyList())
     val traffic = MutableStateFlow(TrafficStats.Zero)
+    /** Session history belongs to the connection, including while choosing a server or in the tray. */
+    val trafficHistory = MutableStateFlow<List<TrafficStats>>(emptyList())
+    private var trafficEpoch: Long? = null
     val busy = MutableStateFlow(false)
     val pinging = MutableStateFlow(false)
     val speed = MutableStateFlow(SpeedTestState())
@@ -51,6 +60,7 @@ class DesktopModel(
     private val subscriptions = Mutex()
     private val pingRequests = MutableStateFlow(0L)
     private var connectionProbe: Job? = null
+    private var tunnelMonitor: Job? = null
     private var speedJob: Job? = null
     private var startupConnectPending = desktop.value.connectOnLaunch
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
@@ -82,6 +92,7 @@ class DesktopModel(
                     updateStatus(backend.request(ServiceRequest(command = "status")))
                     connectOnStartup()
                 }
+                sampleTraffic()
                 afterStatus()
                 delay(1000)
             }
@@ -176,16 +187,55 @@ class DesktopModel(
             if (next.connectedAt == old.connectedAt) (next.download - old.download).coerceAtLeast(0) else 0)
         status.value = next
         if (next.state == "connected" && next.nodeId != null &&
-            (old.state != "connected" || old.nodeId != next.nodeId || old.connectedAt != next.connectedAt)) {
+            (old.state != "connected" || old.nodeId != next.nodeId || old.connectedAt != next.connectedAt || old.probe() != next.probe())) {
             connectionProbe?.cancel()
+            tunnelMonitor?.cancel()
+            connectionHealth.value = ConnectionHealth.Checking
             val node = profiles.allNodes.firstOrNull { it.id == next.nodeId }
             if (node != null) connectionProbe = scope.launch {
-                val result = measureLatency(node, settings.value.pingMode)
+                val result = try { measureLatency(node, settings.value.pingMode) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { LatencyResult(node.id, 0, System.currentTimeMillis(), failed = true) }
                 ensureActive()
                 if (profiles.allNodes.any { it.id == result.nodeId }) profiles.recordLatency(result)
+                // Demo/older backends have no loopback probe. Production monitors actual
+                // traffic below; keep the endpoint latency measurement once per connection.
+                if (next.probe() == null) publishHealth(next, !result.failed)
+            }
+            next.probe()?.let { probe ->
+                tunnelMonitor = scope.launch {
+                    while (isActive) {
+                        val reachable = try { checkTunnel(probe) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { false }
+                        ensureActive()
+                        publishHealth(next, reachable)
+                        delay(CONNECTION_CHECK_MILLIS)
+                    }
+                }
             }
         } else if (next.state != "connected") {
             connectionProbe?.cancel()
+            tunnelMonitor?.cancel()
+            connectionHealth.value = ConnectionHealth.Unchecked
+        }
+    }
+    private fun sampleTraffic() {
+        val current = status.value
+        if (current.state == "connected") {
+            if (trafficEpoch != current.connectedAt) trafficHistory.value = emptyList()
+            trafficEpoch = current.connectedAt
+            trafficHistory.update { (it + traffic.value).takeLast(48) }
+        } else if (current.state != "connecting") {
+            trafficEpoch = null
+            trafficHistory.value = emptyList()
+        }
+    }
+    private suspend fun publishHealth(connection: ServiceStatus, reachable: Boolean) = commands.withLock {
+        val current = status.value
+        if (current.state == "connected" && current.nodeId == connection.nodeId &&
+            current.connectedAt == connection.connectedAt && current.probe() == connection.probe()) {
+            connectionHealth.value = if (reachable) ConnectionHealth.Reachable else ConnectionHealth.Unreachable
         }
     }
     fun toggleConnection() = action {
@@ -202,9 +252,15 @@ class DesktopModel(
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
         // Preserve geo/service metadata while the connect command is in flight. Dropping it
         // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
-        updateStatus(status.value.copy(state = "connecting", nodeId = node.id, error = null, detail = null))
-        val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
-        updateStatus(backend.request(request))
+        val hotSwap = status.value.state == "connected"
+        if (hotSwap) {
+            switching.value = true
+            connectionHealth.value = ConnectionHealth.Checking
+        } else updateStatus(status.value.copy(state = "connecting", nodeId = node.id, error = null, detail = null))
+        try {
+            val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
+            updateStatus(backend.request(request))
+        } finally { switching.value = false }
     }
     fun selectNode(id: String) = action {
         commands.withLock {
@@ -388,6 +444,7 @@ class DesktopModel(
     }
 
     private companion object {
+        const val CONNECTION_CHECK_MILLIS = 15_000L
         /** How stale a list has to be for opening the window to be a reason to refresh it. */
         const val STARTUP_FLOOR_MILLIS = 2 * 60_000L
     }

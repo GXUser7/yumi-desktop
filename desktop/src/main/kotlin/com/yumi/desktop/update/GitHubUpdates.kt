@@ -111,7 +111,7 @@ class GitHubUpdates(private val directory: File, private val transport: UpdateTr
         const val RELEASES = "https://github.com/GXUser7/yumi-desktop/releases"
         private const val MAX_INSTALLER_SIZE = 1_500_000_000L
 
-        /** Yumi currently publishes numeric beta tags; drafts and unrelated assets never qualify. */
+        /** Accept numeric stable releases and legacy beta tags; drafts and unrelated assets never qualify. */
         fun parseReleases(body: String): DesktopRelease? {
             val candidates = Json.parseToJsonElement(body).jsonArray.mapNotNull { item ->
                 val release = item.jsonObject

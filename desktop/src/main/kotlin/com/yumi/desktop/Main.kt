@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.*
 import com.mydrop.vpn.core.model.ThemeMode
 import com.mydrop.vpn.core.model.Visualizer
+import com.mydrop.vpn.data.Strings
 import com.yumi.desktop.model.*
 import com.yumi.desktop.platform.*
 import kotlinx.coroutines.*
@@ -80,18 +81,33 @@ fun main(args: Array<String>) {
         // through the .ico beside it in the build script — the icon on the executable itself.
         val icon=remember(::yumiMark)
         val traySupported = java.awt.SystemTray.isSupported()
-        if(traySupported && !smoke) Tray(icon=icon,tooltip="Yumi",onAction={visible=true}) {
-            Item(model.text("Открыть Yumi","Open Yumi"),onClick={visible=true})
-            Item(if(status.state in listOf("connected","connecting"))model.text("Отключить","Disconnect") else model.text("Подключиться","Connect"),
-                enabled=status.state!="unavailable",onClick={model.toggleConnection()})
-            Separator();Item(model.text("Выйти","Exit"),onClick=close)
-        }
         val captureSize = args.firstOrNull { it.startsWith("--ui-size=") }?.substringAfter('=')?.split('x')
         val captureWidth = captureSize?.getOrNull(0)?.toIntOrNull()?.coerceIn(680, 2560) ?: 1280
         val captureHeight = captureSize?.getOrNull(1)?.toIntOrNull()?.coerceIn(600, 1600) ?: 880
         val windowState=rememberWindowState(width=captureWidth.dp,height=captureHeight.dp)
+        var activation by remember { mutableIntStateOf(0) }
+        val open = {
+            visible = true
+            windowState.isMinimized = false
+            activation++
+            Unit
+        }
+        if(traySupported && !smoke) YumiTray(icon=icon,onOpen=open) {
+            val profiles by model.profiles.state.collectAsState()
+            val pinging by model.pinging.collectAsState()
+            val switching by model.switching.collectAsState()
+            val language = settings.language
+            val strings = remember(language) { Strings { language } }
+            Item(strings.text("Открыть Yumi","Open Yumi"),onClick=open)
+            Item(if(status.state in listOf("connected","connecting"))strings.text("Отключить","Disconnect") else strings.text("Подключиться","Connect"),
+                enabled=status.state!="unavailable",onClick={model.toggleConnection()})
+            Separator()
+            TrayServers(profiles, strings, pinging, switching || status.state == "connecting", { model.selectNode(it) }, model::ping)
+            Separator();Item(strings.text("Выйти","Exit"),onClick=close)
+        }
         Window(onCloseRequest={if(traySupported&&!smoke)visible=false else close()},visible=visible,title="Yumi Desktop",state=windowState,icon=icon) {
             LaunchedEffect(Unit){window.minimumSize=Dimension(680,600);if(smoke){window.isAlwaysOnTop=true;window.toFront()}}
+            LaunchedEffect(activation) { if (activation > 0) restoreApplicationWindow(window) }
             // The title bar is drawn by Windows, not by us, so the only way it stops being the one
             // undesigned strip of the window is to hand DWM the colours the app is using. Keyed on
             // the palette and the theme, so it follows both.
@@ -125,7 +141,7 @@ fun main(args: Array<String>) {
             }
             LaunchedEffect(Unit) {
                 val activation=File(directory,"activate");var stamp=activation.lastModified()
-                while(isActive){delay(500);val next=activation.lastModified();if(next!=stamp){stamp=next;visible=true;window.toFront();window.requestFocus()}}
+                while(isActive){delay(500);val next=activation.lastModified();if(next!=stamp){stamp=next;open()}}
             }
             if(benchmark) LaunchedEffect(Unit) {
                 benchmarkUi(model, checkNotNull(frameProbe), { smokePage = it }, { visible = it })

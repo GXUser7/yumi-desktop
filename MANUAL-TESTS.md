@@ -22,6 +22,9 @@ interesting half of it.
 - [ ] The application opens with no servers and says so, offering the phone transfer.
 - [ ] The connect button is inert while there is no server. It must not be pressable.
 - [ ] Close the window with the ✕. It goes to the tray and keeps running; the tray icon reopens it.
+- [ ] One left click on the tray icon restores and focuses Yumi, including when minimized or
+      maximized before hiding. Right click → Servers shows the selected server and measured ping;
+      measure again, switch a server without opening the window, and check both interface languages.
 - [ ] Exit from the tray menu. The window and the process both go.
 - [ ] Settings → Behavior → Connect VPN on launch is off on an existing installation unless enabled.
       Enable it with a selected server, exit and reopen: one connection to that server. With the
@@ -52,14 +55,30 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 
 - [ ] Connect. The headline turns accented, the timer runs, the figure fills, and the rates under
       it move.
+- [ ] A running core whose server refuses traffic must show “Сервер недоступен”, not “Защищено”.
+      Stop a previously working remote server: within the periodic check plus its timeout the
+      headline and shield show failure. Restore it: protection returns without switching servers.
+      Switch tabs or hide Yumi while changing servers: session traffic history must continue.
 - [ ] `ipconfig` shows the Wintun adapter; a browser reports the server's country.
 - [ ] Check for leaks: the address on <https://browserleaks.com/ip> matches the exit country, and
       the DNS shown there is the resolver from settings — not your provider's.
-- [ ] Disconnect. The adapter goes, and normal traffic resumes without a reconnect of anything else.
+- [ ] Disconnect. VPN is off and new connections go direct. The Yumi adapter stays available as
+      a direct forwarding stack, so existing excluded-app sockets do not have to reconnect.
+      Stop the YumiTunnel service: its worker exits and Yumi's routes, DNS and addresses are removed.
 - [ ] Connect, then kill `yumi-service.exe` from Task Manager. The application must notice and say
       the service is unavailable, not sit on a stale "connected".
-- [ ] Switch servers while connected: the tunnel moves without an intermediate disconnected state
-      visible to the browser.
+- [ ] Switch servers while connected: no intermediate disconnected state, reset of the session
+      timer, traffic totals or rate graph. New connections use the selected server; established
+      connections keep their previous server until they finish. An unavailable old server cannot
+      preserve its existing remote sessions. Changing MTU, IPv6, routing/DNS or physical-adapter
+      options still rebuilds the forwarding stack and may reconnect applications.
+- [ ] Exclude Fortnite and run a match plus continuous direct TCP and UDP echo traffic. Switch
+      servers repeatedly, then turn VPN off/on: excluded flows must keep their original socket,
+      physical source address/port and traffic continuity. Repeat with kill switch on and off.
+      Explicit VPN-off must stop VPN flows, lower the kill switch and leave direct flows running.
+      Check a connection opened while VPN is off also survives turning it back on without being
+      counted in VPN totals. This requires Windows/Wintun and a real match; Linux core tests do
+      not validate the Windows routing/filtering behavior.
 - [ ] Reboot with the tunnel connected. Nothing should be tunnelling after the reboot until you
       press connect.
 

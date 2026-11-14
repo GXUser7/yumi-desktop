@@ -1,8 +1,7 @@
 # Yumi Desktop
 
-> **Beta.** It works, it is used daily, and it has not been through many hands yet. The tunnel
-> service runs with system privileges, so read what it does below before you install it, and
-> expect the rough edges of something young.
+> The tunnel service runs with system privileges; its responsibilities and access controls
+> are described below.
 
 The Windows port of Yumi — a VPN client for Xray-family servers — dressed in the matte glass of
 its sister app YouCloud: Material 3 Expressive shapes drift behind the window, every panel is frosted
@@ -13,6 +12,11 @@ glass over them, and dragging the window knocks them about on springs.
   control beside it.
 * **Servers** — a readable list with protocol/transport details, source, selection and latency
   aligned in each row. Ping can be restarted at any time; connecting probes that server automatically. The server never changes by itself.
+* **Tray** — one click restores the window; the menu switches servers, shows their ping and
+  refreshes latency without opening the app.
+* **Connection health** — protection is shown after the tunnel carries a verified request.
+  An unreachable server is reported even when the local core is still running; checks continue
+  until it recovers.
 * **Subscriptions** — quota, expiry and refresh, or a QR transfer from Yumi on your phone over the
   local network.
 * **Split tunnelling** — pick applications from what is running and installed, with their icons, or
@@ -88,6 +92,14 @@ to the local subnet. Private-only is the safer setting on paper and it made subs
 not exist on laptops: Windows marks a new Wi-Fi network public by default, so the rule never
 applied and the phone's connection was dropped without a word. The domain profile is deliberately
 left out.
+
+Switching servers keeps the forwarding stack alive: new connections use the selected server,
+while established connections finish on their original one. The session timer and traffic totals
+continue across the switch. Turning VPN off cancels VPN connections and sends new traffic directly;
+the adapter stays up as a direct forwarding stack so excluded applications keep their existing
+sockets. Stopping the Windows service removes the adapter's routes and closes that stack.
+Changing routing, DNS, MTU, IPv6 or the physical adapter still requires rebuilding it. A connection
+whose remote server has died cannot be transferred to another server without reconnecting.
 
 ### Kill switch
 

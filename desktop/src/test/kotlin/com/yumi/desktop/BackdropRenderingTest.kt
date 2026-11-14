@@ -105,4 +105,38 @@ class BackdropRenderingTest {
             scene.close()
         }
     }
+    @Test fun frozenSceneRespondsToPaletteEditsAndRestoresWithoutAnimatingWhileHidden() {
+        val palette = mutableStateOf(Palette.Glacier)
+        val shown = mutableStateOf(true)
+        var backdrop: BackdropState? = null
+        val scene = ImageComposeScene(width = 600, height = 400) {
+            CompositionLocalProvider(LocalBackdropDispatcher provides Dispatchers.Unconfined, LocalAnimationsActive provides shown.value) {
+                YumiTheme(AppSettings(themeMode = ThemeMode.Dark), palette.value) {
+                    ExpressiveBackdrop(animated = false) { backdrop = LocalBackdrop.current }
+                }
+            }
+        }
+        try {
+            var time = 0L
+            fun frames() { repeat(8) { Snapshot.sendApplyNotifications(); scene.render(time).close(); time += 16_666_667L } }
+            frames()
+            val state = checkNotNull(backdrop)
+            val first = state.frame
+            palette.value = Palette.Indigo
+            frames()
+            assertTrue(state.frame > first, "A frozen scene must repaint after a palette edit")
+            shown.value = false
+            frames()
+            val hidden = state.frame
+            palette.value = Palette.Glacier
+            frames()
+            assertEquals(hidden, state.frame, "Palette changes must not wake the hidden renderer")
+            shown.value = true
+            frames()
+            assertTrue(state.frame > hidden, "Restoring the window must apply its pending palette")
+            val restored = state.frame
+            frames()
+            assertEquals(restored, state.frame, "A restored frozen backdrop must settle again")
+        } finally { scene.close() }
+    }
 }

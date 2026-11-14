@@ -15,6 +15,7 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "reflect"
     "sync"
     "sync/atomic"
     "syscall"
@@ -38,6 +39,12 @@ type supervisor struct {
     stdin io.WriteCloser
     done chan struct{}
     generation uint64
+    options *Options
+    geoEnabled bool
+    outboundName string
+    // The live worker's adapter outlives a firewall session while VPN is switched off.
+    // Guarded by mu; unlike shieldLUID it is cleared only with the worker.
+    adapterLUID uint64
 
     // The kill switch. Its own lock, taken before mu whenever both are needed and never while mu
     // is held, because installing filters is a round trip to the filtering engine and the status
@@ -69,6 +76,18 @@ func (s *supervisor) snapshot() Status {
     return status
 }
 
+// Keep the adapter identity even when the shield is down; a resumed worker already owns its
+// routes and must be permitted immediately, without waiting for another periodic status frame.
+func (s *supervisor) recordWorkerStatus(generation uint64, status Status) uint64 {
+    s.mu.Lock();defer s.mu.Unlock()
+    if s.generation!=generation { return 0 }
+    luid:=status.TunLUID
+    status.TunLUID=0
+    s.status=status
+    if luid!=0 { s.adapterLUID=luid }
+    return luid
+}
+
 /*
 Raises the kill switch, or moves it onto a new adapter.
 
@@ -78,6 +97,10 @@ milliseconds of nothing rather than a few milliseconds of leak.
 */
 func (s *supervisor) raiseShield(luid uint64, lan bool) error {
     s.shieldMu.Lock();defer s.shieldMu.Unlock()
+    return s.raiseShieldLocked(luid,lan)
+}
+
+func (s *supervisor) raiseShieldLocked(luid uint64, lan bool) error {
     if s.shield!=nil && s.shieldLUID==luid && s.shieldLAN==lan { return nil }
     next,err:=firewall.Enable(luid,lan)
     if err!=nil { return err }
@@ -101,14 +124,16 @@ this is normally the same interface as last time and nothing changes.
 */
 func (s *supervisor) adoptAdapter(generation, luid uint64) {
     s.shieldMu.Lock()
-    up:=s.shield!=nil;lan:=s.shieldLAN;same:=s.shieldLUID==luid
-    s.shieldMu.Unlock()
     s.mu.Lock();current:=s.generation==generation;s.mu.Unlock()
-    if !up || same || !current { return }
+    // Keep the check and replacement under the same shield lock. An explicit disconnect may
+    // otherwise lower the shield after this check, only for this status frame to raise it again.
+    if s.shield==nil || s.shieldLUID==luid || !current { s.shieldMu.Unlock();return }
     // A failure leaves the old filters in place, which block this adapter as well: the tunnel then
     // carries nothing rather than something leaking around it. It is written down for whoever
     // reads the journal.
-    if err:=s.raiseShield(luid,lan);err!=nil { journalLine("kill switch could not follow the adapter: "+detailOf(err)) }
+    err:=s.raiseShieldLocked(luid,s.shieldLAN)
+    s.shieldMu.Unlock()
+    if err!=nil { journalLine("kill switch could not follow the adapter: "+detailOf(err)) }
 }
 
 /** Starts a database download unless one is already running; the status reports how it went. */
@@ -127,7 +152,7 @@ func (s *supervisor) updateGeo() {
 
 func (s *supervisor) stop() {
     s.mu.Lock();child,input,done:=s.child,s.stdin,s.done
-    s.generation++;s.child=nil;s.stdin=nil;s.done=nil
+    s.generation++;s.child=nil;s.stdin=nil;s.done=nil;s.options=nil;s.adapterLUID=0
     s.status=Status{Version:1,State:"disconnecting"};s.mu.Unlock()
     if input!=nil { _=input.Close() }
     if child!=nil { select {case <-done:case <-time.After(8*time.Second):_=child.Process.Kill();<-done} }
@@ -135,84 +160,177 @@ func (s *supervisor) stop() {
 }
 
 func (s *supervisor) connect(r Request) error {
-    s.stop()
-    port,err:=freePort();if err!=nil{return errors.New("probe_port_unavailable")}
-    // The kill switch goes up before the worker starts and stays up through whatever happens to
-    // it; only a disconnect lowers it. Turning the setting off takes effect on the next connect.
-    if r.Options.KillSwitch {
-        s.shieldMu.Lock();luid:=s.shieldLUID;s.shieldMu.Unlock()
-        if err:=s.raiseShield(luid,r.Options.BypassLAN);err!=nil{return errorWithDetail{"kill_switch_failed",err}}
-    } else {
-        s.releaseShield()
-    }
-    initial:=Status{Version:1,State:"connecting",NodeID:r.NodeID,ProbePort:port,ProbeUser:randomSecret(),ProbePassword:randomSecret()}
-    s.mu.Lock();dir:=s.geoDir;s.mu.Unlock()
-    geo:=r.Options.BypassRussia && inspectGeo(dir).Ready
-    // Resolved before the TUN routes exist; if it cannot be, the core's own guess is still used.
-    // A hand-picked adapter is different: if it is gone or down, saying so is better than coming
-    // up with an interface that carries nothing.
-    outbound, outboundErr := outboundInterface(r.Options.OutboundAdapter)
-    if outboundErr != nil {
-        if r.Options.OutboundAdapter != "" { return errorWithDetail{"adapter_unavailable", outboundErr} }
-        outbound = ""
-    }
-    config:=buildConfig(r,port,initial.ProbeUser,initial.ProbePassword,geo,outbound)
-    exe,err:=os.Executable();if err!=nil{return errors.New("worker_unavailable")}
-    child:=exec.Command(exe,"--worker")
-    child.SysProcAttr=&syscall.SysProcAttr{HideWindow:true}
-    // Where the core looks for geoip.dat and geosite.dat; the name is the core's own
-    // (common/platform: xray.location.asset, spelt as an environment variable).
-    if dir!="" { child.Env=append(os.Environ(),"XRAY_LOCATION_ASSET="+dir) }
-    // Everything the worker says on stderr - a Go panic, a Wintun driver refusing to load, the
-    // core's own complaints - used to go to io.Discard. That is the one thing a tunnel that will
-    // not start must not do: the app can only report "could not start", and the sentence that
-    // says why existed for a moment and was thrown away. Failing to open the journal is not worth
-    // failing a connection over, so a broken log falls back to discarding as before.
-    child.Stderr=workerJournal()
-    input,err:=child.StdinPipe();if err!=nil{return errors.New("worker_unavailable")}
-    output,err:=child.StdoutPipe();if err!=nil{input.Close();return errors.New("worker_unavailable")}
-    if err=child.Start();err!=nil{input.Close();output.Close();return errors.New("worker_unavailable")}
-    done:=make(chan struct{})
-    s.mu.Lock();s.child=child;s.stdin=input;s.done=done;s.status=initial;generation:=s.generation;s.mu.Unlock()
-    go func(){
-        scanner:=bufio.NewScanner(output);scanner.Buffer(make([]byte,4096),maxFrame)
-        for scanner.Scan(){
-            var status Status
-            if json.Unmarshal(scanner.Bytes(),&status)==nil && status.Version==1 {
-                luid:=status.TunLUID;status.TunLUID=0
-                s.mu.Lock();if s.generation==generation{s.status=status};s.mu.Unlock()
-                if luid!=0 { s.adoptAdapter(generation,luid) }
-            }
-        }
-        _=child.Wait()
-        s.mu.Lock();if s.generation==generation && s.status.State!="failed" {s.status=Status{Version:1,State:"failed",Error:"worker_stopped"}};s.mu.Unlock()
-        close(done)
-    }()
-    err=json.NewEncoder(input).Encode(obj{"config":config,"status":initial})
-    if err!=nil{s.stop();return errors.New("worker_unavailable")}
-    return nil
+	s.mu.Lock()
+	dir := s.geoDir
+	s.mu.Unlock()
+	geo := r.Options.BypassRussia && inspectGeo(dir).Ready
+	outbound, outboundErr := outboundInterface(r.Options.OutboundAdapter)
+	if outboundErr != nil {
+		if r.Options.OutboundAdapter != "" {
+			return errorWithDetail{"adapter_unavailable", outboundErr}
+		}
+		outbound = ""
+	}
+	s.mu.Lock()
+	hot := s.child != nil && reflect.DeepEqual(s.options, r.Options) && s.geoEnabled == geo && s.outboundName == outbound &&
+		(s.status.State == "connected" || s.status.State == "disconnected")
+	previous, currentInput, workerLUID := s.status, s.stdin, s.adapterLUID
+	s.mu.Unlock()
+	if hot {
+		if r.Options.KillSwitch {
+			if err := s.raiseShield(workerLUID, r.Options.BypassLAN); err != nil {
+				return errorWithDetail{"kill_switch_failed", err}
+			}
+		} else {
+			s.releaseShield()
+		}
+		initial := switchingStatus(previous,r.NodeID)
+		config := buildConfig(r, initial.ProbePort, initial.ProbeUser, initial.ProbePassword, geo, outbound)
+		// A live switch stays connected with the old server until the worker atomically
+		// publishes the new one. Do not reset counters, the timer or the UI's rate history.
+		if previous.State != "connected" { s.mu.Lock();s.status=initial;s.mu.Unlock() }
+		if err := json.NewEncoder(currentInput).Encode(obj{"config": config, "status": initial}); err != nil {
+			return errors.New("worker_unavailable")
+		}
+		return nil
+	}
+	s.stop()
+	port, err := freePort()
+	if err != nil {
+		return errors.New("probe_port_unavailable")
+	}
+	// The kill switch goes up before the worker starts and stays up through whatever happens to
+	// it; only a disconnect lowers it. Turning the setting off takes effect on the next connect.
+	if r.Options.KillSwitch {
+		s.shieldMu.Lock()
+		luid := s.shieldLUID
+		s.shieldMu.Unlock()
+		if err := s.raiseShield(luid, r.Options.BypassLAN); err != nil {
+			return errorWithDetail{"kill_switch_failed", err}
+		}
+	} else {
+		s.releaseShield()
+	}
+	initial := Status{Version: 1, State: "connecting", NodeID: r.NodeID, ProbePort: port, ProbeUser: randomSecret(), ProbePassword: randomSecret()}
+	config := buildConfig(r, port, initial.ProbeUser, initial.ProbePassword, geo, outbound)
+	exe, err := os.Executable()
+	if err != nil {
+		return errors.New("worker_unavailable")
+	}
+	child := exec.Command(exe, "--worker")
+	child.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	// Where the core looks for geoip.dat and geosite.dat; the name is the core's own
+	// (common/platform: xray.location.asset, spelt as an environment variable).
+	if dir != "" {
+		child.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+dir)
+	}
+	// Everything the worker says on stderr - a Go panic, a Wintun driver refusing to load, the
+	// core's own complaints - used to go to io.Discard. That is the one thing a tunnel that will
+	// not start must not do: the app can only report "could not start", and the sentence that
+	// says why existed for a moment and was thrown away. Failing to open the journal is not worth
+	// failing a connection over, so a broken log falls back to discarding as before.
+	child.Stderr = workerJournal()
+	input, err := child.StdinPipe()
+	if err != nil {
+		return errors.New("worker_unavailable")
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		input.Close()
+		return errors.New("worker_unavailable")
+	}
+	if err = child.Start(); err != nil {
+		input.Close()
+		output.Close()
+		return errors.New("worker_unavailable")
+	}
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.child = child
+	s.stdin = input
+	s.done = done
+	s.status = initial
+	s.options = r.Options
+	s.geoEnabled = geo
+	s.outboundName = outbound
+	generation := s.generation
+	s.mu.Unlock()
+	go func() {
+		scanner := bufio.NewScanner(output)
+		scanner.Buffer(make([]byte, 4096), maxFrame)
+		for scanner.Scan() {
+			var status Status
+			if json.Unmarshal(scanner.Bytes(), &status) == nil && status.Version == 1 {
+				if luid := s.recordWorkerStatus(generation, status); luid != 0 {
+					s.adoptAdapter(generation, luid)
+				}
+			}
+		}
+		_ = child.Wait()
+		s.mu.Lock()
+		if s.generation == generation {
+			s.adapterLUID = 0
+			if s.status.State != "failed" {
+				s.status = Status{Version: 1, State: "failed", Error: "worker_stopped"}
+			}
+		}
+		s.mu.Unlock()
+		close(done)
+	}()
+	err = json.NewEncoder(input).Encode(obj{"config": config, "status": initial})
+	if err != nil {
+		s.stop()
+		return errors.New("worker_unavailable")
+	}
+	return nil
 }
 
 func (s *supervisor) handle(r Request) Status {
-    if r.Command=="status" { return s.snapshot() }
-    if r.Command=="adapters" {
-        s.mu.Lock();status:=s.status;s.mu.Unlock()
-        status.Adapters=adapterList();status.TunLUID=0;status.KillSwitch=s.shieldUp.Load()
-        return status
-    }
-    s.commands.Lock();defer s.commands.Unlock()
-    switch r.Command {
-    case "disconnect":s.stop();s.releaseShield()
-    case "geo_update":s.updateGeo()
-    case "connect":if err:=s.connect(r);err!=nil{
-        failed:=Status{Version:1,State:"failed",Error:err.Error(),KillSwitch:s.shieldUp.Load()}
-        var detailed errorWithDetail
-        if errors.As(err,&detailed){failed.Error=detailed.code;failed.Detail=detailOf(detailed.cause)}
-        s.mu.Lock();s.status=failed;s.mu.Unlock()
-        return s.snapshot()
-    }
-    }
-    return s.snapshot()
+	if r.Command == "status" {
+		return s.snapshot()
+	}
+	if r.Command == "adapters" {
+		s.mu.Lock()
+		status := s.status
+		s.mu.Unlock()
+		status.Adapters = adapterList()
+		status.TunLUID = 0
+		status.KillSwitch = s.shieldUp.Load()
+		return status
+	}
+	s.commands.Lock()
+	defer s.commands.Unlock()
+	switch r.Command {
+	case "disconnect":
+		s.mu.Lock()
+		input := s.stdin
+		running := s.child != nil
+		already := s.status.State == "disconnected"
+		s.mu.Unlock()
+		if running && !already {
+			s.mu.Lock();s.status.State="disconnecting";s.mu.Unlock()
+			if err := json.NewEncoder(input).Encode(obj{"disconnect": true}); err != nil { s.stop() }
+		} else if !running {
+			s.stop()
+		}
+		s.releaseShield()
+	case "geo_update":
+		s.updateGeo()
+	case "connect":
+		if err := s.connect(r); err != nil {
+			failed := Status{Version: 1, State: "failed", Error: err.Error(), KillSwitch: s.shieldUp.Load()}
+			var detailed errorWithDetail
+			if errors.As(err, &detailed) {
+				failed.Error = detailed.code
+				failed.Detail = detailOf(detailed.cause)
+			}
+			s.mu.Lock()
+			s.status = failed
+			s.mu.Unlock()
+			return s.snapshot()
+		}
+	}
+	return s.snapshot()
 }
 
 /**

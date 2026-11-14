@@ -38,7 +38,7 @@ class TunnelIndicatorTest {
             setContent {
                 CompositionLocalProvider(LocalAnimationsActive provides false) {
                     YumiTheme(AppSettings(themeMode = ThemeMode.Dark)) {
-                        Box(Modifier.padding(24.dp)) { TunnelCookie(model, status.value) { opens++ } }
+                        Box(Modifier.padding(24.dp)) { TunnelCookie(model, status.value, health = ConnectionHealth.Reachable) { opens++ } }
                     }
                 }
             }
@@ -94,7 +94,7 @@ class TunnelIndicatorTest {
                                 Row(Modifier.padding(20.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
                                     states.forEach { status ->
                                         CompositionLocalProvider(LocalAnimationsActive provides (status.state != "connecting")) {
-                                            TunnelCookie(model, status) {}
+                                            TunnelCookie(model, status, health = ConnectionHealth.Reachable) {}
                                         }
                                     }
                                 }

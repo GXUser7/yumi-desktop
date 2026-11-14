@@ -222,22 +222,29 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
  * when settled, and a warning triangle whose tooltip explains a failure.
  */
 @OptIn(ExperimentalFoundationApi::class)
-@Composable internal fun TunnelCookie(m: DesktopModel, status: ServiceStatus, size: Dp = 56.dp, onClick: () -> Unit) {
+@Composable internal fun TunnelCookie(
+    m: DesktopModel, status: ServiceStatus, size: Dp = 56.dp,
+    health: ConnectionHealth = m.connectionHealth.collectAsState().value,
+    onClick: () -> Unit,
+) {
     val semantic = LocalSemanticColors.current
-    val busy = status.state == "connecting" || status.state == "disconnecting"
     val connected = status.state == "connected"
+    val unreachable = connected && health == ConnectionHealth.Unreachable
+    val checking = connected && health in listOf(ConnectionHealth.Unchecked, ConnectionHealth.Checking)
+    val busy = status.state == "connecting" || status.state == "disconnecting" || checking
     val blocked = status.killSwitch && !connected && !busy
-    val failed = status.state == "failed" || status.state == "unavailable" || !status.error.isNullOrBlank() || blocked
+    val failed = status.state == "failed" || status.state == "unavailable" || !status.error.isNullOrBlank() || blocked || unreachable
     val color = when {
         failed -> MaterialTheme.colorScheme.error
-        connected -> semantic.connected
         busy -> semantic.connecting
+        connected -> semantic.connected
         else -> MaterialTheme.colorScheme.outline
     }
     val label = when {
         failed -> buildList {
             val error = status.error?.takeIf { it.isNotBlank() }
             add(when {
+                unreachable -> m.text("Сервер недоступен. Выбери другой сервер или дождись восстановления соединения.", "Server unavailable. Choose another server or wait for the connection to recover.")
                 error != null -> serviceError(m, error, includeUnknown = status.detail.isNullOrBlank())
                 status.state == "unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
                 status.state == "failed" -> m.text("Не удалось запустить туннель.", "Could not start the tunnel.")
@@ -246,6 +253,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
             status.detail?.trim()?.takeIf { it.isNotEmpty() && it !in this }?.let { add(it) }
             if (blocked) add(m.text("Килл свитч удерживает интернет. Открой подключение, чтобы снять блокировку.", "The kill switch is holding traffic. Open Connection to lift the block."))
         }.joinToString("\n\n")
+        checking -> m.text("Проверяем соединение…", "Checking connection…")
         connected -> m.text("Защищено", "Protected")
         status.state == "connecting" -> m.text("Подключение…", "Connecting…")
         status.state == "disconnecting" -> m.text("Отключение…", "Disconnecting…")
@@ -362,22 +370,7 @@ private val ReadingWidth = 860.dp
     val profiles by m.profiles.state.collectAsState()
     val node = profiles.nodes.firstOrNull { it.id == (status.nodeId ?: profiles.selectedNodeId) }
 
-    val download = rememberRateHistory()
-    val upload = rememberRateHistory()
-    val live by rememberUpdatedState(traffic)
-    // Sampled on a clock rather than on every change of the counters: two identical seconds — an
-    // idle tunnel — would otherwise produce one sample, and the axis would stop being time.
-    LaunchedEffect(status.state) {
-        if (status.state != "connected") {
-            download.clear(); upload.clear()
-            return@LaunchedEffect
-        }
-        while (true) {
-            download.push(live.downloadBytesPerSecond)
-            upload.push(live.uploadBytesPerSecond)
-            delay(1_000)
-        }
-    }
+    val history by m.trafficHistory.collectAsState()
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val narrow = LocalCompactLayout.current || maxWidth < 720.dp
@@ -425,7 +418,7 @@ private val ReadingWidth = 860.dp
                             )
                             status.state in listOf("failed", "unavailable") -> ConnectionProblem(m, status)
                             node == null -> TransferCard(m, onPair)
-                            else -> SessionTile(m, traffic, download.values, upload.values)
+                            else -> SessionTile(m, traffic, history.map { it.downloadBytesPerSecond }, history.map { it.uploadBytesPerSecond })
                         }
                     }
                 }
@@ -548,7 +541,10 @@ private val ReadingWidth = 860.dp
     }
 }
 
-@Composable private fun Headline(m: DesktopModel, status: ServiceStatus, node: ProxyNode?, tight: Boolean, modifier: Modifier, compact: Boolean = false) {
+@Composable internal fun Headline(
+    m: DesktopModel, status: ServiceStatus, node: ProxyNode?, tight: Boolean, modifier: Modifier, compact: Boolean = false,
+    health: ConnectionHealth = m.connectionHealth.collectAsState().value,
+) {
     val semantic = LocalSemanticColors.current
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(status.state, status.connectedAt) {
@@ -558,12 +554,22 @@ private val ReadingWidth = 860.dp
         }
     }
     val connected = status.state == "connected"
+    val unreachable = connected && health == ConnectionHealth.Unreachable
+    val checking = connected && health in listOf(ConnectionHealth.Unchecked, ConnectionHealth.Checking)
     val primary: String
     val secondary: String
     when (status.state) {
         "connected" -> {
-            primary = m.strings.get(R.string.connect_protected)
-            secondary = formatDuration(now - status.connectedAt)
+            primary = when {
+                unreachable -> m.text("Сервер", "Server")
+                checking -> m.text("Проверяем", "Checking")
+                else -> m.strings.get(R.string.connect_protected)
+            }
+            secondary = when {
+                unreachable -> m.text("недоступен", "unavailable")
+                checking -> m.text("соединение", "connection")
+                else -> formatDuration(now - status.connectedAt)
+            }
         }
         "connecting" -> {
             primary = m.strings.get(R.string.connect_raising)
@@ -586,7 +592,11 @@ private val ReadingWidth = 860.dp
             secondary = m.strings.get(R.string.connect_tunnel_secondary)
         }
     }
-    val ink = if (connected) semantic.connected else MaterialTheme.colorScheme.onSurface
+    val ink = when {
+        unreachable -> MaterialTheme.colorScheme.error
+        connected && !checking -> semantic.connected
+        else -> MaterialTheme.colorScheme.onSurface
+    }
     val poster = pagePosterStyle(compact || LocalCompactLayout.current, tight)
     Column(modifier) {
         Kicker(
@@ -598,7 +608,11 @@ private val ReadingWidth = 860.dp
         Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
         if (compact) {
             val label = when (status.state) {
-                "connected" -> primary
+                "connected" -> when {
+                    unreachable -> m.text("Сервер недоступен", "Server unavailable")
+                    checking -> m.text("Проверяем соединение", "Checking connection")
+                    else -> primary
+                }
                 "connecting" -> m.text("Подключение", "Connecting")
                 "disconnecting" -> m.text("Отключение", "Disconnecting")
                 "failed" -> m.text("Ошибка подключения", "Connection failed")
@@ -607,7 +621,7 @@ private val ReadingWidth = 860.dp
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(label, Modifier.weight(1f), style = poster, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (connected) Text(secondary, style = poster.copy(fontSize = 20.sp, lineHeight = 26.sp, fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
+                if (connected && !unreachable && !checking) Text(secondary, style = poster.copy(fontSize = 20.sp, lineHeight = 26.sp, fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
             }
         } else {
         Text(primary, style = poster, color = ink, maxLines = 1)
@@ -615,7 +629,7 @@ private val ReadingWidth = 860.dp
         // once a second while the timer ticks. Tabular figures keep it from twitching sideways.
         @Suppress("UnusedContentLambdaTargetStateParameter")
         AnimatedContent(
-            targetState = status.state,
+            targetState = status.state to health,
             transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
             label = "headline-second-line",
         ) { _ ->
@@ -1637,6 +1651,7 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
     "service_unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
     "platform_not_supported" -> m.text("VPN-туннель поддерживается только в Windows.", "The VPN tunnel is supported only on Windows.")
     "worker_stopped" -> m.text("Ядро VPN неожиданно остановилось.", "The VPN core stopped unexpectedly.")
+    "hot_swap_failed" -> m.text("Не удалось сменить сервер. Предыдущее соединение сохранено.", "Could not switch servers. The previous connection is still active.")
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
     "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")
     "kill_switch_failed" -> m.text("Не удалось включить килл свитч, поэтому туннель не поднят. Выключи его в настройках, чтобы подключиться без него.", "The kill switch could not be raised, so the tunnel was not started. Turn it off in Settings to connect without it.")

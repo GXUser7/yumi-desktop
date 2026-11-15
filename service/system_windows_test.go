@@ -3,12 +3,43 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"golang.org/x/sys/windows/registry"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestLegacyLocationSnapshotMigratesAndClearsBothPathsAfterRecovery(t *testing.T) {
+	t.Setenv("ProgramData", t.TempDir())
+	legacy := legacySysStatePath()
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := sysState{Active: true, PrevTimezone: "original", Timezone: "changed", HadPolicy: true}
+	data, _ := json.Marshal(want)
+	if err := os.WriteFile(legacy, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSysState()
+	if err != nil || got == nil || *got != want {
+		t.Fatal("lost the legacy recovery baseline")
+	}
+	if _, err := os.Stat(sysStatePath()); err != nil {
+		t.Fatal("did not create the protected-path snapshot")
+	}
+	if err := clearSysState(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{legacy, sysStatePath()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("left a stale recovery record")
+		}
+	}
+}
 
 /*
 The table is data edited by hand, which is exactly the kind of thing that rots quietly: a typo in

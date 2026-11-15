@@ -30,7 +30,10 @@ class ConnectRequestTest {
     @Test fun applicationPathsFromOlderSettingsBecomeNames() {
         val desktop = DesktopSettings(applications = listOf("C:/Program Files/Google/Chrome/Application/chrome.exe", "chrome.exe", "Telegram"))
         val request = ConnectRequestFactory.create(server("a.example.com"), AppSettings(mtu = 1500), desktop)
-        assertEquals(listOf("chrome.exe", "Telegram.exe"), request.options!!.applications)
+        // Names arrive as the platform spells them: a name that carries its extension keeps it,
+        // a bare one gains it where processes have extensions.
+        val windows = System.getProperty("os.name").startsWith("Windows")
+        assertEquals(listOf("chrome.exe", if (windows) "Telegram.exe" else "Telegram"), request.options!!.applications)
     }
 
     @Test fun chosenAdapterTravelsWithTheRequest() {

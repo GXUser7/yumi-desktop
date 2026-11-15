@@ -19,7 +19,7 @@ OS=$(uname)
 # ── Version gate ─────────────────────────────────────────────────────────────────────────────
 VERSION=$(sed -n 's/.*version = "\(.*\)".*/\1/p' build.gradle.kts | head -1)
 [ -n "$VERSION" ] || { echo "version not found in build.gradle.kts"; exit 1; }
-grep -q "packageVersion = \"$VERSION\"" desktop/build.gradle.kts || { echo "desktop/build.gradle.kts disagrees with $VERSION"; exit 1; }
+grep -q "releaseVersion = \"$VERSION\"" desktop/build.gradle.kts || { echo "desktop/build.gradle.kts disagrees with $VERSION"; exit 1; }
 grep -q "#define AppVersion \"$VERSION\"" installer/Yumi.iss || { echo "installer/Yumi.iss disagrees with $VERSION"; exit 1; }
 grep -q "AppVersion = \"$VERSION\"" desktop/src/main/kotlin/com/yumi/desktop/BuildInfo.kt || { echo "BuildInfo.kt disagrees with $VERSION"; exit 1; }
 echo "Version gate: $VERSION"

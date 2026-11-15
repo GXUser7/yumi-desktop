@@ -19,7 +19,7 @@ class UpdatePanelTest {
         seedDemo(directory)
         val model = DesktopModel(DemoBackend(), directory)
         model.desktop.update { it.copy(autoUpdate = false) }
-        val release = DesktopRelease("0.4.0", "", "", "", 100)
+        val release = DesktopRelease("1.1.0", "", "", "", 100)
         val finish = CompletableDeferred<Unit>()
         val updater = DesktopUpdater(model.scope, object : UpdateSource {
             override suspend fun latest() = release
@@ -41,7 +41,7 @@ class UpdatePanelTest {
                 waitUntil { updater.state.value is DesktopUpdateState.Available }
                 onNodeWithText("Скачать обновление").performClick()
                 waitUntil { updater.state.value is DesktopUpdateState.Downloading }
-                onNodeWithText("Скачивается 0.4.0 · 50 %").assertExists()
+                onNodeWithText("Скачивается 1.1.0 · 50 %").assertExists()
                 onNodeWithText("Отмена").performClick()
                 waitUntil { updater.state.value is DesktopUpdateState.Available }
                 onNodeWithText("Скачать обновление").performClick()

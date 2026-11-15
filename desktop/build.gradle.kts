@@ -1,5 +1,8 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 plugins { kotlin("jvm"); id("org.jetbrains.kotlin.plugin.compose"); id("org.jetbrains.compose") }
+
+// The release version, as the four-file version gate reads it.
+val releaseVersion = "1.0.0"
 kotlin {
     jvmToolchain(21)
     compilerOptions.freeCompilerArgs.addAll(
@@ -52,7 +55,7 @@ compose.desktop {
             // rpm for Linux, Dmg to hand someone and Pkg for the updater to install on macOS.
             targetFormats(TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm, TargetFormat.Dmg, TargetFormat.Pkg)
             packageName = "Yumi"
-            packageVersion = "0.3.0"
+            packageVersion = releaseVersion
             includeAllModules = true
             appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
             windows { menu = true; shortcut = true; upgradeUuid = "e8cb03d0-c852-4375-bf1b-a83f09e118b7"
@@ -65,10 +68,6 @@ compose.desktop {
                 iconFile.set(project.file("icon/yumi.icns"))
                 bundleID = "app.yumi.desktop"
                 dockName = "Yumi"
-                // jpackage refuses an app-version whose first number is zero, so the macOS
-                // bundle carries 3.0 while every tag, package and update check stays 0.3.0.
-                dmgPackageVersion = "3.0"
-                pkgPackageVersion = "3.0"
             }
         }
     }

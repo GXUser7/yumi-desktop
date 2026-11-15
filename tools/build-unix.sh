@@ -64,8 +64,8 @@ echo "== Dist"
 mkdir -p dist
 BINARIES=desktop/build/compose/binaries/main
 if [ "$OS" = "Linux" ]; then
-    cp "$BINARIES/deb/yumi_${VERSION}-1_amd64.deb"      "dist/Yumi-Desktop-$VERSION-linux-amd64.deb"
-    cp "$BINARIES/rpm/Yumi-$VERSION-1.x86_64.rpm"       "dist/Yumi-Desktop-$VERSION-linux-amd64.rpm"
+    cp "$BINARIES/deb/yumi_${VERSION}_amd64.deb"        "dist/Yumi-Desktop-$VERSION-linux-amd64.deb"
+    cp "$BINARIES/rpm/yumi-$VERSION-1.x86_64.rpm"       "dist/Yumi-Desktop-$VERSION-linux-amd64.rpm"
 else
     cp "$BINARIES/dmg/Yumi-$VERSION.dmg"                "dist/Yumi-Desktop-$VERSION-macos-arm64.dmg"
     cp "$BINARIES/pkg/Yumi-$VERSION.pkg"                "dist/Yumi-Desktop-$VERSION-macos-arm64.pkg"

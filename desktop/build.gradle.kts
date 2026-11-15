@@ -65,6 +65,10 @@ compose.desktop {
                 iconFile.set(project.file("icon/yumi.icns"))
                 bundleID = "app.yumi.desktop"
                 dockName = "Yumi"
+                // jpackage refuses an app-version whose first number is zero, so the macOS
+                // bundle carries 3.0 while every tag, package and update check stays 0.3.0.
+                dmgPackageVersion = "3.0"
+                pkgPackageVersion = "3.0"
             }
         }
     }

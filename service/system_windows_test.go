@@ -104,3 +104,17 @@ func TestSysStateNeedsProgramData(t *testing.T) {
 		t.Fatalf("restore without a snapshot refused: %v", err)
 	}
 }
+
+// A connected frame can queue behind disconnect on the command lock. Its delayed callback must
+// not move the machine again after disconnect has already restored it. No writable snapshot
+// directory is provided, so the pre-fix path cannot change the test machine either.
+func TestLateLocationFrameCannotReactivateAfterDisconnect(t *testing.T) {
+	t.Setenv("ProgramData", "")
+	for _, state := range []string{"disconnected", "disconnecting", "connecting", "failed"} {
+		s := &supervisor{options: &Options{MatchLocation: true}, status: Status{State: state, ServerCountry: "DE"}}
+		s.applyLocationMode()
+		if s.sysActive || s.sysCountry != "" || s.sysNote != "" {
+			t.Fatalf("late callback applied location to %s: active=%v country=%q note=%q", state, s.sysActive, s.sysCountry, s.sysNote)
+		}
+	}
+}

@@ -149,6 +149,21 @@ func TestLiveSwitchStatusKeepsConnectedEpochAndTotals(t *testing.T) {
 	}
 }
 
+func TestLiveSwitchCountryBelongsToAcknowledgedServer(t *testing.T) {
+	previous := Status{Version: 1, State: "connected", NodeID: "old", ServerCountry: "BE", ConnectedAt: 123}
+	requested := switchingStatus(previous, "new")
+	requested.ServerCountry = "DE"
+	// Preparing a candidate must not move the old connection's country. A rejected candidate
+	// keeps the previous status; only the worker's successful replacement publishes this one.
+	if previous.ServerCountry != "BE" {
+		t.Fatal("preparing a switch changed the active country")
+	}
+	acknowledged := liveConnectedStatus(previous, requested, 999)
+	if acknowledged.NodeID != "new" || acknowledged.ServerCountry != "DE" || acknowledged.ConnectedAt != 123 {
+		t.Fatalf("acknowledgement lost the active country or session: %+v", acknowledged)
+	}
+}
+
 func TestLiveCoreKeepsDirectUDPSocketAndSourcePort(t *testing.T) {
 	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {

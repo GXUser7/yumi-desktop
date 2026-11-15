@@ -65,6 +65,8 @@ type Status struct {
     // not start is unattributable by anyone — the user, the journal, or whoever is reading this.
     Detail string `json:"detail,omitempty"`
     NodeID string `json:"nodeId,omitempty"`
+    // Travels with the worker's acknowledged server, including through a rejected hot switch.
+    ServerCountry string `json:"serverCountry,omitempty"`
     ConnectedAt int64 `json:"connectedAt"`
     Upload int64 `json:"upload"`
     Download int64 `json:"download"`

@@ -27,6 +27,9 @@ class DesktopModel(
     val message = MutableStateFlow<String?>(null)
     val settings = SettingsRepository(directory, scope)
     val profiles = ProfileRepository(directory, scope)
+    private val connection = JsonStore(File(directory, "active-connection.json"), ActiveConnection.serializer(), ActiveConnection(), scope)
+    val activeNode = MutableStateFlow<ProxyNode?>(null)
+    private var requestedNode: ProxyNode? = null
     val desktop = JsonStore(File(directory, "desktop.json"), DesktopSettings.serializer(), DesktopSettings(), scope)
     val updates = DesktopUpdater(
         scope, GitHubUpdates(File(directory, "updates"), HttpsUpdateTransport(AppVersion)), desktop.state, AppVersion,
@@ -136,7 +139,7 @@ class DesktopModel(
         val arrived = current.geoReady && !geoWasReady
         geoWasReady = current.geoReady
         if (arrived && geoSeen && current.state == "connected" && desktop.value.bypassRussia) {
-            commands.withLock { if (status.value.state == "connected") { cancelSpeed(); connectSelected() } }
+            commands.withLock { if (status.value.state == "connected") { cancelSpeed(); reconnectActive() } }
         }
         geoSeen = true
     }
@@ -182,6 +185,20 @@ class DesktopModel(
     }
     private fun updateStatus(next: ServiceStatus) {
         val old = status.value
+        val saved = connection.value
+        val node = if (next.state in listOf("connected", "connecting", "disconnecting")) {
+            saved.node?.takeIf { saved.serviceNodeId == next.nodeId && saved.connectedAt == next.connectedAt }
+                ?: requestedNode?.takeIf { it.id == next.nodeId }
+                ?: profiles.allNodes.firstOrNull { it.id == next.nodeId }
+                ?: profiles.nodeIdMigration[next.nodeId]?.let { id -> profiles.allNodes.firstOrNull { it.id == id } }
+        } else null
+        activeNode.value = node
+        if (next.state == "connected" && node != null) {
+            val acknowledged = ActiveConnection(next.nodeId, next.connectedAt, node)
+            if (saved != acknowledged) connection.update { acknowledged }
+        } else if (next.state in listOf("disconnected", "failed") && saved != ActiveConnection()) {
+            connection.update { ActiveConnection() }
+        }
         traffic.value = TrafficStats(next.upload, next.download,
             if (next.connectedAt == old.connectedAt) (next.upload - old.upload).coerceAtLeast(0) else 0,
             if (next.connectedAt == old.connectedAt) (next.download - old.download).coerceAtLeast(0) else 0)
@@ -191,7 +208,6 @@ class DesktopModel(
             connectionProbe?.cancel()
             tunnelMonitor?.cancel()
             connectionHealth.value = ConnectionHealth.Checking
-            val node = profiles.allNodes.firstOrNull { it.id == next.nodeId }
             if (node != null) connectionProbe = scope.launch {
                 val result = try { measureLatency(node, settings.value.pingMode) }
                 catch (cancelled: CancellationException) { throw cancelled }
@@ -247,23 +263,35 @@ class DesktopModel(
             } else connectSelected()
         }
     }
-    private suspend fun connectSelected() {
-        val node = profiles.selectedNode()
+    private suspend fun connectSelected() = connectNode(profiles.selectedNode())
+
+    private suspend fun reconnectActive() {
+        val node = activeNode.value
+        if (node == null) {
+            message.value = text("Активного сервера больше нет в подписке. Выберите сервер для переподключения.",
+                "The active server is no longer in the subscription. Choose a server to reconnect.")
+            return
+        }
+        connectNode(node)
+    }
+
+    private suspend fun connectNode(node: ProxyNode?) {
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
         // Preserve geo/service metadata while the connect command is in flight. Dropping it
         // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
         val hotSwap = status.value.state == "connected"
         if (hotSwap) {
             switching.value = true
-            connectionHealth.value = ConnectionHealth.Checking
         } else updateStatus(status.value.copy(state = "connecting", nodeId = node.id, error = null, detail = null))
         try {
             val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
+            requestedNode = node
             updateStatus(backend.request(request))
         } finally { switching.value = false }
     }
     fun selectNode(id: String) = action {
         commands.withLock {
+            if (profiles.nodes.none { it.id == id }) return@withLock
             val reconnect = status.value.state == "connected"
             profiles.selectNode(id)
             if (reconnect) { cancelSpeed(); connectSelected() }
@@ -272,7 +300,7 @@ class DesktopModel(
     fun changeSettings(transform: (AppSettings) -> AppSettings, reconnect: Boolean = false) = action {
         commands.withLock {
             settings.update(transform)
-            if (reconnect && status.value.state == "connected") { cancelSpeed(); connectSelected() }
+            if (reconnect && status.value.state == "connected") { cancelSpeed(); reconnectActive() }
         }
     }
     fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = action {
@@ -281,7 +309,7 @@ class DesktopModel(
             val loweringShield = desktop.value.killSwitch && !next.killSwitch
             desktop.update { next }
             if (!next.connectOnLaunch) startupConnectPending = false
-            if (reconnect && status.value.state == "connected") { cancelSpeed(); connectSelected() }
+            if (reconnect && status.value.state == "connected") { cancelSpeed(); reconnectActive() }
             // Switching the kill switch off while it holds a dead tunnel means "give me my
             // internet back", not "next time": the block comes down now.
             else if (loweringShield && status.value.killSwitch && status.value.state != "connecting") {
@@ -355,7 +383,7 @@ class DesktopModel(
     }
     fun removeSubscription(id: String) = action {
         commands.withLock {
-            val active = profiles.allNodes.firstOrNull { it.id == status.value.nodeId }
+            val active = activeNode.value
             if (active?.subscriptionId == id && status.value.state in listOf("connecting", "connected")) {
                 cancelSpeed(); updateStatus(backend.request(ServiceRequest(command = "disconnect")))
             }
@@ -421,7 +449,7 @@ class DesktopModel(
             var download = emptyList<Long>()
             var upload = emptyList<Long>()
             var phase = SpeedPhase.Idle
-            SpeedTester(logs, strings).measure(probe, profiles.allNodes.firstOrNull { it.id == current.nodeId }?.name).collect { next ->
+            SpeedTester(logs, strings).measure(probe, activeNode.value?.name).collect { next ->
                 if (next.phase != phase) {
                     when (phase) {
                         SpeedPhase.Download -> download = live

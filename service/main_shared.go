@@ -69,7 +69,6 @@ type supervisor struct {
 	sysCountry string
 	sysTimezone string
 	sysNote string
-	pendingCountry string
 
 	// Where the routing databases live, and the download in flight; see geo.go. Guarded by mu.
 	geoDir string
@@ -200,9 +199,6 @@ func (s *supervisor) connect(r Request) error {
 	hot := s.child != nil && reflect.DeepEqual(s.options, r.Options) && s.geoEnabled == geo && s.outboundName == outbound &&
 		(s.status.State == "connected" || s.status.State == "disconnected")
 	previous, currentInput, workerRef := s.status, s.stdin, firewall.TunRef{LUID: s.adapterLUID, Name: s.adapterName}
-	// The country rides outside Options, so a hot switch to a server across a border changes
-	// nothing the DeepEqual above looks at; the mode follows it live below.
-	s.pendingCountry = r.ServerCountry
 	s.mu.Unlock()
 	if hot {
 		if r.Options.KillSwitch {
@@ -213,6 +209,7 @@ func (s *supervisor) connect(r Request) error {
 			s.releaseShield()
 		}
 		initial := switchingStatus(previous,r.NodeID)
+		initial.ServerCountry = r.ServerCountry
 		config := buildConfig(r, initial.ProbePort, initial.ProbeUser, initial.ProbePassword, geo, outbound)
 		// A live switch stays connected with the old server until the worker atomically
 		// publishes the new one. Do not reset counters, the timer or the UI's rate history.
@@ -220,9 +217,6 @@ func (s *supervisor) connect(r Request) error {
 		if err := json.NewEncoder(currentInput).Encode(obj{"config": config, "status": initial}); err != nil {
 			return errors.New("worker_unavailable")
 		}
-		// The worker has accepted the new server while staying connected, so the mode can follow
-		// right now instead of waiting for a frame that will not change the verdict.
-		if r.Options.MatchLocation { s.applyLocationMode() } else { s.releaseLocationMode() }
 		return nil
 	}
 	s.stop()
@@ -242,7 +236,7 @@ func (s *supervisor) connect(r Request) error {
 	} else {
 		s.releaseShield()
 	}
-	initial := Status{Version: 1, State: "connecting", NodeID: r.NodeID, ProbePort: port, ProbeUser: randomSecret(), ProbePassword: randomSecret()}
+	initial := Status{Version: 1, State: "connecting", NodeID: r.NodeID, ServerCountry: r.ServerCountry, ProbePort: port, ProbeUser: randomSecret(), ProbePassword: randomSecret()}
 	config := buildConfig(r, port, initial.ProbeUser, initial.ProbePassword, geo, outbound)
 	exe, err := os.Executable()
 	if err != nil {
@@ -284,7 +278,6 @@ func (s *supervisor) connect(r Request) error {
 	s.options = r.Options
 	s.geoEnabled = geo
 	s.outboundName = outbound
-	s.pendingCountry = r.ServerCountry
 	generation := s.generation
 	s.mu.Unlock()
 	go func() {
@@ -389,8 +382,8 @@ goroutine hands this to one: a disconnect arriving mid-apply must win, not queue
 */
 func (s *supervisor) applyLocationMode() {
     s.mu.Lock()
-    wanted := s.options != nil && s.options.MatchLocation
-    country := s.pendingCountry
+    wanted := s.status.State == "connected" && s.options != nil && s.options.MatchLocation
+    country := s.status.ServerCountry
     s.mu.Unlock()
     if !wanted { return }
     s.mu.Lock()

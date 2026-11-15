@@ -368,7 +368,10 @@ private val ReadingWidth = 860.dp
     val status by m.status.collectAsState()
     val traffic by m.traffic.collectAsState()
     val profiles by m.profiles.state.collectAsState()
-    val node = profiles.nodes.firstOrNull { it.id == (status.nodeId ?: profiles.selectedNodeId) }
+    val activeNode by m.activeNode.collectAsState()
+    val running = status.state in listOf("connected", "connecting", "disconnecting")
+    val node = if (running) activeNode ?: profiles.nodes.firstOrNull { it.id == status.nodeId }
+        else profiles.nodes.firstOrNull { it.id == profiles.selectedNodeId }
 
     val history by m.trafficHistory.collectAsState()
 
@@ -400,7 +403,7 @@ private val ReadingWidth = 860.dp
                         FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
                     }
                     Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        ServerRow(m, node, profiles.latencies[node?.id], onServers)
+                        ServerRow(m, node, profiles.latencies[node?.id], onServers, running)
                         ControlTile(m, status, node != null, Modifier.weight(1f), m::toggleConnection)
                         when {
                             // A kill switch holding a dead tunnel is the one thing on this screen the user
@@ -417,7 +420,7 @@ private val ReadingWidth = 860.dp
                                 onAction = { m.releaseKillSwitch() },
                             )
                             status.state in listOf("failed", "unavailable") -> ConnectionProblem(m, status)
-                            node == null -> TransferCard(m, onPair)
+                            !running && profiles.nodes.isEmpty() && profiles.subscriptions.isEmpty() -> TransferCard(m, onPair)
                             else -> SessionTile(m, traffic, history.map { it.downloadBytesPerSecond }, history.map { it.uploadBytesPerSecond })
                         }
                     }
@@ -439,7 +442,8 @@ private val ReadingWidth = 860.dp
                 Box(Modifier.weight(1f).fillMaxWidth().testTag("page-header").glass(PanelShape, glassTint())) {
                     Headline(m, status, node, true, Modifier.padding(12.dp), compact = true)
                 }
-                ServerButton(m, node, latency, Modifier.fillMaxWidth().height(64.dp), true, onServers)
+                ServerButton(m, node, latency, Modifier.fillMaxWidth().height(64.dp), true, onServers,
+                    status.state in listOf("connected", "connecting", "disconnecting"))
             }
             Box(Modifier.weight(1f).fillMaxHeight().testTag("compact-control")) {
                 ControlTile(m, status, node != null, Modifier.fillMaxSize(), m::toggleConnection)
@@ -450,7 +454,8 @@ private val ReadingWidth = 860.dp
             QuietButton(m.text("Снять блокировку интернета", "Lift the network block"), Modifier.fillMaxWidth(), Icons.Rounded.GppMaybe) { m.releaseKillSwitch() }
         } else if (status.state in listOf("failed", "unavailable")) {
             ConnectionProblem(m, status)
-        } else if (node == null) {
+        } else if (status.state !in listOf("connected", "connecting", "disconnecting") &&
+            m.profiles.state.value.nodes.isEmpty() && m.profiles.state.value.subscriptions.isEmpty()) {
             QuietButton(m.text("Перенести с телефона", "Transfer from phone"), Modifier.fillMaxWidth(), Icons.Rounded.QrCodeScanner, onClick = onPair)
         } else {
             val semantic = LocalSemanticColors.current
@@ -466,9 +471,9 @@ private val ReadingWidth = 860.dp
  * The server, and the square that changes it: a tile with the latency on it that opens the server
  * list, and beside it the server that reading belongs to.
  */
-@Composable private fun ServerRow(m: DesktopModel, node: ProxyNode?, latency: LatencyResult?, onServers: () -> Unit) {
+@Composable private fun ServerRow(m: DesktopModel, node: ProxyNode?, latency: LatencyResult?, onServers: () -> Unit, running: Boolean) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        if (maxWidth < 240.dp) ServerButton(m, node, latency, Modifier.fillMaxWidth().height(72.dp), true, onServers)
+        if (maxWidth < 240.dp) ServerButton(m, node, latency, Modifier.fillMaxWidth().height(72.dp), true, onServers, running)
         else Row(Modifier.fillMaxWidth().height(96.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             ServerButton(m, node, latency, Modifier.fillMaxHeight().aspectRatio(1f), false, onServers)
             Column(
@@ -478,7 +483,7 @@ private val ReadingWidth = 860.dp
                 Kicker(m.text("Сервер", "Server"))
                 Text(
                     if (node != null) rememberEmojiText(node.name, 14.sp)
-                    else AnnotatedString(m.text("Не выбран", "None chosen")),
+                    else AnnotatedString(if (running) m.text("Активный · нет в списке", "Active · not in the list") else m.text("Не выбран", "None chosen")),
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -499,6 +504,7 @@ private val ReadingWidth = 860.dp
     modifier: Modifier,
     wide: Boolean,
     onServers: () -> Unit,
+    running: Boolean = false,
 ) {
     val semantic = LocalSemanticColors.current
     val value = latency?.takeIf { !it.failed }?.millis
@@ -526,7 +532,7 @@ private val ReadingWidth = 860.dp
         ) {
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             if (node != null) Text(rememberEmojiText(node.name, 15.sp), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            else Text(m.text("Выбрать", "Choose"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
+            else Text(if (running) m.text("Активный · нет в списке", "Active · not in the list") else m.text("Выбрать", "Choose"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
             Text(value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = ink, maxLines = 1)
         } else Column(
             Modifier.fillMaxSize().padding(6.dp),
@@ -845,6 +851,7 @@ private val ReadingWidth = 860.dp
     val profiles by m.profiles.state.collectAsState()
     val pinging by m.pinging.collectAsState()
     val status by m.status.collectAsState()
+    val activeNode by m.activeNode.collectAsState()
     var query by remember { mutableStateOf("") }
     val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
     val matches = remember(visibleNodes, query) {
@@ -904,7 +911,7 @@ private val ReadingWidth = 860.dp
                     ) {
                         items(matches, key = { it.id }, contentType = { "server" }) { node ->
                             ServerListRow(m, node, node.id == profiles.selectedNodeId,
-                                node.id == status.nodeId && status.state == "connected", profiles.latencies[node.id], sources[node.subscriptionId])
+                                node.id == (activeNode?.id ?: status.nodeId) && status.state == "connected", profiles.latencies[node.id], sources[node.subscriptionId])
                         }
                     }
                     VerticalScrollbar(rememberScrollbarAdapter(list), Modifier.align(Alignment.CenterEnd).fillMaxHeight().padding(vertical = 10.dp))

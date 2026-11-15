@@ -56,7 +56,7 @@ class SubscriptionService(
     private val logs: LogRepository,
     private val strings: Strings,
     private val userAgent: String =
-        "Yumi/1.0.0 (" + (System.getProperty("os.name")?.replace(' ', '_') ?: "unknown") + ")",
+        "Yumi/1.0.1 (" + (System.getProperty("os.name")?.replace(' ', '_') ?: "unknown") + ")",
     private val identity: () -> DeviceIdentity? = { null },
     /**
      * How to reach the running tunnel from inside this process, or null when there is none.

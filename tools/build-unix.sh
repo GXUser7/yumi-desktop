@@ -40,9 +40,11 @@ $GO -C service test ./... -count=1
 $GO -C service build -trimpath -ldflags '-s -w' -o ../runtime/yumi-service .
 
 # ── Icons ────────────────────────────────────────────────────────────────────────────────────
+echo "== Icons"
 if [ "$OS" = "Darwin" ]; then
     # The iconset is committed; the .icns is macOS' own conversion of it and is not portable.
     [ -f desktop/icon/yumi.icns ] || iconutil -c icns desktop/icon/yumi.iconset -o desktop/icon/yumi.icns
+    ls -l desktop/icon/yumi.icns
 fi
 
 # ── Licenses ─────────────────────────────────────────────────────────────────────────────────
@@ -51,7 +53,11 @@ pwsh -NoProfile -File tools/collect-licenses.ps1 -GoExe "$(command -v $GO)"
 
 # ── Packages ─────────────────────────────────────────────────────────────────────────────────
 echo "== Packages"
-$GRADLE :desktop:packageDistributionForCurrentOS --console=plain
+# jpackage writes its complaint to a log on this machine; show it before dying.
+$GRADLE :desktop:packageDistributionForCurrentOS --console=plain || {
+    cat desktop/build/compose/logs/*/jpackage*err.txt 2>/dev/null
+    exit 1
+}
 
 # ── Dist ─────────────────────────────────────────────────────────────────────────────────────
 echo "== Dist"

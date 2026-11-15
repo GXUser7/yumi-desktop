@@ -17,6 +17,9 @@ import kotlinx.serialization.json.*
     val networks: List<String> = emptyList(),
     /** Nothing leaves outside the tunnel from connect until an explicit disconnect. */
     val killSwitch: Boolean = false,
+    /** While connected the service moves the system timezone onto the server's and silences the
+     *  system's location sources. The timezone follows the country, so no server data is needed. */
+    val matchLocation: Boolean = false,
     /** Russian sites go direct by the geo databases, above the application rules. */
     val bypassRussia: Boolean = true,
     /** The physical adapter the core sends proxy traffic out of; empty follows the Windows
@@ -37,6 +40,10 @@ import kotlinx.serialization.json.*
     val nodeId: String? = null,
     val outbound: JsonObject? = null,
     val options: TunnelOptions? = null,
+    /** The active server's country, read off the flag in its name. Carries the timezone the
+     *  service applies in [TunnelOptions.matchLocation] mode. Top level rather than inside
+     *  [options] so a hot switch to a server in another country does not restart the worker. */
+    val serverCountry: String = "",
 )
 @Serializable data class ServiceStatus(
     val version: Int = 1,
@@ -59,6 +66,10 @@ import kotlinx.serialization.json.*
     val geoUpdatedAt: Long = 0,
     val geoBytes: Long = 0,
     val geoError: String? = null,
+    /** The location mode as the machine sees it: the timezone the service has put the system
+     *  into, or the sentence about why it could not. Empty whenever the mode is off. */
+    val sysTimezone: String = "",
+    val sysNote: String = "",
     /** Answered only for the "adapters" command; the status poll leaves it empty. */
     val adapters: List<NetworkAdapter> = emptyList(),
 ) {
@@ -74,6 +85,7 @@ object ConnectRequestFactory {
         val document = XrayConfigFactory.build(listOf(server), server, settings.copy(routingMode = RoutingMode.Global), geoAvailable = false)
         val outbound = Json.parseToJsonElement(document.json).jsonObject.getValue("outbounds").jsonArray.first().jsonObject
         return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
+            serverCountry = WorldMap.countryCodeOf(node.name) ?: "",
             options = TunnelOptions(
                 mtu = settings.mtu,
                 ipv6 = settings.enableIpv6,
@@ -84,6 +96,7 @@ object ConnectRequestFactory {
                 domains = desktop.domains.map(RuleValidation::domain),
                 networks = desktop.networks.map(RuleValidation::network),
                 killSwitch = desktop.killSwitch,
+                matchLocation = desktop.matchServerLocation,
                 bypassRussia = desktop.bypassRussia,
                 outboundAdapter = desktop.outboundAdapter,
             ))

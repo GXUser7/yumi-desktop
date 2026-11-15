@@ -24,6 +24,10 @@ import com.mydrop.vpn.core.net.isNumericAddress
     /** Block everything outside the tunnel until an explicit disconnect. Off by default: a kill
      *  switch nobody asked for looks exactly like a broken internet connection. */
     val killSwitch: Boolean = false,
+    /** While connected, the service moves the system timezone onto the selected server's and
+     *  silences the system's location sources, so lookups answer with the server's whereabouts;
+     *  both are restored on disconnect. Off by default: the system clock visibly moves. */
+    val matchServerLocation: Boolean = false,
     /** Russian sites and addresses around the tunnel, by the geo databases, above every
      *  application rule. Inert until the databases are downloaded. */
     val bypassRussia: Boolean = true,
@@ -50,12 +54,12 @@ object RuleValidation {
     }
 
     /**
-     * An application as a process name: `Telegram.exe`.
+     * An application as a process name: `Telegram.exe` on Windows, `telegram` on unix.
      *
-     * Accepts what a person types — `telegram`, `Telegram.exe`, a whole path pasted from Explorer —
-     * and keeps only the file name, with `.exe` on the end so the list reads the way Task Manager
-     * does. The case is kept as given: a name picked from the list is spelt as it is on disk, and
-     * the service offers a hand-typed one in the spellings people use.
+     * Accepts what a person types — `telegram`, `Telegram.exe`, a whole path pasted from a file
+     * manager — and keeps only the file name, with `.exe` on the end where that is what a process
+     * is called. The case is kept as given: a name picked from the list is spelt as it is on disk,
+     * and the service offers a hand-typed one in the spellings people use.
      */
     fun application(raw: String): String {
         val trimmed = raw.trim().trim('"')
@@ -63,6 +67,8 @@ object RuleValidation {
         val name = trimmed.substringAfterLast('\\').substringAfterLast('/')
         require(name.isNotBlank() && name.trim('.').isNotEmpty() && name.length <= 255) { "Invalid application" }
         require(name.none { it in "<>:\"|?*" || it.code < 0x20 }) { "Invalid application" }
-        return if (name.endsWith(".exe", ignoreCase = true)) name else "$name.exe"
+        val windows = System.getProperty("os.name").startsWith("Windows")
+        if (windows) return if (name.endsWith(".exe", ignoreCase = true)) name else "$name.exe"
+        return name
     }
 }

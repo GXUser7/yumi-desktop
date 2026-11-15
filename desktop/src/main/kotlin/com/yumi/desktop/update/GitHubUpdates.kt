@@ -14,8 +14,21 @@ import java.nio.file.StandardCopyOption.*
 import java.security.MessageDigest
 
 data class DesktopRelease(val version: String, val notes: String, val installerUrl: String, val checksumUrl: String, val size: Long) {
-    val fileName get() = "Yumi-Desktop-$version-windows-x64-setup.exe"
+    val fileName get() = assetName(version)
     val pageUrl get() = "https://github.com/GXUser7/yumi-desktop/releases/tag/v$version"
+}
+
+/**
+ * The asset this build installs, spelled for the platform it runs on; a release carries all of
+ * them. Linux picks between the two package formats by the system it finds itself on, the same
+ * choice the elevated installer would make.
+ */
+fun assetName(version: String): String = when {
+    System.getProperty("os.name").startsWith("Windows") -> "Yumi-Desktop-$version-windows-x64-setup.exe"
+    System.getProperty("os.name") == "Mac OS X" -> "Yumi-Desktop-$version-macos-arm64.pkg"
+    File("/etc/debian_version").isFile || File("/etc/alpine-release").isFile || File("/etc/lsb-release").isFile ->
+        "Yumi-Desktop-$version-linux-amd64.deb"
+    else -> "Yumi-Desktop-$version-linux-amd64.rpm"
 }
 
 data class VerifiedUpdate(val release: DesktopRelease, val file: File, val sha256: String) {
@@ -119,7 +132,7 @@ class GitHubUpdates(private val directory: File, private val transport: UpdateTr
                 val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
                 if (!tag.matches(Regex("v[0-9]+\\.[0-9]+\\.[0-9]+"))) return@mapNotNull null
                 val version = tag.drop(1)
-                val name = "Yumi-Desktop-$version-windows-x64-setup.exe"
+                val name = assetName(version)
                 val assets = release["assets"]?.jsonArray ?: return@mapNotNull null
                 fun asset(file: String) = assets.map { it.jsonObject }.firstOrNull { it["name"]?.jsonPrimitive?.contentOrNull == file }
                 val installer = asset(name) ?: return@mapNotNull null

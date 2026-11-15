@@ -26,6 +26,10 @@ type Options struct {
     // Block everything outside the tunnel from the moment of connecting until an explicit
     // disconnect, including after the worker dies. Enforced by the service; see firewall/.
     KillSwitch bool `json:"killSwitch"`
+    // While connected, the service moves the system timezone onto the server's and silences the
+    // system's location sources, restoring both on disconnect. Windows: system_windows.go; the
+    // unix builds carry the same contract over timedatectl/systemsetup.
+    MatchLocation bool `json:"matchLocation"`
     // Russian sites and addresses go around the tunnel, by the geo databases, whatever the
     // application rules say. Inert until the databases have been downloaded.
     BypassRussia bool `json:"bypassRussia"`
@@ -47,6 +51,10 @@ type Request struct {
     NodeID string `json:"nodeId"`
     Outbound map[string]any `json:"outbound"`
     Options *Options `json:"options"`
+    // The active server's country, as the app reads it off the flag in its name. Top level
+    // rather than inside Options so a hot switch to a server in another country keeps the
+    // worker: only this field changes, and the timezone follows it live. See validCountry.
+    ServerCountry string `json:"serverCountry"`
 }
 type Status struct {
     Version int `json:"version"`
@@ -72,9 +80,15 @@ type Status struct {
     GeoUpdatedAt int64 `json:"geoUpdatedAt"`
     GeoBytes int64 `json:"geoBytes"`
     GeoError string `json:"geoError,omitempty"`
+    // The location mode as the machine sees it: the timezone the service has put the system
+    // into, or the sentence about why it could not. Empty whenever the mode is off.
+    SysTimezone string `json:"sysTimezone,omitempty"`
+    SysNote string `json:"sysNote,omitempty"`
     // The worker's adapter, reported to the supervisor and never past it: the kill switch has to
-    // let this interface through and the supervisor strips it before answering the app.
+    // let this interface through and the supervisor strips it before answering the app. Windows
+    // reports the wintun LUID; unix reports the interface name the core created.
     TunLUID uint64 `json:"tunLuid,omitempty"`
+    TunName string `json:"tunName,omitempty"`
     // Only answered for the "adapters" command; the once-a-second status poll does not carry them.
     Adapters []Adapter `json:"adapters,omitempty"`
 }
@@ -92,7 +106,17 @@ func decodeRequest(data []byte) (Request, error) {
     if r.Options == nil || r.NodeID == "" || len(r.NodeID) > 128 { return r, errors.New("invalid_options") }
     if err := validateOptions(*r.Options); err != nil { return r, err }
     if err := validateOutbound(r.Outbound); err != nil { return r, err }
+    if !validCountry(r.ServerCountry) { return r, errors.New("invalid_country") }
     return r, nil
+}
+
+// A server's country, as the app reads it off the flag in its name: two capital letters, or
+// nothing at all — a server without a flag only skips the timezone half of the location mode.
+func validCountry(code string) bool {
+    if code == "" { return true }
+    if len(code) != 2 { return false }
+    for _, r := range code { if r < 'A' || r > 'Z' { return false } }
+    return true
 }
 
 func validateOptions(o Options) error {
@@ -118,9 +142,11 @@ func validateOptions(o Options) error {
 }
 
 // Yumi's own adapter is never a way out. The prefix form covers the per-connection names older
-// builds used; both the route picker and request validation need this answer.
+// builds used, and the exact current name covers every platform — the name differs per OS, and
+// macOS names the tunnel after the utun unit it was given. Both the route picker and request
+// validation need this answer.
 func ownAdapter(name string) bool {
-    return name != "" && (strings.EqualFold(name, "Yumi") || strings.HasPrefix(strings.ToLower(name), "yumi-"))
+    return name != "" && (strings.EqualFold(name, "Yumi") || strings.EqualFold(name, tunAdapterName()) || strings.HasPrefix(strings.ToLower(name), "yumi-"))
 }
 
 func validHost(h string) bool {
@@ -340,7 +366,7 @@ func buildConfig(r Request, port int, user, password string, geo bool, outbound 
         },
         "dns":obj{"servers":[]string{dns},"queryStrategy":strategy,"tag":"dns-in"},
         "inbounds":[]obj{
-            {"tag":"tun-in","protocol":"tun","settings":obj{"name":"Yumi","desc":"Yumi VPN","mtu":o.MTU,
+            {"tag":"tun-in","protocol":"tun","settings":obj{"name":tunAdapterName(),"desc":"Yumi VPN","mtu":o.MTU,
                 "gateway":gateway, "dns":[]string{tunDNSV4},
                 "autoSystemRoutingTable":routes,"autoOutboundsInterface":outboundInterface},
                 "sniffing":obj{"enabled":true,"destOverride":[]string{"http","tls","quic"},"routeOnly":true}},

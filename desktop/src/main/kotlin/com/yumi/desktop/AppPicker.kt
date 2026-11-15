@@ -33,6 +33,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.yumi.desktop.model.RuleValidation
 import com.yumi.desktop.platform.AppCatalog
 import com.yumi.desktop.platform.DesktopApp
+import com.yumi.desktop.platform.DesktopPlatform
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import javax.swing.JFileChooser
@@ -150,7 +151,13 @@ fun AppPickerDialog(m: DesktopModel, selected: List<String>, onDone: (List<Strin
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     TextButton(onClick = {
                         val chooser = JFileChooser()
-                        chooser.fileFilter = FileNameExtensionFilter(m.text("Программы Windows (*.exe)", "Windows programs (*.exe)"), "exe")
+                        if (DesktopPlatform.isWindows) {
+                            chooser.fileFilter = FileNameExtensionFilter(m.text("Программы Windows (*.exe)", "Windows programs (*.exe)"), "exe")
+                        } else {
+                            // A mac program is a directory, a Linux one a bare binary; anything the
+                            // file manager shows is a name the rule can carry.
+                            chooser.fileSelectionMode = JFileChooser.FILES_AND_DIRECTORIES
+                        }
                         if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
                             runCatching { RuleValidation.application(chooser.selectedFile.name) }.getOrNull()?.let { name ->
                                 if (name.lowercase() !in chosenKeys) chosen = chosen + name

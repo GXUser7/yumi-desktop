@@ -278,6 +278,13 @@ class ProfileRepository(
      * Replaces a subscription's servers with a freshly fetched set. Nodes that survive keep
      * their identity — and therefore the user's selection and measured latency — because ids
      * are derived from the endpoint rather than from list position.
+     *
+     * The selection itself is decided before anything is pinned, then kept: a refresh that drops
+     * the selected server — a rename the name match cannot follow, a provider that deleted it,
+     * or an empty answer — leaves the old row standing in the list, selected, exactly as the
+     * tunnel may still be carrying it. The row is the old node itself, so a reconnect dials what
+     * the screen shows. It leaves on the first refresh after the user picks another server, which
+     * no longer has to keep it.
      */
     fun applySubscriptionUpdate(
         subscriptionId: String,
@@ -302,7 +309,14 @@ class ProfileRepository(
             removed = (previousIds - fetchedIds).size
 
             val others = current.nodes.filterNot { it.subscriptionId == subscriptionId }
-            val nodes = (others + fetched).distinctById()
+            val refreshed = (others + fetched).distinctById()
+
+            val selection = survivingSelection(current, refreshed)
+
+            val kept = selection
+                ?.takeIf { id -> refreshed.none { it.id == id } }
+                ?.let { id -> current.nodes.firstOrNull { it.id == id } }
+            val nodes = (refreshed + listOfNotNull(kept)).distinctById()
 
             current.copy(
                 nodes = nodes,
@@ -320,7 +334,7 @@ class ProfileRepository(
                         )
                     }
                 },
-                selectedNodeId = survivingSelection(current, nodes),
+                selectedNodeId = selection,
                 latencies = current.latencies.filterKeys { id -> nodes.any { it.id == id } },
             )
         }
@@ -338,12 +352,16 @@ class ProfileRepository(
      * The naive answer to that — fall back to the first node in the list — was caught in a field
      * journal doing real harm. A working tunnel on Belgium survived a routine auto-refresh by
      * being moved to France, which was dead; twenty seconds of no internet followed, and neither
-     * the switch nor its reason was anything the user had asked for or could see.
+     * the switch nor its reason was anything the user had asked for or could see. An empty answer
+     * was caught doing the same later, from the other side: every row vanished, the selection
+     * read as null, and the screen said no server was chosen while the tunnel quietly kept
+     * carrying the one it had.
      *
-     * So the name is used as a continuity key when the id fails, within the same subscription.
-     * It is a weaker key than the id and can miss — a provider that renames *and* re-addresses in
-     * the same refresh gets the old behaviour — but it cannot pick the wrong server, only fail to
-     * find the right one.
+     * So the name is used as a continuity key when the id fails, within the same subscription —
+     * it cannot pick the wrong server, only fail to find the right one. And when even the name
+     * misses, the selection stays exactly what it was: [applySubscriptionUpdate] pins that row
+     * into the list, so the id keeps resolving, and the user — not a background task — decides
+     * what comes next.
      */
     private fun survivingSelection(current: ProfileState, nodes: List<ProxyNode>): String? {
         val selectedId = current.selectedNodeId ?: return nodes.firstOrNull()?.id
@@ -355,7 +373,7 @@ class ProfileRepository(
                 it.subscriptionId == previous.subscriptionId && it.name == previous.name
             }
         }
-        return sameName?.id ?: nodes.firstOrNull()?.id
+        return sameName?.id ?: selectedId
     }
 
     fun recordSubscriptionError(subscriptionId: String, message: String) = store.update { current ->

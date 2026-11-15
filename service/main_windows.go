@@ -3,354 +3,32 @@
 package main
 
 import (
-    "bufio"
-    "context"
-    "encoding/binary"
-    "encoding/json"
-    "errors"
-    "flag"
-    "io"
-    "net"
-    "net/http"
-    "os"
-    "os/exec"
-    "path/filepath"
-    "reflect"
-    "sync"
-    "sync/atomic"
-    "syscall"
-    "time"
+	"errors"
+	"flag"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"syscall"
+	"time"
 
-    "github.com/GXUser7/yumi-desktop/service/firewall"
-    "github.com/Microsoft/go-winio"
-    "golang.org/x/sys/windows"
-    "golang.org/x/sys/windows/svc"
-    "golang.org/x/sys/windows/svc/mgr"
+	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const serviceName="YumiTunnel"
 const pipeName=`\\.\pipe\YumiTunnel-v1`
 
-type supervisor struct {
-    mu sync.Mutex
-    commands sync.Mutex
-    status Status
-    child *exec.Cmd
-    stdin io.WriteCloser
-    done chan struct{}
-    generation uint64
-    options *Options
-    geoEnabled bool
-    outboundName string
-    // The live worker's adapter outlives a firewall session while VPN is switched off.
-    // Guarded by mu; unlike shieldLUID it is cleared only with the worker.
-    adapterLUID uint64
+// The tunnel's own adapter, as wintun names it. The same name every run: wintun derives a stable
+// GUID from it, which is why the kill switch usually re-finds last run's interface.
+func tunAdapterName() string { return "Yumi" }
 
-    // The kill switch. Its own lock, taken before mu whenever both are needed and never while mu
-    // is held, because installing filters is a round trip to the filtering engine and the status
-    // poll must not wait behind it. shieldUp mirrors shield != nil for the status, which reads it
-    // under mu and so cannot take shieldMu.
-    shieldMu sync.Mutex
-    shield *firewall.Firewall
-    shieldLUID uint64
-    shieldLAN bool
-    shieldUp atomic.Bool
-
-    // Where the routing databases live, and the download in flight; see geo.go. Guarded by mu.
-    geoDir string
-    geoUpdating bool
-    geoError string
+// A console window flashing behind the worker is exactly the kind of thing someone notices.
+func childProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{HideWindow: true}
 }
-
-func (s *supervisor) snapshot() Status {
-    s.mu.Lock()
-    status:=s.status
-    status.GeoUpdating=s.geoUpdating;status.GeoError=s.geoError
-    dir:=s.geoDir
-    s.mu.Unlock()
-    geo:=inspectGeo(dir)
-    status.GeoReady=geo.Ready;status.GeoBytes=geo.Bytes;status.GeoUpdatedAt=geo.UpdatedAt
-    status.KillSwitch=s.shieldUp.Load()
-    status.TunLUID=0
-    status.Adapters=nil
-    return status
-}
-
-// Keep the adapter identity even when the shield is down; a resumed worker already owns its
-// routes and must be permitted immediately, without waiting for another periodic status frame.
-func (s *supervisor) recordWorkerStatus(generation uint64, status Status) uint64 {
-    s.mu.Lock();defer s.mu.Unlock()
-    if s.generation!=generation { return 0 }
-    luid:=status.TunLUID
-    status.TunLUID=0
-    s.status=status
-    if luid!=0 { s.adapterLUID=luid }
-    return luid
-}
-
-/*
-Raises the kill switch, or moves it onto a new adapter.
-
-The new filters go in before the old ones come out, so there is no instant without a kill switch;
-while both are installed the old one still blocks an adapter it does not know, which costs a few
-milliseconds of nothing rather than a few milliseconds of leak.
-*/
-func (s *supervisor) raiseShield(luid uint64, lan bool) error {
-    s.shieldMu.Lock();defer s.shieldMu.Unlock()
-    return s.raiseShieldLocked(luid,lan)
-}
-
-func (s *supervisor) raiseShieldLocked(luid uint64, lan bool) error {
-    if s.shield!=nil && s.shieldLUID==luid && s.shieldLAN==lan { return nil }
-    next,err:=firewall.Enable(luid,lan)
-    if err!=nil { return err }
-    s.shield.Close()
-    s.shield,s.shieldLUID,s.shieldLAN=next,luid,lan
-    s.shieldUp.Store(true)
-    return nil
-}
-
-func (s *supervisor) releaseShield() {
-    s.shieldMu.Lock();defer s.shieldMu.Unlock()
-    s.shield.Close()
-    s.shield=nil;s.shieldLUID=0
-    s.shieldUp.Store(false)
-}
-
-/*
-The worker's adapter, as soon as the worker reports it: the kill switch is moved onto it if it is up
-and this is still the current tunnel. Wintun names the adapter by a GUID derived from its name, so
-this is normally the same interface as last time and nothing changes.
-*/
-func (s *supervisor) adoptAdapter(generation, luid uint64) {
-    s.shieldMu.Lock()
-    s.mu.Lock();current:=s.generation==generation;s.mu.Unlock()
-    // Keep the check and replacement under the same shield lock. An explicit disconnect may
-    // otherwise lower the shield after this check, only for this status frame to raise it again.
-    if s.shield==nil || s.shieldLUID==luid || !current { s.shieldMu.Unlock();return }
-    // A failure leaves the old filters in place, which block this adapter as well: the tunnel then
-    // carries nothing rather than something leaking around it. It is written down for whoever
-    // reads the journal.
-    err:=s.raiseShieldLocked(luid,s.shieldLAN)
-    s.shieldMu.Unlock()
-    if err!=nil { journalLine("kill switch could not follow the adapter: "+detailOf(err)) }
-}
-
-/** Starts a database download unless one is already running; the status reports how it went. */
-func (s *supervisor) updateGeo() {
-    s.mu.Lock()
-    if s.geoUpdating || s.geoDir=="" { s.mu.Unlock();return }
-    s.geoUpdating=true;s.geoError="";dir:=s.geoDir
-    s.mu.Unlock()
-    go func(){
-        ctx,cancel:=context.WithTimeout(context.Background(),10*time.Minute);defer cancel()
-        err:=secureDirectory(dir)
-        if err==nil { err=downloadGeo(ctx,&http.Client{Timeout:8*time.Minute},dir,geoAssets) }
-        s.mu.Lock();s.geoUpdating=false;if err!=nil{s.geoError=detailOf(err)};s.mu.Unlock()
-    }()
-}
-
-func (s *supervisor) stop() {
-    s.mu.Lock();child,input,done:=s.child,s.stdin,s.done
-    s.generation++;s.child=nil;s.stdin=nil;s.done=nil;s.options=nil;s.adapterLUID=0
-    s.status=Status{Version:1,State:"disconnecting"};s.mu.Unlock()
-    if input!=nil { _=input.Close() }
-    if child!=nil { select {case <-done:case <-time.After(8*time.Second):_=child.Process.Kill();<-done} }
-    s.mu.Lock();s.status=Status{Version:1,State:"disconnected"};s.mu.Unlock()
-}
-
-func (s *supervisor) connect(r Request) error {
-	s.mu.Lock()
-	dir := s.geoDir
-	s.mu.Unlock()
-	geo := r.Options.BypassRussia && inspectGeo(dir).Ready
-	outbound, outboundErr := outboundInterface(r.Options.OutboundAdapter)
-	if outboundErr != nil {
-		if r.Options.OutboundAdapter != "" {
-			return errorWithDetail{"adapter_unavailable", outboundErr}
-		}
-		outbound = ""
-	}
-	s.mu.Lock()
-	hot := s.child != nil && reflect.DeepEqual(s.options, r.Options) && s.geoEnabled == geo && s.outboundName == outbound &&
-		(s.status.State == "connected" || s.status.State == "disconnected")
-	previous, currentInput, workerLUID := s.status, s.stdin, s.adapterLUID
-	s.mu.Unlock()
-	if hot {
-		if r.Options.KillSwitch {
-			if err := s.raiseShield(workerLUID, r.Options.BypassLAN); err != nil {
-				return errorWithDetail{"kill_switch_failed", err}
-			}
-		} else {
-			s.releaseShield()
-		}
-		initial := switchingStatus(previous,r.NodeID)
-		config := buildConfig(r, initial.ProbePort, initial.ProbeUser, initial.ProbePassword, geo, outbound)
-		// A live switch stays connected with the old server until the worker atomically
-		// publishes the new one. Do not reset counters, the timer or the UI's rate history.
-		if previous.State != "connected" { s.mu.Lock();s.status=initial;s.mu.Unlock() }
-		if err := json.NewEncoder(currentInput).Encode(obj{"config": config, "status": initial}); err != nil {
-			return errors.New("worker_unavailable")
-		}
-		return nil
-	}
-	s.stop()
-	port, err := freePort()
-	if err != nil {
-		return errors.New("probe_port_unavailable")
-	}
-	// The kill switch goes up before the worker starts and stays up through whatever happens to
-	// it; only a disconnect lowers it. Turning the setting off takes effect on the next connect.
-	if r.Options.KillSwitch {
-		s.shieldMu.Lock()
-		luid := s.shieldLUID
-		s.shieldMu.Unlock()
-		if err := s.raiseShield(luid, r.Options.BypassLAN); err != nil {
-			return errorWithDetail{"kill_switch_failed", err}
-		}
-	} else {
-		s.releaseShield()
-	}
-	initial := Status{Version: 1, State: "connecting", NodeID: r.NodeID, ProbePort: port, ProbeUser: randomSecret(), ProbePassword: randomSecret()}
-	config := buildConfig(r, port, initial.ProbeUser, initial.ProbePassword, geo, outbound)
-	exe, err := os.Executable()
-	if err != nil {
-		return errors.New("worker_unavailable")
-	}
-	child := exec.Command(exe, "--worker")
-	child.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	// Where the core looks for geoip.dat and geosite.dat; the name is the core's own
-	// (common/platform: xray.location.asset, spelt as an environment variable).
-	if dir != "" {
-		child.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+dir)
-	}
-	// Everything the worker says on stderr - a Go panic, a Wintun driver refusing to load, the
-	// core's own complaints - used to go to io.Discard. That is the one thing a tunnel that will
-	// not start must not do: the app can only report "could not start", and the sentence that
-	// says why existed for a moment and was thrown away. Failing to open the journal is not worth
-	// failing a connection over, so a broken log falls back to discarding as before.
-	child.Stderr = workerJournal()
-	input, err := child.StdinPipe()
-	if err != nil {
-		return errors.New("worker_unavailable")
-	}
-	output, err := child.StdoutPipe()
-	if err != nil {
-		input.Close()
-		return errors.New("worker_unavailable")
-	}
-	if err = child.Start(); err != nil {
-		input.Close()
-		output.Close()
-		return errors.New("worker_unavailable")
-	}
-	done := make(chan struct{})
-	s.mu.Lock()
-	s.child = child
-	s.stdin = input
-	s.done = done
-	s.status = initial
-	s.options = r.Options
-	s.geoEnabled = geo
-	s.outboundName = outbound
-	generation := s.generation
-	s.mu.Unlock()
-	go func() {
-		scanner := bufio.NewScanner(output)
-		scanner.Buffer(make([]byte, 4096), maxFrame)
-		for scanner.Scan() {
-			var status Status
-			if json.Unmarshal(scanner.Bytes(), &status) == nil && status.Version == 1 {
-				if luid := s.recordWorkerStatus(generation, status); luid != 0 {
-					s.adoptAdapter(generation, luid)
-				}
-			}
-		}
-		_ = child.Wait()
-		s.mu.Lock()
-		if s.generation == generation {
-			s.adapterLUID = 0
-			if s.status.State != "failed" {
-				s.status = Status{Version: 1, State: "failed", Error: "worker_stopped"}
-			}
-		}
-		s.mu.Unlock()
-		close(done)
-	}()
-	err = json.NewEncoder(input).Encode(obj{"config": config, "status": initial})
-	if err != nil {
-		s.stop()
-		return errors.New("worker_unavailable")
-	}
-	return nil
-}
-
-func (s *supervisor) handle(r Request) Status {
-	if r.Command == "status" {
-		return s.snapshot()
-	}
-	if r.Command == "adapters" {
-		s.mu.Lock()
-		status := s.status
-		s.mu.Unlock()
-		status.Adapters = adapterList()
-		status.TunLUID = 0
-		status.KillSwitch = s.shieldUp.Load()
-		return status
-	}
-	s.commands.Lock()
-	defer s.commands.Unlock()
-	switch r.Command {
-	case "disconnect":
-		s.mu.Lock()
-		input := s.stdin
-		running := s.child != nil
-		already := s.status.State == "disconnected"
-		s.mu.Unlock()
-		if running && !already {
-			s.mu.Lock();s.status.State="disconnecting";s.mu.Unlock()
-			if err := json.NewEncoder(input).Encode(obj{"disconnect": true}); err != nil { s.stop() }
-		} else if !running {
-			s.stop()
-		}
-		s.releaseShield()
-	case "geo_update":
-		s.updateGeo()
-	case "connect":
-		if err := s.connect(r); err != nil {
-			failed := Status{Version: 1, State: "failed", Error: err.Error(), KillSwitch: s.shieldUp.Load()}
-			var detailed errorWithDetail
-			if errors.As(err, &detailed) {
-				failed.Error = detailed.code
-				failed.Detail = detailOf(detailed.cause)
-			}
-			s.mu.Lock()
-			s.status = failed
-			s.mu.Unlock()
-			return s.snapshot()
-		}
-	}
-	return s.snapshot()
-}
-
-/**
- * Where the worker's stderr goes, capped and reopened each time.
- *
- * Under ProgramData rather than beside the executable: the service runs as LocalSystem and could
- * write into Program Files, but a program directory that changes under a running install is the
- * kind of thing installers and anti-malware both take badly.
- *
- * Truncated rather than rotated once it passes a megabyte. A ring of files would be the tidier
- * answer and this is a log nobody reads until something breaks, at which point what matters is
- * the last failure and not the previous hundred.
- */
-func journalLine(line string) {
-    if w,ok:=workerJournal().(*os.File);ok { _,_=w.WriteString(line+"\n");_=w.Close() }
-}
-
-/** A failure code for the app, carrying the sentence the library wrote for the detail line. */
-type errorWithDetail struct{ code string; cause error }
-func (e errorWithDetail) Error() string { return e.code }
 
 /*
 The routing databases' directory, under ProgramData and closed to everyone but SYSTEM and
@@ -374,6 +52,17 @@ func secureDirectory(dir string) error {
         windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,nil,nil,dacl,nil)
 }
 
+/*
+Where the worker's stderr goes, capped and reopened each time.
+
+Under ProgramData rather than beside the executable: the service runs as LocalSystem and could
+write into Program Files, but a program directory that changes under a running install is the
+kind of thing installers and anti-malware both take badly.
+
+Truncated rather than rotated once it passes a megabyte. A ring of files would be the tidier
+answer and this is a log nobody reads until something breaks, at which point what matters is
+the last failure and not the previous hundred.
+*/
 func workerJournal() io.Writer {
     root:=os.Getenv("ProgramData");if root==""{return io.Discard}
     dir:=filepath.Join(root,"Yumi Desktop")
@@ -403,29 +92,23 @@ func authenticated(conn net.Conn,owner string) bool {
     user,err:=token.GetTokenUser();return err==nil && user.User.Sid.String()==owner
 }
 
-func serveClient(conn net.Conn,owner string,s *supervisor) {
-    defer conn.Close()
-    _=conn.SetDeadline(time.Now().Add(15*time.Second))
-    if !authenticated(conn,owner){return}
-    var size uint32
-    if binary.Read(conn,binary.BigEndian,&size)!=nil || size==0 || size>maxFrame{return}
-    data:=make([]byte,size);if _,err:=io.ReadFull(conn,data);err!=nil{return}
-    request,err:=decodeRequest(data)
-    var status Status
-    if err!=nil{status=Status{Version:1,State:"failed",Error:err.Error()}}else{status=s.handle(request)}
-    reply,_:=json.Marshal(status)
-    _=binary.Write(conn,binary.BigEndian,uint32(len(reply)));_,_=conn.Write(reply)
+// Owner-only access and remote-client rejection are both enforced by the pipe implementation.
+func listenIPC(owner string) (net.Listener,error) {
+    return winio.ListenPipe(pipeName,&winio.PipeConfig{SecurityDescriptor:"D:P(A;;GA;;;SY)(A;;GA;;;"+owner+")",InputBufferSize:65536,OutputBufferSize:65536})
 }
 
 type tunnelService struct{owner string}
 func (t *tunnelService) Execute(_ []string,requests <-chan svc.ChangeRequest,changes chan<- svc.Status)(bool,uint32){
     changes<-svc.Status{State:svc.StartPending}
-    // Owner-only access and remote-client rejection are both enforced by the pipe implementation.
-    listener,err:=winio.ListenPipe(pipeName,&winio.PipeConfig{SecurityDescriptor:"D:P(A;;GA;;;SY)(A;;GA;;;"+t.owner+")",InputBufferSize:65536,OutputBufferSize:65536})
+    // A previous life of this service may have died with the location mode applied and its
+    // snapshot still on disk. Before anything else, the machine goes back to how that snapshot
+    // found it.
+    restoreAbandonedLocation()
+    listener,err:=listenIPC(t.owner)
     if err!=nil{return true,1}
-    s:=&supervisor{status:Status{Version:1,State:"disconnected"},geoDir:geoDirectory()}
-    defer func(){listener.Close();s.commands.Lock();defer s.commands.Unlock();s.stop();s.releaseShield()}()
-    go func(){for{conn,err:=listener.Accept();if err!=nil{return};go serveClient(conn,t.owner,s)}}()
+    s:=newSupervisor()
+    defer shutdownSupervisor(s)
+    serveUntilClosed(listener,t.owner,s)
     current:=svc.Status{State:svc.Running,Accepts:svc.AcceptStop|svc.AcceptShutdown}
     changes<-current
     for request:=range requests{switch request.Cmd{case svc.Interrogate:changes<-current;case svc.Stop,svc.Shutdown:changes<-svc.Status{State:svc.StopPending};return false,0}}

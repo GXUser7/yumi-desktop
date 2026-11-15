@@ -57,6 +57,7 @@ func liveConnectedStatus(previous, requested Status, now int64) Status {
 	next := requested
 	next.State = "connected"
 	next.TunLUID = previous.TunLUID
+	next.TunName = previous.TunName
 	next.ConnectedAt = now
 	if previous.State == "connected" {
 		next.ConnectedAt = previous.ConnectedAt

@@ -7,6 +7,8 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.TimeUnit
+import javax.imageio.ImageIO
 import javax.swing.Icon
 import javax.swing.ImageIcon
 import javax.swing.filechooser.FileSystemView
@@ -28,7 +30,7 @@ data class DesktopApp(
  * Finds the programs on this machine, so that choosing one is a search and a click rather than a
  * trip through Program Files with a file dialog.
  *
- * Four places, each covering what the others miss:
+ * Four places on Windows, each covering what the others miss:
  *
  * - **running processes** — whatever is open right now, which is usually what someone is looking
  *   at when they decide it should go around the tunnel;
@@ -37,14 +39,43 @@ data class DesktopApp(
  * - **installed programs** in the registry — their display names and the icon each one declares,
  *   which is nearly always the main executable.
  *
+ * On Linux the same answer comes from `.desktop` entries — the free-desktop's own answer to a
+ * Start menu — beside whatever is running; on macOS from the applications folder and each bundle's
+ * Info.plist. Icons are read only where they are plain image files, which is most of Linux; a
+ * bundle's `.icns` is converted once through the system's own `sips`, and where none of that
+ * answers, the UI falls back to a letter and nobody is the worse.
+ *
  * Nothing here is privileged and nothing is written: it reads what the signed-in user can read.
  * Each source fails on its own — a shortcut that will not parse or a registry key that is gone
  * costs that entry, not the list.
  */
 object AppCatalog {
 
-    fun discover(): List<DesktopApp> {
-        if (!DesktopPlatform.isWindows) return runningProcesses()
+    fun discover(): List<DesktopApp> = if (!DesktopPlatform.isWindows) unixDiscover() else windowsDiscover()
+
+    private fun unixDiscover(): List<DesktopApp> {
+        val byProcess = LinkedHashMap<String, DesktopApp>()
+        fun offer(app: DesktopApp) {
+            val key = app.process.lowercase()
+            val known = byProcess[key]
+            byProcess[key] = when {
+                known == null -> app
+                // The friendlier name wins, and "running" is sticky: it is the most useful fact.
+                else -> known.copy(
+                    name = if (known.name.equals(known.process, true)) app.name else known.name,
+                    path = known.path ?: app.path,
+                    running = known.running || app.running,
+                )
+            }
+        }
+        runCatching { unixInstalledApps().forEach(::offer) }
+        runCatching { runningProcesses().forEach(::offer) }
+        return byProcess.values
+            .filterNot { isNoise(it) }
+            .sortedWith(compareByDescending<DesktopApp> { it.running }.thenBy { it.name.lowercase() })
+    }
+
+    private fun windowsDiscover(): List<DesktopApp> {
         val byProcess = LinkedHashMap<String, DesktopApp>()
         fun offer(app: DesktopApp) {
             val key = app.process.lowercase()
@@ -73,10 +104,99 @@ object AppCatalog {
         stream.toList().mapNotNull { process ->
             val command = runCatching { process.info().command().orElse(null) }.getOrNull() ?: return@mapNotNull null
             val file = File(command)
-            if (!file.name.endsWith(".exe", true)) return@mapNotNull null
-            if (isSystemPath(file.path)) return@mapNotNull null
+            if (DesktopPlatform.isWindows) {
+                if (!file.name.endsWith(".exe", true)) return@mapNotNull null
+                if (isSystemPath(file.path)) return@mapNotNull null
+            } else if (isUnixNoise(file.name)) {
+                return@mapNotNull null
+            }
             DesktopApp(file.name, prettify(file.name), file.path, running = true)
         }.distinctBy { it.process.lowercase() }
+    }
+
+    private fun unixInstalledApps(): List<DesktopApp> =
+        if (DesktopPlatform.isMac) macInstalledApps() else linuxInstalledApps()
+
+    private fun linuxInstalledApps(): List<DesktopApp> {
+        val roots = listOf(
+            File("/usr/share/applications"),
+            File("/usr/local/share/applications"),
+            File("/var/lib/flatpak/exports/share/applications"),
+            File(System.getProperty("user.home"), ".local/share/applications"),
+            File(System.getProperty("user.home"), ".local/share/flatpak/exports/share/applications"),
+        )
+        return roots.flatMap { root ->
+            root.listFiles { f -> f.isFile && f.name.endsWith(".desktop") }?.toList() ?: emptyList()
+        }.mapNotNull(::parseDesktopEntry)
+    }
+
+    private fun parseDesktopEntry(file: File): DesktopApp? {
+        val text = runCatching { file.readText() }.getOrNull() ?: return null
+        if (Regex("^NoDisplay=true", RegexOption.MULTILINE).containsMatchIn(text)) return null
+        val name = Regex("^Name=(.*)$", RegexOption.MULTILINE).find(text)?.groupValues?.get(1)?.trim()
+        val exec = Regex("^Exec=(.*)$", RegexOption.MULTILINE).find(text)?.groupValues?.get(1)?.trim() ?: return null
+        // Exec carries field codes (%f, %u) and the occasional quoting; what the core matches is
+        // the program the line runs. A token with a path in it is more specific than `flatpak`.
+        val tokens = exec.split(' ').map { it.trim().trim('"') }.filter { it.isNotEmpty() && !it.startsWith("%") }
+        val binary = tokens.firstOrNull { it.contains('/') } ?: tokens.firstOrNull() ?: return null
+        val process = File(binary).name
+        if (process.isEmpty()) return null
+        return DesktopApp(process, name ?: prettify(process), desktopIcon(text) ?: binary, running = false)
+    }
+
+    /** The entry's icon resolved to a file ImageIO can read, or null where the theme does not. */
+    private fun desktopIcon(entry: String): String? {
+        val icon = Regex("^Icon=(.*)$", RegexOption.MULTILINE).find(entry)?.groupValues?.get(1)?.trim() ?: return null
+        if (File(icon).isFile) return icon
+        val sizes = listOf("256x256", "128x128", "64x64", "48x48", "32x32")
+        val roots = listOf("/usr/share/icons/hicolor", "/usr/local/share/icons/hicolor")
+        for (root in roots) for (size in sizes) {
+            val candidate = File("$root/$size/apps/$icon.png")
+            if (candidate.isFile) return candidate.path
+        }
+        val pixmap = File("/usr/share/pixmaps/$icon.png")
+        return pixmap.takeIf { it.isFile }?.path
+    }
+
+    private fun macInstalledApps(): List<DesktopApp> {
+        val roots = listOf(File("/Applications"), File("/System/Applications"))
+        return roots.flatMap { root -> root.listFiles()?.filter { it.isDirectory && it.name.endsWith(".app") } ?: emptyList() }
+            .mapNotNull { bundle ->
+                val plist = File(bundle, "Contents/Info.plist")
+                val text = runCatching { plist.readText() }.getOrNull() ?: return@mapNotNull null
+                fun value(key: String) = Regex("<key>$key</key>\\s*<string>(.*?)</string>").find(text)?.groupValues?.get(1)?.trim()
+                val name = value("CFBundleName") ?: value("CFBundleDisplayName") ?: bundle.name.removeSuffix(".app")
+                val executable = value("CFBundleExecutable") ?: name
+                if (executable.isEmpty()) return@mapNotNull null
+                DesktopApp(executable, name, macIcon(bundle, value("CFBundleIconFile") ?: value("CFBundleIconName")) ?: bundle.path, running = false)
+            }
+    }
+
+    /** A bundle's `.icns` turned into a png once, by the system's own converter, into our cache. */
+    private fun macIcon(bundle: File, iconFile: String?): String? {
+        if (iconFile == null) return null
+        val spelled = if (iconFile.endsWith(".icns")) iconFile else "$iconFile.icns"
+        val icns = File(bundle, "Contents/Resources/$spelled")
+        if (!icns.isFile) return null
+        val out = File(DesktopPlatform.dataDirectory(), "icons/${bundle.nameWithoutExtension}.png")
+        return runCatching {
+            out.parentFile.mkdirs()
+            val process = ProcessBuilder("sips", "-s", "format", "png", icns.path, "--out", out.path).start()
+            if (process.waitFor(10, TimeUnit.SECONDS) && process.exitValue() == 0) out.path else null
+        }.getOrNull()
+    }
+
+    // The parts of the desktop nobody routes, and the ones that would otherwise own the list.
+    private val unixNoise = listOf(
+        "systemd", "dbus", "pipewire", "wireplumber", "pulseaudio", "gvfs", "gnome-", "gnome_",
+        "org.gnome", "plasma", "kded", "kwin", "xwayland", "xorg", "snapd", "sshd", "cupsd",
+        "polkit", "rtkit", "udisks", "upower", "wpa_", "networkmanager", "packagekit", "tracker",
+        "at-spi", "gjs", "dconf", "xdg", "ibus", "fcitx", "systemsettings", "gnome-shell",
+    )
+
+    private fun isUnixNoise(name: String): Boolean {
+        val lower = name.lowercase()
+        return unixNoise.any { lower.startsWith(it) || lower == it }
     }
 
     private fun startMenu(): List<DesktopApp> {
@@ -138,8 +258,12 @@ object AppCatalog {
     private fun isNoise(app: DesktopApp): Boolean {
         val process = app.process.lowercase()
         if (isUninstaller(process)) return true
-        // Ourselves, and the parts of Windows nobody routes: the shell and its helpers.
-        if (process in setOf("yumi.exe", "yumi-service.exe", "java.exe", "javaw.exe")) return true
+        // Ourselves, and the parts of the system nobody routes: the shell and its helpers.
+        if (DesktopPlatform.isWindows) {
+            if (process in setOf("yumi.exe", "yumi-service.exe", "java.exe", "javaw.exe")) return true
+        } else {
+            if (process in setOf("yumi", "yumi-service", "java", "jar") || isUnixNoise(app.process)) return true
+        }
         val name = app.name.lowercase()
         return listOf("uninstall", "удал", "readme", "help", "documentation", "справка").any { it in name }
     }
@@ -162,6 +286,9 @@ object AppCatalog {
         return icons.getOrPut("$path@$size") {
             runCatching {
                 val file = File(path).takeIf { it.isFile } ?: return@runCatching null
+                // On unix the paths the catalog hands out are plain image files already resolved
+                // at discover time, so the shell is not asked for anything.
+                if (!DesktopPlatform.isWindows) return@runCatching readImageFile(file, size)
                 val icon: Icon = FileSystemView.getFileSystemView().getSystemIcon(file, size, size) ?: return@runCatching null
                 val image = BufferedImage(icon.iconWidth.coerceAtLeast(1), icon.iconHeight.coerceAtLeast(1), BufferedImage.TYPE_INT_ARGB)
                 val graphics = image.createGraphics()
@@ -173,6 +300,18 @@ object AppCatalog {
                 image
             }.getOrNull()
         }
+    }
+
+    private fun readImageFile(file: File, size: Int): BufferedImage? {
+        val source = ImageIO.read(file) ?: return null
+        val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
+        val graphics = image.createGraphics()
+        try {
+            graphics.drawImage(source, 0, 0, size, size, null)
+        } finally {
+            graphics.dispose()
+        }
+        return image
     }
 }
 

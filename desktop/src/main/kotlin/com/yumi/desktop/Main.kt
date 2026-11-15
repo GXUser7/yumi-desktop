@@ -39,7 +39,7 @@ fun main(args: Array<String>) {
         smoke -> object:TunnelBackend {
             override suspend fun request(request:ServiceRequest)=ServiceStatus(state="unavailable",error="service_unavailable")
         }
-        else -> WindowsTunnelBackend()
+        else -> if (DesktopPlatform.isWindows) WindowsTunnelBackend() else UnixTunnelBackend()
     }
     val model=DesktopModel(backend,directory)
     application {

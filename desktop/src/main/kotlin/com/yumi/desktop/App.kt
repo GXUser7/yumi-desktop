@@ -1388,6 +1388,7 @@ private val ReadingWidth = 860.dp
 @Composable private fun SettingsPage(m: DesktopModel, onInstallUpdate: () -> Unit) {
     val settings by m.settings.settings.collectAsState()
     val desktop by m.desktop.state.collectAsState()
+    val status by m.status.collectAsState()
     val adapters by m.adapters.collectAsState()
     var dns by remember(settings.remoteDns) { mutableStateOf(settings.remoteDns) }
     var mtu by remember(settings.mtu) { mutableStateOf(settings.mtu.toString()) }
@@ -1417,6 +1418,27 @@ private val ReadingWidth = 860.dp
                     "From connecting until you disconnect nothing leaves around the tunnel — even if the server drops or the service restarts. The local network stays reachable while it bypasses the tunnel.",
                 ),
             ) { m.changeDesktop(desktop.copy(killSwitch = it), true) }
+            SwitchRow(
+                m.text("Местоположение — как у сервера", "Match the server's location"),
+                desktop.matchServerLocation,
+                m.text(
+                    "Пока VPN подключён, системная таймзона переезжает на серверную, а системная геолокация замолкает — сайты и приложения видят местоположение сервера. На отключении всё возвращается. Системные часы сдвинутся.",
+                    "While the VPN is connected the system timezone moves to the server's and system location is silenced, so sites and apps see the server's whereabouts. Everything is restored on disconnect. The system clock will visibly move.",
+                ),
+            ) { m.changeDesktop(desktop.copy(matchServerLocation = it), true) }
+            if (status.sysNote.isNotEmpty()) {
+                Text(
+                    m.text("Не получилось: ${status.sysNote}", "Could not: ${status.sysNote}"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                )
+            } else if (status.sysTimezone.isNotEmpty()) {
+                Text(
+                    m.text("Таймзона системы: ${status.sysTimezone}", "System timezone: ${status.sysTimezone}"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
 
         GlassPanel(Modifier.fillMaxWidth()) {
@@ -1489,7 +1511,7 @@ private val ReadingWidth = 860.dp
 
         GlassPanel(Modifier.fillMaxWidth()) {
             SectionTitle(m.text("Поведение", "Behavior"))
-            SwitchRow(m.text("Запускать при входе в Windows", "Launch at Windows sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
+            SwitchRow(m.text("Запускать при входе в систему", "Launch at sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
             SwitchRow(
                 m.text("Подключать VPN при запуске", "Connect VPN on launch"),
                 desktop.connectOnLaunch,
@@ -1649,7 +1671,7 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
     "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
     "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
     "service_unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
-    "platform_not_supported" -> m.text("VPN-туннель поддерживается только в Windows.", "The VPN tunnel is supported only on Windows.")
+    "platform_not_supported" -> m.text("Служба туннеля недоступна на этой платформе.", "The tunnel service is not available on this platform.")
     "worker_stopped" -> m.text("Ядро VPN неожиданно остановилось.", "The VPN core stopped unexpectedly.")
     "hot_swap_failed" -> m.text("Не удалось сменить сервер. Предыдущее соединение сохранено.", "Could not switch servers. The previous connection is still active.")
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")

@@ -14,3 +14,5 @@ settings.json
 *.zip
 !gradle/wrapper/gradle-wrapper.jar
 .kotlin/
+desktop/resources/
+tools/icongen/.idea/

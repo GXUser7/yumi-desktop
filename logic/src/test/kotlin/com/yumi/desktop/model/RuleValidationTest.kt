@@ -9,11 +9,14 @@ class RuleValidationTest {
         assertEquals("2001:db8::/32",RuleValidation.network("2001:db8::/32"))
     }
     @Test fun applicationsAreProcessNames() {
-        // Older settings held whole paths; they come back as the name the core matches on.
+        // Older settings held whole paths; they come back as the name the core matches on. The
+        // shape of that name is the platform's: Windows appends `.exe` to a bare name, unix keeps
+        // it bare, and a name that arrives with its extension keeps it either way.
+        val exe = System.getProperty("os.name").startsWith("Windows")
         assertEquals("app.exe",RuleValidation.application("C:\\Program Files\\App\\app.exe"))
         assertEquals("app.exe",RuleValidation.application("C:/Program Files/App/app.exe"))
         assertEquals("Telegram.exe",RuleValidation.application("Telegram.exe"))
-        assertEquals("telegram.exe",RuleValidation.application("  telegram "))
+        assertEquals(if (exe) "telegram.exe" else "telegram",RuleValidation.application("  telegram "))
         assertEquals("Discord.exe",RuleValidation.application("\"C:\\Users\\me\\AppData\\Local\\Discord\\app-1.0.9\\Discord.exe\""))
     }
     @Test fun rejectsInvalidRules() {

@@ -31,7 +31,7 @@ class DesktopModel(
     val updates = DesktopUpdater(
         scope, GitHubUpdates(File(directory, "updates"), HttpsUpdateTransport(AppVersion)), desktop.state, AppVersion,
         installed = DesktopPlatform.installedDirectory() != null,
-        automatic = backend is WindowsTunnelBackend && System.getProperty("jpackage.app-path") != null,
+        automatic = backend !is DemoBackend && System.getProperty("jpackage.app-path") != null,
     )
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)

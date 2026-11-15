@@ -24,14 +24,14 @@ type baseObjects struct {
 }
 
 /*
-Firewall is one installed kill switch: a dynamic WFP session holding a block-everything filter and
-the handful of permits that keep the tunnel itself alive.
+wfpShield is the Windows half of the [Firewall] interface: a dynamic WFP session holding a
+block-everything filter and the handful of permits that keep the tunnel itself alive.
 
 Dynamic means Windows removes every filter in it the moment the session handle closes, including
 when the process holding it dies. That is the property that makes this safe to ship: a crash of the
 service can never leave a machine without a network, at worst without a kill switch.
 */
-type Firewall struct {
+type wfpShield struct {
 	session uintptr
 }
 
@@ -107,16 +107,17 @@ func registerBaseObjects(session uintptr) (*baseObjects, error) {
 /*
 Enable installs a kill switch that lets through only: this executable (the service and its worker,
 which carry the tunnel and the traffic routed around it), loopback, DHCP and neighbour discovery,
-the tunnel adapter identified by luid, and — when permitLAN is set — the private ranges of the local
+the tunnel adapter identified by ref, and — when permitLAN is set — the private ranges of the local
 network. Everything else is blocked.
 
-A luid of zero is accepted and matches no interface; it is what is passed while the adapter does
-not exist yet, and the tunnel's own traffic still flows because it leaves from this executable.
+A ref whose LUID is zero is accepted and matches no interface; it is what is passed while the
+adapter does not exist yet, and the tunnel's own traffic still flows because it leaves from this
+executable.
 
 Several may be enabled at once. Moving the kill switch onto a new adapter is done by enabling the
 new one and only then closing the old, so there is no instant at which neither is installed.
 */
-func Enable(luid uint64, permitLAN bool) (*Firewall, error) {
+func Enable(ref TunRef, permitLAN bool) (Firewall, error) {
 	session, err := createWfpSession()
 	if err != nil {
 		return nil, wrapErr(err)
@@ -138,8 +139,8 @@ func Enable(luid uint64, permitLAN bool) (*Firewall, error) {
 			return wrapErr(err)
 		}
 
-		if luid != 0 {
-			err = permitTunInterface(session, baseObjects, 12, luid)
+		if ref.LUID != 0 {
+			err = permitTunInterface(session, baseObjects, 12, ref.LUID)
 			if err != nil {
 				return wrapErr(err)
 			}
@@ -181,11 +182,11 @@ func Enable(luid uint64, permitLAN bool) (*Firewall, error) {
 		return nil, wrapErr(err)
 	}
 
-	return &Firewall{session: session}, nil
+	return &wfpShield{session: session}, nil
 }
 
 // Close removes every filter this kill switch installed. Safe to call more than once.
-func (f *Firewall) Close() {
+func (f *wfpShield) Close() {
 	if f == nil || f.session == 0 {
 		return
 	}

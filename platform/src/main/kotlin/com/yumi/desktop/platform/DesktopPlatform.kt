@@ -18,6 +18,12 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.net.StandardProtocolFamily
+import java.net.UnixDomainSocketAddress
+import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -28,26 +34,77 @@ interface TunnelBackend {
     suspend fun request(request: ServiceRequest): ServiceStatus
 }
 
+/*
+Both backends speak the same wire: one UTF-8 JSON request frame, one reply frame, each headed by a
+big-endian 32-bit length, one exchange per connection, a megabyte cap both ways. The service
+enforces the same numbers on its side, so the two transports below differ only in how the bytes
+travel — a named pipe on Windows, a unix socket on Linux and macOS.
+*/
+private val tunnelJson = Json { encodeDefaults = true; ignoreUnknownKeys = true }
+
+private const val MAX_FRAME = 1_048_576
+
+private fun frameOf(bytes: ByteArray): ByteBuffer {
+    val frame = ByteBuffer.allocate(4 + bytes.size)
+    frame.putInt(bytes.size)
+    frame.put(bytes)
+    frame.flip()
+    return frame
+}
+
+private fun readFrame(read: (ByteBuffer) -> Int): ByteArray {
+    val head = ByteBuffer.allocate(4)
+    while (head.hasRemaining()) if (read(head) < 0) throw java.io.IOException("short frame header")
+    val size = ByteBuffer.wrap(head.array()).int
+    require(size in 1..MAX_FRAME)
+    val body = ByteBuffer.allocate(size)
+    while (body.hasRemaining()) if (read(body) < 0) throw java.io.IOException("short frame body")
+    return body.array()
+}
+
+private fun decodeReply(reply: ByteArray): ServiceStatus =
+    tunnelJson.decodeFromString<ServiceStatus>(reply.decodeToString()).also { require(it.version == 1) }
+
 class WindowsTunnelBackend : TunnelBackend {
-    // Unknown keys are tolerated on the way in: a service a version ahead may report more than
-    // this window knows to show, and that is no reason to call it unavailable.
-    private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
     override suspend fun request(request: ServiceRequest): ServiceStatus = withContext(Dispatchers.IO) {
         if (!DesktopPlatform.isWindows) return@withContext ServiceStatus(state = "unavailable", error = "platform_not_supported")
         try {
             RandomAccessFile(DesktopPlatform.PIPE_NAME, "rw").use { pipe ->
-                val bytes = json.encodeToString(request).toByteArray(Charsets.UTF_8)
-                require(bytes.size in 1..1_048_576)
+                val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
+                require(bytes.size in 1..MAX_FRAME)
                 pipe.writeInt(bytes.size); pipe.write(bytes)
-                val size = pipe.readInt(); require(size in 1..1_048_576)
+                val size = pipe.readInt(); require(size in 1..MAX_FRAME)
                 val reply = ByteArray(size); pipe.readFully(reply)
-                json.decodeFromString<ServiceStatus>(reply.decodeToString()).also { require(it.version == 1) }
+                decodeReply(reply)
             }
         } catch (_: Exception) {
             // Everything used to land here as one code, and the screen then advised installing a
             // service that was already installed and running. The reason is asked for now, once,
             // and only on the failing path.
             ServiceStatus(state = "unavailable", error = DesktopPlatform.diagnoseService())
+        }
+    }
+}
+
+class UnixTunnelBackend : TunnelBackend {
+    override suspend fun request(request: ServiceRequest): ServiceStatus = withContext(Dispatchers.IO) {
+        try {
+            val address = UnixDomainSocketAddress.of(DesktopPlatform.SOCKET_PATH)
+            if (!Files.exists(address.path)) {
+                return@withContext ServiceStatus(state = "unavailable", error = "service_missing")
+            }
+            SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
+                channel.connect(address)
+                val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
+                require(bytes.size in 1..MAX_FRAME)
+                channel.write(frameOf(bytes))
+                val reply = readFrame { buffer -> channel.read(buffer) }
+                decodeReply(reply)
+            }
+        } catch (_: Exception) {
+            // The socket either is not there (answered above), or the exchange failed for a reason
+            // the file system cannot name. The generic answer keeps the screen honest.
+            ServiceStatus(state = "unavailable", error = "service_unavailable")
         }
     }
 }
@@ -59,30 +116,92 @@ enum class ServiceRepair { Done, Declined, Unavailable }
 
 object DesktopPlatform {
     val isWindows = System.getProperty("os.name").startsWith("Windows")
+    val isMac = System.getProperty("os.name") == "Mac OS X"
+
     fun dataDirectory(): File {
         System.getProperty("yumi.dataDir")?.let { return File(it).also(File::mkdirs) }
-        val base = if (isWindows) System.getenv("LOCALAPPDATA") else null
-        return File(base ?: File(System.getProperty("user.home"), ".local/share").path, "YumiDesktop").also(File::mkdirs)
+        val home = System.getProperty("user.home")
+        val base = when {
+            isWindows -> System.getenv("LOCALAPPDATA") ?: File(home, "AppData/Local").path
+            // macOS convention instead of the XDG default; Linux honours XDG_DATA_HOME.
+            isMac -> File(home, "Library/Application Support").path
+            else -> System.getenv("XDG_DATA_HOME") ?: File(home, ".local/share").path
+        }
+        return File(base, "YumiDesktop").also(File::mkdirs)
     }
+
     fun localAddresses(): List<LocalAddress> = runCatching {
         NetworkInterface.getNetworkInterfaces().toList().filter {
-            it.isUp && !it.isLoopback && !Regex("tun|tap|vpn|wireguard|wintun|hyper-v|vmware|virtual", RegexOption.IGNORE_CASE).containsMatchIn(it.displayName.orEmpty())
+            it.isUp && !it.isLoopback &&
+                !Regex("tun|tap|vpn|wireguard|wintun|hyper-v|vmware|virtual|docker|veth|virbr|bridge", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(it.displayName.orEmpty())
         }.flatMap { network -> network.inetAddresses.toList().filterIsInstance<Inet4Address>()
             .filter { it.isSiteLocalAddress && !it.isLoopbackAddress }
             .map { LocalAddress(network.displayName + " · " + it.hostAddress, it) } }
     }.getOrDefault(emptyList())
 
     fun setLaunchAtLogin(enabled: Boolean) {
-        check(isWindows)
+        when {
+            isWindows -> setLaunchAtLoginWindows(enabled)
+            isMac -> setLaunchAtLoginMac(enabled)
+            else -> setLaunchAtLoginLinux(enabled)
+        }
+    }
+
+    private fun launcher(): File {
+        val launcher = System.getProperty("jpackage.app-path")?.let(::File)
+        require(launcher?.isFile == true) { "Install Yumi before enabling startup" }
+        return launcher
+    }
+
+    private fun setLaunchAtLoginWindows(enabled: Boolean) {
         val key = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
         if (!enabled) {
             if (Advapi32Util.registryValueExists(WinReg.HKEY_CURRENT_USER, key, "YumiDesktop"))
                 Advapi32Util.registryDeleteValue(WinReg.HKEY_CURRENT_USER, key, "YumiDesktop")
             return
         }
-        val launcher = System.getProperty("jpackage.app-path")?.let(::File)
-        require(launcher?.isFile == true) { "Install Yumi before enabling startup" }
+        val launcher = launcher()
         Advapi32Util.registrySetStringValue(WinReg.HKEY_CURRENT_USER, key, "YumiDesktop", "\"${launcher.absolutePath}\" --tray")
+    }
+
+    private fun setLaunchAtLoginLinux(enabled: Boolean) {
+        val file = File(System.getenv("XDG_CONFIG_HOME") ?: File(System.getProperty("user.home"), ".config").path, "autostart/yumi-desktop.desktop")
+        if (!enabled) {
+            file.delete()
+            return
+        }
+        val launcher = launcher()
+        file.parentFile.mkdirs()
+        file.writeText(
+            "[Desktop Entry]\n" +
+                "Type=Application\n" +
+                "Name=Yumi\n" +
+                "Exec=\"${launcher.absolutePath}\" --tray\n" +
+                "X-GNOME-Autostart-enabled=true\n",
+        )
+    }
+
+    private fun setLaunchAtLoginMac(enabled: Boolean) {
+        val file = File(System.getProperty("user.home"), "Library/LaunchAgents/app.yumi.desktop.plist")
+        if (!enabled) {
+            file.delete()
+            return
+        }
+        val launcher = launcher()
+        file.parentFile.mkdirs()
+        // LaunchAgent rather than the modern SMAppService: the JVM has no Objective-C bridge, and
+        // a plist in the user's own domain needs no elevation and survives reboots all the same.
+        file.writeText(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+                "<plist version=\"1.0\">\n<dict>\n" +
+                "    <key>Label</key><string>app.yumi.desktop</string>\n" +
+                "    <key>ProgramArguments</key>\n    <array>\n" +
+                "        <string>${launcher.absolutePath}</string>\n        <string>--tray</string>\n    </array>\n" +
+                "    <key>RunAtLoad</key><true/>\n" +
+                "</dict>\n</plist>\n",
+        )
     }
 
     /**
@@ -105,6 +224,8 @@ object DesktopPlatform {
      * `SWP_FRAMECHANGED` did not move it and neither did `RedrawWindow`; what does is telling the
      * window its activation changed, because that is the event on which DWM re-reads the frame.
      * The pair of messages leaves it active, as it was.
+     *
+     * On Linux and macOS the title bar already belongs to the system, so this is a no-op.
      */
     fun applyWindowChrome(windowHandle: Long, dark: Boolean, captionArgb: Int, textArgb: Int) {
         if (!isWindows || windowHandle == 0L) return
@@ -143,20 +264,26 @@ object DesktopPlatform {
     private const val REDRAW_FRAME = 0x0001 or 0x0002 or 0x0004 or 0x0020
 
     /**
-     * Why the pipe would not open, asked only after it has already failed.
-     *
-     * `RandomAccessFile` throws `FileNotFoundException` both for a pipe that is not there and for
-     * one that refused us, and tells the two apart only in the message — which Windows writes in
-     * the user's own language. So the classification is done by asking Windows again, through an
-     * API that answers in numbers.
+     * Why the service would not answer, asked only after it has already failed.
      *
      * The distinction is the whole point. "Not there" means the service is not installed or not
      * running, and the honest advice is to install Yumi. "Refused" means it is running and belongs
      * to another account — advice to install it again is then not merely useless, it sends someone
      * to reinstall a thing that is working. See [repairService] for what is offered instead.
+     *
+     * On Windows the pipe answers FileNotFoundException for both cases in the user's own language,
+     * so the classification is done by asking Windows again, through an API that answers in
+     * numbers. On unix the socket file either exists or it does not, which is most of the answer
+     * already; a file that is there while the connection fails is a busy or foreign socket.
      */
     fun diagnoseService(): String {
-        if (!isWindows) return "platform_not_supported"
+        if (!isWindows) {
+            val socket = Path.of(SOCKET_PATH)
+            return when {
+                !Files.exists(socket) -> "service_missing"
+                else -> "service_unavailable"
+            }
+        }
         val handle = runCatching {
             Kernel32.INSTANCE.CreateFile(
                 PIPE_NAME,
@@ -184,19 +311,51 @@ object DesktopPlatform {
 
     /** The tunnel service binary that shipped beside this application, if this is a real install. */
     fun serviceExecutable(): File? {
-        val launcher = System.getProperty("jpackage.app-path")?.let(::File) ?: return null
-        return File(launcher.parentFile, "service\\yumi-service.exe").takeIf { it.isFile }
+        if (isWindows) {
+            val launcher = System.getProperty("jpackage.app-path")?.let(::File) ?: return null
+            return File(launcher.parentFile, "service\\yumi-service.exe").takeIf { it.isFile }
+        }
+        // Compose puts the appResourcesRootDir content under app/resources in the image and names
+        // it to the launcher through this property; the fallback walks the same layout by hand.
+        val resources = System.getProperty("compose.application.resources.dir")?.let(::File)
+            ?: System.getProperty("jpackage.app-path")?.let(::File)?.parentFile?.let { File(it, "app/resources") }
+            ?: return null
+        val exe = File(resources, "service/yumi-service").takeIf { it.isFile } ?: return null
+        // The packaging decides the bit; if a transfer stripped it, restore it quietly rather than
+        // fail every connect with a permission error.
+        if (!exe.canExecute()) runCatching { exe.setExecutable(true, false) }
+        return exe
     }
 
     fun installedDirectory(): File? {
         val launcher = System.getProperty("jpackage.app-path")?.let(::File) ?: return null
+        if (!isWindows) return launcher.parentFile.takeIf { serviceExecutable() != null }
         return launcher.parentFile.takeIf { File(it, "unins000.exe").isFile && serviceExecutable() != null }
     }
 
-    /** The installer handles elevation and relaunch; exit only after Windows starts it. */
+    /**
+     * Installs a downloaded update, on every platform by handing the verified package to the
+     * system's own installer with one elevation prompt.
+     *
+     * On Windows the Inno installer waits for this process to exit and then relaunches the app.
+     * The unix package managers have no such handshake, so there the elevated shell waits for this
+     * process to exit — the files are only touched once this JVM is gone — installs, and leaves
+     * the relaunch to the user. The prompt appears while the app is still up, which is when
+     * someone is looking at it.
+     */
     fun installUpdate(file: File): Boolean {
+        if (!file.isFile) return false
+        return when {
+            isWindows -> installUpdateWindows(file)
+            file.name.endsWith(".deb") -> launchUpdate("dpkg -i ${quote(file)}")
+            file.name.endsWith(".rpm") -> launchUpdate("rpm -U ${quote(file)}")
+            file.name.endsWith(".pkg") -> launchUpdate("installer -pkg ${quote(file)} -target /")
+            else -> false
+        }
+    }
+
+    private fun installUpdateWindows(file: File): Boolean {
         val directory = installedDirectory() ?: return false
-        if (!isWindows || !file.isFile) return false
         return runCatching {
             val request = ShellAPI.SHELLEXECUTEINFO()
             request.lpVerb = "open"
@@ -210,21 +369,70 @@ object DesktopPlatform {
         }.getOrDefault(false)
     }
 
+    private fun quote(file: File) = "\"" + file.absolutePath.replace("\"", "\\\"") + "\""
+
+    // Starts the elevated installer and comes back at once: the shell itself waits for this
+    // process to end, so the app can exit on its own schedule while the prompt is answered.
+    private fun launchUpdate(command: String): Boolean = runCatching {
+        val pid = ProcessHandle.current().pid()
+        val script = "while kill -0 $pid 2>/dev/null; do sleep 1; done; $command"
+        if (isMac) {
+            val appleScript = "do shell script " + "\"" + script.replace("\\", "\\\\").replace("\"", "\\\"") + "\" with administrator privileges"
+            ProcessBuilder("osascript", "-e", appleScript).start()
+        } else {
+            ProcessBuilder("pkexec", "sh", "-c", script).start()
+        }
+        true
+    }.getOrDefault(false)
+
+    /*
+     * One elevation prompt on every non-Windows platform: polkit on Linux, the administrator
+     * dialog on macOS. The command runs inside the elevated shell, so the answer comes back only
+     * when the work is actually done. Declining the prompt is an answer, not a fault: pkexec
+     * answers 126 and osascript reports the cancellation in its error text, and both become
+     * [ServiceRepair.Declined].
+     */
+    private fun elevatedRun(command: String): ServiceRepair = runCatching {
+        val process = if (isMac) {
+            val appleScript = "do shell script " + "\"" + command.replace("\\", "\\\\").replace("\"", "\\\"") + "\" with administrator privileges"
+            ProcessBuilder("osascript", "-e", appleScript).start()
+        } else {
+            ProcessBuilder("pkexec", "sh", "-c", command).start()
+        }
+        val stderr = StringBuilder()
+        val reader = process.errorStream.bufferedReader()
+        val done = process.waitFor(10, TimeUnit.MINUTES)
+        if (!done) {
+            process.destroyForcibly()
+            return ServiceRepair.Unavailable
+        }
+        reader.use { runCatching { stderr.append(it.readText()) } }
+        val cancelled = process.exitValue() == 126 || stderr.contains("User canceled", ignoreCase = true)
+        when {
+            process.exitValue() == 0 -> ServiceRepair.Done
+            cancelled -> ServiceRepair.Declined
+            else -> ServiceRepair.Unavailable
+        }
+    }.getOrDefault(ServiceRepair.Unavailable)
+
     /**
-     * This account's SID, asked of the service binary rather than worked out here.
+     * This account's owner id, asked of the service binary rather than worked out here.
      *
      * It is the same code path the installer uses and the same one the service compares against,
      * so there is exactly one definition of "who am I" in the product. Doing it again in Kotlin
      * would be a second definition, and the entire bug this repairs was two answers to that
-     * question disagreeing.
+     * question disagreeing. Windows spells the answer as a SID, unix as a decimal uid.
      */
-    fun currentUserSid(): String? {
+    fun currentUserOwner(): String? {
         val exe = serviceExecutable() ?: return null
         return runCatching {
             val process = ProcessBuilder(exe.absolutePath, "--print-owner").start()
             val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
             process.waitFor(5, TimeUnit.SECONDS)
-            text.takeIf { it.startsWith("S-") && it.length in 8..184 }
+            when {
+                isWindows -> text.takeIf { it.startsWith("S-") && it.length in 8..184 }
+                else -> text.takeIf { it.isNotEmpty() && it.all(Char::isDigit) && it.length <= 10 }
+            }
         }.getOrNull()
     }
 
@@ -242,12 +450,15 @@ object DesktopPlatform {
      */
     fun repairService(): ServiceRepair {
         val exe = serviceExecutable() ?: return ServiceRepair.Unavailable
-        val sid = currentUserSid() ?: return ServiceRepair.Unavailable
+        val owner = currentUserOwner() ?: return ServiceRepair.Unavailable
+        if (!isWindows) {
+            return elevatedRun("${quote(exe)} --install --owner $owner")
+        }
         return runCatching {
             val request = ShellAPI.SHELLEXECUTEINFO()
             request.lpVerb = "runas"
             request.lpFile = exe.absolutePath
-            request.lpParameters = "--install --owner $sid"
+            request.lpParameters = "--install --owner $owner"
             request.nShow = WinUser.SW_HIDE
             request.fMask = SEE_MASK_NOCLOSEPROCESS
             if (!Shell32.INSTANCE.ShellExecuteEx(request)) {
@@ -268,6 +479,8 @@ object DesktopPlatform {
     }
 
     internal const val PIPE_NAME = "\\\\.\\pipe\\YumiTunnel-v1"
+    internal val SOCKET_PATH: String =
+        if (System.getProperty("os.name") == "Mac OS X") "/var/run/yumi/tunnel.sock" else "/run/yumi/tunnel.sock"
 
     private const val ERROR_FILE_NOT_FOUND = 2
     private const val ERROR_PATH_NOT_FOUND = 3

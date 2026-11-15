@@ -26,11 +26,16 @@ glass over them, and dragging the window knocks them about on springs.
   VPN still opens them directly. YouTube stays in the tunnel.
 * **Kill switch** — from connect until disconnect nothing leaves around the tunnel, even when the
   server or the core falls over.
+* **Location as the server's** — while connected, the system timezone moves onto the selected
+  server's and the system's location sources go quiet, so sites and applications that ask where
+  the machine is hear the server's country. Everything is restored on disconnect, and the machine's
+  state is written down first, so even a crash puts it back. Off until enabled in Settings.
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
 * **Fifteen palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
 * **Connect on launch**, optionally, to the server you selected; off until you enable it in Settings.
 * **Updates in Settings** — background checks and verified downloads, progress and cancellation,
-  then restart now or install on exit. Windows asks for permission to replace the app and service.
+  then restart now or install on exit. Each platform asks its own permission to replace the app
+  and service.
 
 | | |
 |:-:|:-:|
@@ -49,6 +54,10 @@ HTTPUpgrade or QUIC.
 Windows 10 version 1809 (build 17763) or newer, 64-bit. Nothing else: the installer brings its own
 Java runtime and its own network adapter driver.
 
+Linux (x86-64, systemd; `.deb` and `.rpm`) and macOS 12 or newer on Apple Silicon (`.dmg` to
+install, `.pkg` for the updater) carry the same feature set: the tunnel, the kill switch, split
+tunnelling, the geo databases, subscriptions, the location mode. See [Linux and macOS](#linux-and-macos).
+
 ## Installing
 
 Run `Yumi-Desktop-<version>-windows-x64-setup.exe` and accept the elevation prompt. The installer:
@@ -65,6 +74,34 @@ Uninstalling removes the service, the firewall rule and the startup entry. Your 
 settings live in `%LOCALAPPDATA%\YumiDesktop` and are left alone, so reinstalling keeps them; delete
 that folder by hand if you want them gone.
 
+## Linux and macOS
+
+Install the package the distribution's way — `dpkg -i`, `rpm -U`, or a double-click for the macOS
+dmg — and start Yumi. The tunnel service is not registered at install time: the first connection
+asks once for the administrator password (`pkexec` on Linux, the administrator dialog on macOS),
+registers `yumi-tunnel.service` with systemd or the daemon with launchd, and from then on the
+service owns the tunnel exactly as `YumiTunnel` does on Windows — same protocol, same commands,
+a unix socket at `/run/yumi/tunnel.sock` in place of the named pipe.
+
+* The **kill switch** is an nftables table on Linux and a pf anchor on macOS, installed before the
+  core starts and removed on disconnect. It permits the service's own account rather than one
+  executable — nftables and pf match owners, not programs — so other root processes ride free
+  alongside the tunnel; user-level traffic, which is what the shield exists to hold, does not.
+* The **system resolver** is pointed into the tunnel while it is up (`resolvectl` where
+  systemd-resolved runs, `/etc/resolv.conf` with a kept copy where it does not, `networksetup` on
+  macOS) and given back on the way out.
+* **Location as the server's** moves the clock with `timedatectl` or `systemsetup` and silences
+  GeoClue or locationd, restoring both from the written-down snapshot.
+* Packages are not code-signed. macOS asks Gatekeeper about the first launch: right-click the
+  application, "Open". The Application Firewall may ask once about incoming connections for the
+  subscription transfer; that is the phone handing a subscription over.
+
+Honest limits: the tray icon needs an AppIndicator-compatible shell (GNOME without the extension
+reports none, and closing the window then quits the app instead of hiding it — the app says so and
+behaves accordingly), and the macOS build is Apple Silicon only.
+
+## How it is split
+
 ## How it is split
 
 The application never touches the network stack. It talks to a local service over a named pipe,
@@ -74,11 +111,12 @@ and the service is the only thing that holds the tunnel:
 |------------|------------------------------------------------------------------------------|
 | `desktop`  | The Compose UI, the window, the tray icon.                                    |
 | `logic`    | Parsing, subscriptions, latency and speed measurement, the Xray config. Shared, unchanged, with the Android app. |
-| `platform` | The Windows-shaped parts: the registry, the named pipe, the title-bar colour. |
-| `service`  | The Go service: Wintun, Xray-core, and the pipe protocol. Runs as `YumiTunnel`. |
+| `platform` | The OS-shaped parts: the registry, the named pipe and its unix twin, the title-bar colour, the application catalog. |
+| `service`  | The Go service: the tunnel adapter, Xray-core, and the command protocol. Runs as `YumiTunnel` on Windows, as `yumi-tunnel` under systemd or launchd elsewhere. |
 
-The service accepts commands from exactly one Windows account — the owner's SID is baked into its
-configuration — and does nothing at all until the application asks it to connect.
+The service accepts commands from exactly one account — the owner's SID on Windows, the owner's uid
+on Linux and macOS, baked into its configuration — and does nothing at all until the application
+asks it to connect.
 
 That account is the one that was signed in when the installer ran, not the one that answered the
 elevation prompt. On a machine where those differ, the service would otherwise be owned by an

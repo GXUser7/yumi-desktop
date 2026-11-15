@@ -18,16 +18,54 @@ dependencies {
     testImplementation(compose.desktop.uiTestJUnit4)
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
+
+// The tunnel service binary rides inside the package, in the resources directory the launcher
+// names at runtime (compose.application.resources.dir); see DesktopPlatform.serviceExecutable.
+// Which binary depends on the host the package is built on — jpackage cannot cross-compile —
+// and the build scripts put it in runtime/ before calling any packaging task.
+val hostOs = System.getProperty("os.name").lowercase()
+val serviceOs = when {
+    "win" in hostOs -> "windows"
+    "mac" in hostOs -> "macos"
+    else -> "linux"
+}
+val serviceName = if ("win" in hostOs) "yumi-service.exe" else "yumi-service"
+val stageServiceBinary = tasks.register<Copy>("stageServiceBinary") {
+    from(rootProject.layout.projectDirectory.file("runtime/$serviceName"))
+    into(layout.projectDirectory.dir("resources/$serviceOs/service"))
+    rename { serviceName }
+}
+tasks.whenTaskAdded {
+    if (name in setOf("createDistributable", "packageDistributionForCurrentOS", "packageMsi", "packageDeb", "packageRpm", "packageDmg", "packagePkg")) {
+        dependsOn(stageServiceBinary)
+    }
+    // prepareAppResources copies the resources tree into the image, so the service binary has to
+    // be staged before it runs, not after.
+    if (name == "prepareAppResources") { dependsOn(stageServiceBinary) }
+}
+
 compose.desktop {
     application {
         mainClass = "com.yumi.desktop.MainKt"
         nativeDistributions {
-            targetFormats(TargetFormat.Msi)
+            // One format per platform: Msi for Windows (wrapped by the Inno installer), deb and
+            // rpm for Linux, Dmg to hand someone and Pkg for the updater to install on macOS.
+            targetFormats(TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm, TargetFormat.Dmg, TargetFormat.Pkg)
             packageName = "Yumi"
-            packageVersion = "0.2.6"
+            packageVersion = "0.3.0"
             includeAllModules = true
+            appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
             windows { menu = true; shortcut = true; upgradeUuid = "e8cb03d0-c852-4375-bf1b-a83f09e118b7"
                 iconFile.set(project.file("icon/yumi.ico")) }
+            linux {
+                iconFile.set(project.file("icon/yumi-256.png"))
+                debMaintainer = "yumi-desktop@users.noreply.github.com"
+            }
+            macOS {
+                iconFile.set(project.file("icon/yumi.icns"))
+                bundleID = "app.yumi.desktop"
+                dockName = "Yumi"
+            }
         }
     }
 }

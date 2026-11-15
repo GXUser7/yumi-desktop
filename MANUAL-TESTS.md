@@ -201,3 +201,43 @@ both, and testing on a Public one is worth doing because that is what a laptop g
       a subscription refresh.
 - [ ] A server is selected by anything other than the user.
 - [ ] The application makes a network request naming a server to anything but that server.
+
+## Location as the server's
+
+Windows: `tzutil /g` before and after; Linux: `timedatectl`; macOS: `systemsetup -gettimezone`.
+
+- [ ] The switch is off by default and the clock never moves on a plain connect.
+- [ ] On, connect to a server of a known country: the system timezone follows it, Settings shows
+      which one, and Windows `lfsvc` is stopped with the LocationAndSensors policy set (or GeoClue
+      masked on Linux, locationd unloaded on macOS).
+- [ ] A server whose name carries no flag: location goes quiet, the clock stays where it was.
+- [ ] Disconnect: the previous timezone is back, the location sources are running again, the
+      policy keys are gone.
+- [ ] Hot-switch to a server in another country: the timezone follows without a reconnect.
+- [ ] Kill the service while the mode is applied, then start it again: the machine is put back
+      before anything else happens.
+- [ ] The system clock visibly moving is the feature, and the switch's own description says so.
+
+## Linux and macOS
+
+The same list, on the other systems, with their own spellings. Windows-only steps are marked.
+
+- [ ] The package installs (`dpkg -i`, `rpm -U`, or the dmg), Yumi starts, and no service exists
+      yet — the first connect asks once for the administrator password and registers
+      `yumi-tunnel.service` (systemd) or `app.yumi.desktop.tunnel` (launchd).
+- [ ] Connect: browsing works. `nft list tables` shows `yumi_shield_*` with the kill switch on and
+      nothing with it off; on macOS `pfctl -s Anchors` shows `com.yumi.shield`.
+- [ ] Kill switch, on: kill the worker process (`pkill -f yumi-service` or a `kill -9`) — browsing
+      stops, the connect screen says the shield is holding. Off: browsing survives the same kill.
+- [ ] Split tunnelling: the application picker lists what is running and what is installed, with
+      icons where the system keeps them as images; a rule for a chosen application moves its
+      traffic around the tunnel.
+- [ ] Russian sites go direct with the geo databases present; `systemctl status geoclue` and the
+      tunnel coexist.
+- [ ] The phone's QR transfer reaches the machine over the local network (on Linux only a running
+      firewalld/ufw needs a rule for it).
+- [ ] Disconnect, then stop the service (`systemctl stop yumi-tunnel`, `launchctl bootout`): the
+      routes, resolver and timezone the tunnel touched are gone, and the machine is exactly as it
+      was found.
+- [ ] Restart the machine with the service enabled: it comes up, the socket answers, and nothing
+      tunneled by itself.

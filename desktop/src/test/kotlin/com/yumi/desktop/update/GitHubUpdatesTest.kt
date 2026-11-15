@@ -17,7 +17,8 @@ class GitHubUpdatesTest {
     private fun releaseJson(version: String, draft: Boolean = false, checksum: Boolean = true, malicious: Boolean = false): JsonObject = buildJsonObject {
         put("tag_name", "v$version"); put("draft", draft); put("prerelease", true); put("body", "What's new")
         putJsonArray("assets") {
-            val name = "Yumi-Desktop-$version-windows-x64-setup.exe"
+            // The asset the running platform selects, the one parseReleases looks for.
+            val name = assetName(version)
             for (file in if (checksum) listOf(name, "$name.sha256") else listOf(name)) addJsonObject {
                 put("name", file); put("size", payload.size)
                 put("browser_download_url", if (malicious) "https://example.com/$file" else "https://github.com/GXUser7/yumi-desktop/releases/download/v$version/$file")

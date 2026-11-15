@@ -2,7 +2,7 @@ import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 plugins { kotlin("jvm"); id("org.jetbrains.kotlin.plugin.compose"); id("org.jetbrains.compose") }
 
 // The release version, as the four-file version gate reads it.
-val releaseVersion = "1.0.1"
+val releaseVersion = "1.0.2"
 kotlin {
     jvmToolchain(21)
     compilerOptions.freeCompilerArgs.addAll(

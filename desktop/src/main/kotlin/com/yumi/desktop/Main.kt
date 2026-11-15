@@ -102,7 +102,7 @@ fun main(args: Array<String>) {
             Item(if(status.state in listOf("connected","connecting"))strings.text("Отключить","Disconnect") else strings.text("Подключиться","Connect"),
                 enabled=status.state!="unavailable",onClick={model.toggleConnection()})
             Separator()
-            TrayServers(profiles, strings, pinging, switching || status.state == "connecting", { model.selectNode(it) }, model::ping)
+            TrayServers(profiles, strings, pinging, switching || status.state == "connecting", { model.selectNode(it) }, model::pingAll)
             Separator();Item(strings.text("Выйти","Exit"),onClick=close)
         }
         Window(onCloseRequest={if(traySupported&&!smoke)visible=false else close()},visible=visible,title="Yumi Desktop",state=windowState,icon=icon) {

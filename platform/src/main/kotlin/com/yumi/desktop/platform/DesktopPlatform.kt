@@ -27,6 +27,9 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.CompletableFuture
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -86,27 +89,32 @@ class WindowsTunnelBackend : TunnelBackend {
     }
 }
 
-class UnixTunnelBackend : TunnelBackend {
-    override suspend fun request(request: ServiceRequest): ServiceStatus = withContext(Dispatchers.IO) {
+class UnixTunnelBackend(
+    private val socketPath: Path = Path.of(DesktopPlatform.SOCKET_PATH),
+    private val timeoutMillis: Long = 15_000,
+) : TunnelBackend {
+    override suspend fun request(request: ServiceRequest): ServiceStatus = withTimeoutOrNull(timeoutMillis) { runInterruptible(Dispatchers.IO) {
         try {
-            val address = UnixDomainSocketAddress.of(DesktopPlatform.SOCKET_PATH)
+            val address = UnixDomainSocketAddress.of(socketPath)
             if (!Files.exists(address.path)) {
-                return@withContext ServiceStatus(state = "unavailable", error = "service_missing")
+                return@runInterruptible ServiceStatus(state = "unavailable", error = "service_missing")
             }
             SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
                 channel.connect(address)
                 val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
                 require(bytes.size in 1..MAX_FRAME)
-                channel.write(frameOf(bytes))
+                val frame = frameOf(bytes)
+                while (frame.hasRemaining()) channel.write(frame)
                 val reply = readFrame { buffer -> channel.read(buffer) }
                 decodeReply(reply)
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
             // The socket either is not there (answered above), or the exchange failed for a reason
             // the file system cannot name. The generic answer keeps the screen honest.
-            ServiceStatus(state = "unavailable", error = "service_unavailable")
+            ServiceStatus(state = "unavailable", error = if (error is java.nio.file.AccessDeniedException ||
+                error.message.orEmpty().contains("Permission denied", ignoreCase = true)) "service_denied" else "service_unavailable")
         }
-    }
+    } } ?: ServiceStatus(state = "unavailable", error = "service_unavailable")
 }
 
 data class LocalAddress(val label: String, val address: Inet4Address)
@@ -369,13 +377,16 @@ object DesktopPlatform {
         }.getOrDefault(false)
     }
 
-    private fun quote(file: File) = "\"" + file.absolutePath.replace("\"", "\\\"") + "\""
+    internal fun shellQuote(value: String) = "'" + value.replace("'", "'\\''") + "'"
+    private fun quote(file: File) = shellQuote(file.absolutePath)
 
     // Starts the elevated installer and comes back at once: the shell itself waits for this
     // process to end, so the app can exit on its own schedule while the prompt is answered.
     private fun launchUpdate(command: String): Boolean = runCatching {
         val pid = ProcessHandle.current().pid()
-        val script = "while kill -0 $pid 2>/dev/null; do sleep 1; done; $command"
+        val service = serviceExecutable() ?: return false
+        val owner = currentUserOwner() ?: return false
+        val script = "while kill -0 $pid 2>/dev/null; do sleep 1; done; $command && ${quote(service)} --install --owner $owner"
         if (isMac) {
             val appleScript = "do shell script " + "\"" + script.replace("\\", "\\\\").replace("\"", "\\\"") + "\" with administrator privileges"
             ProcessBuilder("osascript", "-e", appleScript).start()
@@ -395,19 +406,18 @@ object DesktopPlatform {
     private fun elevatedRun(command: String): ServiceRepair = runCatching {
         val process = if (isMac) {
             val appleScript = "do shell script " + "\"" + command.replace("\\", "\\\\").replace("\"", "\\\"") + "\" with administrator privileges"
-            ProcessBuilder("osascript", "-e", appleScript).start()
+            ProcessBuilder("osascript", "-e", appleScript).redirectErrorStream(true).start()
         } else {
-            ProcessBuilder("pkexec", "sh", "-c", command).start()
+            ProcessBuilder("pkexec", "sh", "-c", command).redirectErrorStream(true).start()
         }
-        val stderr = StringBuilder()
-        val reader = process.errorStream.bufferedReader()
+        val output = CompletableFuture.supplyAsync { process.inputStream.bufferedReader().use { it.readText() } }
         val done = process.waitFor(10, TimeUnit.MINUTES)
         if (!done) {
             process.destroyForcibly()
             return ServiceRepair.Unavailable
         }
-        reader.use { runCatching { stderr.append(it.readText()) } }
-        val cancelled = process.exitValue() == 126 || stderr.contains("User canceled", ignoreCase = true)
+        val diagnostic = output.get(5, TimeUnit.SECONDS)
+        val cancelled = process.exitValue() == 126 || diagnostic.contains("User canceled", ignoreCase = true)
         when {
             process.exitValue() == 0 -> ServiceRepair.Done
             cancelled -> ServiceRepair.Declined
@@ -427,8 +437,9 @@ object DesktopPlatform {
         val exe = serviceExecutable() ?: return null
         return runCatching {
             val process = ProcessBuilder(exe.absolutePath, "--print-owner").start()
+            if (!process.waitFor(5, TimeUnit.SECONDS)) { process.destroyForcibly(); return@runCatching null }
+            if (process.exitValue() != 0) return@runCatching null
             val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
-            process.waitFor(5, TimeUnit.SECONDS)
             when {
                 isWindows -> text.takeIf { it.startsWith("S-") && it.length in 8..184 }
                 else -> text.takeIf { it.isNotEmpty() && it.all(Char::isDigit) && it.length <= 10 }

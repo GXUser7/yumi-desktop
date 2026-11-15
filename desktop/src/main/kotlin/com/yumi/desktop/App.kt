@@ -322,7 +322,6 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 }
 
 /** Badges worth showing on a desktop: "Auto ×N" says nothing here, where a group rides its first server. */
-private val ProxyNode.desktopBadges get() = badges.filterNot { it.startsWith("Auto ×") }
 
 @Composable private fun ProtocolPlate(protocol: Protocol) {
     Plate(protocol.label, loud = protocol == Protocol.VLESS || protocol == Protocol.HYSTERIA2)
@@ -369,9 +368,11 @@ private val ReadingWidth = 860.dp
     val traffic by m.traffic.collectAsState()
     val profiles by m.profiles.state.collectAsState()
     val activeNode by m.activeNode.collectAsState()
+    val activeLatency by m.activeLatency.collectAsState()
     val running = status.state in listOf("connected", "connecting", "disconnecting")
     val node = if (running) activeNode ?: profiles.nodes.firstOrNull { it.id == status.nodeId }
         else profiles.nodes.firstOrNull { it.id == profiles.selectedNodeId }
+    val latency = if (running) activeLatency ?: profiles.latencies[node?.id] else profiles.latencies[node?.id]
 
     val history by m.trafficHistory.collectAsState()
 
@@ -393,7 +394,7 @@ private val ReadingWidth = 860.dp
             translationY = (1f - entry.value) * 8.dp.toPx()
         } else Modifier)) {
             if (narrow) {
-                CompactConnectPage(m, status, traffic, node, profiles.latencies[node?.id], onServers, onPair)
+                CompactConnectPage(m, status, traffic, node, latency, onServers, onPair)
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -403,7 +404,7 @@ private val ReadingWidth = 860.dp
                         FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
                     }
                     Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        ServerRow(m, node, profiles.latencies[node?.id], onServers, running)
+                        ServerRow(m, node, latency, onServers, running)
                         ControlTile(m, status, node != null, Modifier.weight(1f), m::toggleConnection)
                         when {
                             // A kill switch holding a dead tunnel is the one thing on this screen the user
@@ -490,7 +491,7 @@ private val ReadingWidth = 860.dp
                 )
                 if (node != null) Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
                     ProtocolPlate(node.protocol)
-                    node.desktopBadges.take(1).forEach { Plate(it) }
+                    node.badges.take(1).forEach { Plate(it) }
                 }
             }
         }
@@ -509,6 +510,7 @@ private val ReadingWidth = 860.dp
     val semantic = LocalSemanticColors.current
     val value = latency?.takeIf { !it.failed }?.millis
     val ink = when {
+        latency?.failed == true -> MaterialTheme.colorScheme.error
         value == null -> MaterialTheme.colorScheme.onSurfaceVariant
         value < 80 -> semantic.latencyFast
         value < 180 -> semantic.latencyMedium
@@ -533,7 +535,7 @@ private val ReadingWidth = 860.dp
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             if (node != null) Text(rememberEmojiText(node.name, 15.sp), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
             else Text(if (running) m.text("Активный · нет в списке", "Active · not in the list") else m.text("Выбрать", "Choose"), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
-            Text(value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = ink, maxLines = 1)
+            Text(value?.let { m.strings.get(R.string.servers_latency_value, it) } ?: if (latency?.failed == true) "×" else "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.labelLarge.fontSize), color = ink, maxLines = 1)
         } else Column(
             Modifier.fillMaxSize().padding(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -541,7 +543,7 @@ private val ReadingWidth = 860.dp
         ) {
             Icon(Icons.Rounded.SwapHoriz, m.text("Сменить сервер", "Choose server"), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(3.dp))
-            Text(value?.toString() ?: "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleLarge.fontSize), color = ink)
+            Text(value?.toString() ?: if (latency?.failed == true) "×" else "—", style = MonoStyle.copy(fontSize = MaterialTheme.typography.titleLarge.fontSize), color = ink)
             Text(m.strings.get(R.string.unit_millis).uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -647,11 +649,12 @@ private val ReadingWidth = 860.dp
 
 /** Keep diagnostics outside the fixed poster, so the dock grid also holds for service errors. */
 @Composable private fun ConnectionProblem(m: DesktopModel, status: ServiceStatus) {
+    val installing by m.serviceInstalling.collectAsState()
     // Only what the tiles beside this one cannot say: a handshake that failed, a service that is not
     // installed or belongs to someone else.
     val subtitle = when {
         status.state == "unavailable" -> when (status.error) {
-            "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
+            "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись.", "The tunnel service is registered to a different account.")
             "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
             else -> m.text("Установите Yumi вместе с VPN-службой, чтобы подключаться.", "Install Yumi with its tunnel service to connect.")
         }
@@ -663,7 +666,13 @@ private val ReadingWidth = 860.dp
         if (status.state == "failed") m.text("Не удалось подключиться", "Could not connect") else m.text("Служба недоступна", "Service unavailable"),
         subtitle,
         Modifier.fillMaxWidth(),
-        action = if (status.state == "unavailable" && status.error == "service_denied") m.text("Переназначить службу на меня", "Register the service to me") else null,
+        action = when {
+            installing -> null
+            status.state != "unavailable" -> null
+            m.canInstallService -> m.text("Установить службу", "Install the service")
+            status.error == "service_denied" -> m.text("Переназначить службу на меня", "Register the service to me")
+            else -> null
+        },
         onAction = { m.repairService() },
         detail = status.detail?.takeIf { status.state == "failed" && it.isNotBlank() },
     )
@@ -725,9 +734,10 @@ private val ReadingWidth = 860.dp
  * is up it settles into glass with the one ring on the screen, the ring of the active element.
  */
 @Composable private fun ControlTile(m: DesktopModel, status: ServiceStatus, hasNode: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val installing by m.serviceInstalling.collectAsState()
     val semantic = LocalSemanticColors.current
     val connected = status.state == "connected"
-    val busy = status.state == "connecting" || status.state == "disconnecting"
+    val busy = status.state == "connecting" || status.state == "disconnecting" || installing
     val loud = !connected && !busy
     val container by animateColorAsState(
         if (busy) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.primary,
@@ -745,7 +755,8 @@ private val ReadingWidth = 860.dp
     )
     // Stopping never needs a server.
     val usable = when (status.state) {
-        "unavailable", "disconnecting" -> false
+        "unavailable" -> m.canInstallService && hasNode && !installing
+        "disconnecting" -> false
         "connected", "connecting" -> true
         else -> hasNode
     }
@@ -783,7 +794,7 @@ private val ReadingWidth = 860.dp
                     else -> Icon(Icons.Rounded.PowerSettingsNew, null, Modifier.size(if (roomy) 42.dp else 32.dp), tint = content)
                 }
                 Text(
-                    m.strings.get(
+                    if (installing) m.text("Устанавливаем службу", "Installing service") else m.strings.get(
                         when (status.state) {
                             "connected" -> R.string.connect_button_disconnect
                             "connecting" -> R.string.connect_button_connecting
@@ -852,7 +863,7 @@ private val ReadingWidth = 860.dp
     val pinging by m.pinging.collectAsState()
     val status by m.status.collectAsState()
     val activeNode by m.activeNode.collectAsState()
-    var query by remember { mutableStateOf("") }
+    val query by m.serverQuery.collectAsState()
     val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
     val matches = remember(visibleNodes, query) {
         if (query.isBlank()) visibleNodes else visibleNodes.filter { it.name.contains(query.trim(), true) }
@@ -876,7 +887,7 @@ private val ReadingWidth = 860.dp
         )
         Row(Modifier.fillMaxWidth().height(if (LocalCompactLayout.current) 64.dp else 48.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.weight(1f).glass(PillShape, glassTint())) {
-                GlassField(query, { query = it }, Modifier.fillMaxWidth().testTag("server-search"),
+                GlassField(query, m::searchServers, Modifier.fillMaxWidth().testTag("server-search"),
                     placeholder = m.strings.get(R.string.servers_search_placeholder), leading = Icons.Rounded.Search,
                     containerColor = Color.Transparent, singleLineHeight = 48.dp)
             }
@@ -884,7 +895,7 @@ private val ReadingWidth = 860.dp
                 if (pinging) m.text("Заново", "Restart") else m.text("Пинг", "Ping"),
                 Modifier.testTag("ping-servers"),
                 icon = if (pinging) Icons.Rounded.Refresh else Icons.Rounded.Bolt,
-                enabled = visibleNodes.isNotEmpty(),
+                enabled = matches.isNotEmpty(),
             ) { m.ping() }
         }
         Box(Modifier.weight(1f).fillMaxWidth().glass(PanelShape, glassTint()).testTag("server-panel")) {
@@ -925,7 +936,7 @@ private val ReadingWidth = 860.dp
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     val scheme = MaterialTheme.colorScheme
-    val details = remember(node, source) { (listOf(node.protocol.label) + node.desktopBadges + listOfNotNull(source)).distinct().joinToString(" · ") }
+    val details = remember(node, source) { (listOf(node.protocol.label) + node.badges + listOfNotNull(source)).distinct().joinToString(" · ") }
     Row(
         Modifier.fillMaxWidth().testTag("server-card-${node.id}")
             .semantics { this.selected = selected }
@@ -1675,12 +1686,14 @@ private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
 /* ── Words for the service's error codes ──────────────────────────────────────────────────── */
 
 private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean = false) = when (code) {
-    "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись Windows.", "The tunnel service is registered to a different Windows account.")
+    "service_denied" -> m.text("Служба туннеля зарегистрирована на другую учётную запись.", "The tunnel service is registered to a different account.")
     "service_missing" -> m.text("Служба туннеля не установлена или остановлена.", "The tunnel service is not installed, or is not running.")
     "service_unavailable" -> m.text("Служба туннеля недоступна.", "The tunnel service is unavailable.")
     "platform_not_supported" -> m.text("Служба туннеля недоступна на этой платформе.", "The tunnel service is not available on this platform.")
     "worker_stopped" -> m.text("Ядро VPN неожиданно остановилось.", "The VPN core stopped unexpectedly.")
     "hot_swap_failed" -> m.text("Не удалось сменить сервер. Предыдущее соединение сохранено.", "Could not switch servers. The previous connection is still active.")
+    "dns_configuration_failed" -> m.text("Не удалось настроить DNS. Исходные настройки сохранены для восстановления.", "Could not configure DNS. Original settings were kept for recovery.")
+    "invalid_group" -> m.text("Некорректная группа серверов в подписке.", "The subscription contains an invalid server group.")
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
     "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")
     "kill_switch_failed" -> m.text("Не удалось включить килл свитч, поэтому туннель не поднят. Выключи его в настройках, чтобы подключиться без него.", "The kill switch could not be raised, so the tunnel was not started. Turn it off in Settings to connect without it.")

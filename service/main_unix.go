@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/GXUser7/yumi-desktop/service/firewall"
 	"io"
 	"net"
 	"os"
@@ -157,11 +158,16 @@ func runDaemon(owner string) error {
 	// A previous life of this daemon may have died with the location mode applied and its
 	// snapshot still on disk. Before anything else, the machine goes back to how that snapshot
 	// found it.
-	restoreAbandonedLocation()
 	listener, err := listenIPC(owner)
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
+	if err := firewall.CleanupLeftovers(); err != nil {
+		return err
+	}
+	restoreWorkerNetwork()
+	restoreAbandonedLocation()
 	s := newSupervisor()
 	defer shutdownSupervisor(s)
 	serveUntilClosed(listener, owner, s)
@@ -178,6 +184,9 @@ arguments, so the socket belongs to whoever will actually use the tunnel and not
 answered the elevation prompt — the app passes the uid it is running as.
 */
 func install(owner string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("install requires administrator privileges")
+	}
 	if owner == "" {
 		found, err := currentOwner()
 		if err != nil {
@@ -185,13 +194,18 @@ func install(owner string) error {
 		}
 		owner = found
 	}
-	if _, err := strconv.Atoi(owner); err != nil {
+	if uid, err := strconv.ParseUint(owner, 10, 32); err != nil || uid > 4294967294 {
 		return fmt.Errorf("bad owner uid %q", owner)
 	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	helper := installedServicePath()
+	if err := stageServiceBinary(exe, helper); err != nil {
+		return err
+	}
+	exe = helper
 	if isDarwin() {
 		return installLaunchd(exe, owner)
 	}

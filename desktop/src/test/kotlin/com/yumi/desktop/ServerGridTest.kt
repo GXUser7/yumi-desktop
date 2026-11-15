@@ -34,6 +34,14 @@ class ServerGridTest {
                 waitUntil { model.profiles.state.value.selectedNodeId == last.id }
                 assertEquals(1, onAllNodes(cards).fetchSemanticsNodes().size)
                 assertEquals("disconnected", model.status.value.state, "Choosing a server must not raise an idle VPN")
+                onNodeWithTag("nav-Connect").performClick()
+                onNodeWithTag("nav-Servers").performClick()
+                onNode(hasSetTextAction() and hasAnyAncestor(hasTestTag("server-search"))).assertTextEquals("600")
+                assertEquals(1, onAllNodes(cards).fetchSemanticsNodes().size)
+                model.profiles.clearLatencies()
+                onNodeWithTag("ping-servers").performClick()
+                waitUntil(timeoutMillis = 10_000) { model.profiles.state.value.latencies.containsKey(last.id) }
+                assertEquals(setOf(last.id), model.profiles.state.value.latencies.keys)
             }
         } finally {
             runBlocking { model.close() }

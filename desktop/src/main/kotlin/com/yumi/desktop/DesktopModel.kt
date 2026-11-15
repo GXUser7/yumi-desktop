@@ -23,12 +23,18 @@ class DesktopModel(
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val measureLatency: suspend (ProxyNode, PingMode) -> LatencyResult = if (backend is DemoBackend) backend::measureLatency else LatencyTester()::measure,
     private val checkTunnel: suspend (ProbeEndpoint) -> Boolean = TunnelHealthProbe()::reachable,
+    private val serviceInstaller: (suspend () -> ServiceRepair)? =
+        if (backend is UnixTunnelBackend && DesktopPlatform.serviceExecutable() != null) ({ DesktopPlatform.repairService() }) else null,
 ) {
+    val canInstallService get() = serviceInstaller != null
+    val serviceInstalling = MutableStateFlow(false)
     val message = MutableStateFlow<String?>(null)
     val settings = SettingsRepository(directory, scope)
     val profiles = ProfileRepository(directory, scope)
     private val connection = JsonStore(File(directory, "active-connection.json"), ActiveConnection.serializer(), ActiveConnection(), scope)
     val activeNode = MutableStateFlow<ProxyNode?>(null)
+    val activeLatency = MutableStateFlow<LatencyResult?>(null)
+    val serverQuery = MutableStateFlow("")
     private var requestedNode: ProxyNode? = null
     val desktop = JsonStore(File(directory, "desktop.json"), DesktopSettings.serializer(), DesktopSettings(), scope)
     val updates = DesktopUpdater(
@@ -61,7 +67,8 @@ class DesktopModel(
     }
     private val commands = Mutex()
     private val subscriptions = Mutex()
-    private val pingRequests = MutableStateFlow(0L)
+    private data class PingRequest(val sequence: Long = 0, val nodes: List<ProxyNode> = emptyList())
+    private val pingRequests = MutableStateFlow(PingRequest())
     private var connectionProbe: Job? = null
     private var tunnelMonitor: Job? = null
     private var speedJob: Job? = null
@@ -72,9 +79,9 @@ class DesktopModel(
 
     init {
         scope.launch {
-            pingRequests.filter { it > 0 }.collectLatest {
+            pingRequests.filter { it.sequence > 0 }.collectLatest { request ->
                 pinging.value = true
-                try { measureServers(profiles.nodes) }
+                try { measureServers(request.nodes) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { message.value = text("Не удалось измерить задержку.", "Could not measure latency.") }
                 finally { pinging.value = false }
@@ -207,25 +214,32 @@ class DesktopModel(
             (old.state != "connected" || old.nodeId != next.nodeId || old.connectedAt != next.connectedAt || old.probe() != next.probe())) {
             connectionProbe?.cancel()
             tunnelMonitor?.cancel()
+            activeLatency.value = null
+            if (next.groupLatency > 0) activeLatency.value = LatencyResult(node?.id ?: next.nodeId.orEmpty(),
+                next.groupLatency, System.currentTimeMillis())
             connectionHealth.value = ConnectionHealth.Checking
             if (node != null) connectionProbe = scope.launch {
                 val result = try { measureLatency(node, settings.value.pingMode) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { LatencyResult(node.id, 0, System.currentTimeMillis(), failed = true) }
                 ensureActive()
+                if (status.value.nodeId == next.nodeId && status.value.connectedAt == next.connectedAt && activeLatency.value == null) {
+                    activeLatency.value = result
+                }
                 if (profiles.allNodes.any { it.id == result.nodeId }) profiles.recordLatency(result)
                 // Demo/older backends have no loopback probe. Production monitors actual
                 // traffic below; keep the endpoint latency measurement once per connection.
-                if (next.probe() == null) publishHealth(next, !result.failed)
+                if (next.probe() == null) publishHealth(next, !result.failed, result.millis)
             }
             next.probe()?.let { probe ->
                 tunnelMonitor = scope.launch {
                     while (isActive) {
+                        val started = System.nanoTime()
                         val reachable = try { checkTunnel(probe) }
                         catch (cancelled: CancellationException) { throw cancelled }
                         catch (_: Exception) { false }
                         ensureActive()
-                        publishHealth(next, reachable)
+                        publishHealth(next, reachable, ((System.nanoTime() - started) / 1_000_000).toInt().coerceAtLeast(1))
                         delay(CONNECTION_CHECK_MILLIS)
                     }
                 }
@@ -234,6 +248,7 @@ class DesktopModel(
             connectionProbe?.cancel()
             tunnelMonitor?.cancel()
             connectionHealth.value = ConnectionHealth.Unchecked
+            activeLatency.value = null
         }
     }
     private fun sampleTraffic() {
@@ -247,17 +262,20 @@ class DesktopModel(
             trafficHistory.value = emptyList()
         }
     }
-    private suspend fun publishHealth(connection: ServiceStatus, reachable: Boolean) = commands.withLock {
+    private suspend fun publishHealth(connection: ServiceStatus, reachable: Boolean, millis: Int) = commands.withLock {
         val current = status.value
         if (current.state == "connected" && current.nodeId == connection.nodeId &&
             current.connectedAt == connection.connectedAt && current.probe() == connection.probe()) {
             connectionHealth.value = if (reachable) ConnectionHealth.Reachable else ConnectionHealth.Unreachable
+            activeLatency.value = LatencyResult(activeNode.value?.id ?: current.nodeId.orEmpty(),
+                if (reachable) millis.coerceAtLeast(1) else 0, System.currentTimeMillis(), failed = !reachable)
         }
     }
     fun toggleConnection() = action {
         commands.withLock {
             startupConnectPending = false
             cancelSpeed()
+            if (status.value.state == "unavailable" && canInstallService && !prepareService()) return@withLock
             if (status.value.state in listOf("connected", "connecting")) {
                 updateStatus(backend.request(ServiceRequest(command = "disconnect")))
             } else connectSelected()
@@ -355,15 +373,28 @@ class DesktopModel(
      * Nothing is reported on success. The status poll is running at one hertz and will say what
      * happened a second later, in the place the user is already looking.
      */
-    fun repairService() = scope.launch(Dispatchers.IO) {
-        when (DesktopPlatform.repairService()) {
-            ServiceRepair.Done -> Unit
-            ServiceRepair.Declined -> Unit
-            ServiceRepair.Unavailable -> message.value = text(
-                "Не удалось переназначить службу. Переустановите Yumi.",
-                "The service could not be re-registered. Reinstall Yumi.",
-            )
-        }
+    fun repairService() = action { commands.withLock { prepareService() } }
+
+    private suspend fun prepareService(): Boolean {
+        serviceInstalling.value = true
+        try {
+            when (serviceInstaller?.invoke() ?: DesktopPlatform.repairService()) {
+                ServiceRepair.Done -> {
+                    repeat(60) {
+                        updateStatus(backend.request(ServiceRequest(command = "status")))
+                        if (status.value.state != "unavailable") return true
+                        delay(250)
+                    }
+                    message.value = text("Служба установлена, но не ответила. Повторите подключение.", "The service was installed but did not respond. Retry the connection.")
+                }
+                ServiceRepair.Declined -> Unit
+                ServiceRepair.Unavailable -> message.value = text(
+                    "Не удалось установить или запустить службу Yumi.",
+                    "Could not install or start the Yumi service.",
+                )
+            }
+            return false
+        } finally { serviceInstalling.value = false }
     }
 
     /**
@@ -391,7 +422,16 @@ class DesktopModel(
         }
     }
     /** collectLatest cancels and joins the previous sweep before starting this one. */
-    fun ping() { pingRequests.update { it + 1 } }
+    fun matchingServers(): List<ProxyNode> {
+        val query = serverQuery.value.trim()
+        return profiles.nodes.filter { query.isEmpty() || it.name.contains(query, ignoreCase = true) }
+    }
+    fun searchServers(query: String) {
+        serverQuery.value = query
+        if (pinging.value) ping()
+    }
+    fun ping() { val nodes = matchingServers(); pingRequests.update { PingRequest(it.sequence + 1, nodes) } }
+    fun pingAll() { val nodes = profiles.nodes; pingRequests.update { PingRequest(it.sequence + 1, nodes) } }
 
     private suspend fun measureServers(nodes: List<ProxyNode>) = coroutineScope {
         val pending = java.util.concurrent.ConcurrentLinkedQueue<LatencyResult>()

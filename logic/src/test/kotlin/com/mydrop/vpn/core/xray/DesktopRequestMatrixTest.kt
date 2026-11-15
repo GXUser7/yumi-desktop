@@ -204,6 +204,15 @@ class DesktopRequestMatrixTest {
         )
         written++
 
+        val groupMembers = listOf(
+            ProxyNode("g-vless", "First", "first.example.com", 443, ProxySettings.Vless(uuid = uuid)),
+            ProxyNode("g-trojan", "Relay", "relay.example.com", 443, ProxySettings.Trojan(password = "fixture")),
+        )
+        for (strategy in listOf("cost", "fastest")) {
+            dump("group-$strategy", groupMembers.first().copy(id = "group-$strategy", name = "LTE Auto",
+                group = com.mydrop.vpn.core.model.NodeGroup(groupMembers, strategy, 1500)))
+            written++
+        }
         assertTrue("expected a full matrix, wrote $written", written >= 150)
     }
 }

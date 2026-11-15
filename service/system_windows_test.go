@@ -3,8 +3,11 @@
 package main
 
 import (
+	"fmt"
+	"golang.org/x/sys/windows/registry"
 	"strings"
 	"testing"
+	"time"
 )
 
 /*
@@ -116,5 +119,45 @@ func TestLateLocationFrameCannotReactivateAfterDisconnect(t *testing.T) {
 		if s.sysActive || s.sysCountry != "" || s.sysNote != "" {
 			t.Fatalf("late callback applied location to %s: active=%v country=%q note=%q", state, s.sysActive, s.sysCountry, s.sysNote)
 		}
+	}
+}
+
+func TestLocationPolicyRoundTripPreservesBothValuesTypesAndAbsence(t *testing.T) {
+	path := fmt.Sprintf(`Software\YumiDesktopTest\Location-%d`, time.Now().UnixNano())
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, path, registry.ALL_ACCESS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { key.Close(); registry.DeleteKey(registry.CURRENT_USER, path) }()
+	if err := key.SetDWordValue("DisableLocation", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := key.SetQWordValue("DisableWindowsLocationProvider", 0); err != nil {
+		t.Fatal(err)
+	}
+	st := &sysState{SnapshotVersion: 2}
+	if err := capturePolicyValues(key, st); err != nil {
+		t.Fatal(err)
+	}
+	_ = key.SetDWordValue("DisableLocation", 1)
+	_ = key.SetDWordValue("DisableWindowsLocationProvider", 1)
+	if err := restorePolicyValues(key, st); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]uint32{"DisableLocation": registry.DWORD, "DisableWindowsLocationProvider": registry.QWORD} {
+		value, kind, err := key.GetIntegerValue(name)
+		if err != nil || value != 0 || kind != want {
+			t.Fatalf("lost original %s: value%d type%d %v", name, value, kind, err)
+		}
+	}
+	if err := restorePolicyValues(key, &sysState{SnapshotVersion: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := key.GetIntegerValue("DisableLocation"); err != registry.ErrNotExist {
+		t.Fatal("restored an absent value as zero instead of removing it")
+	}
+	_ = key.SetStringValue("DisableLocation", "administrator policy")
+	if err := capturePolicyValues(key, &sysState{}); err == nil {
+		t.Fatal("accepted an unknown policy type that cannot be restored")
 	}
 }

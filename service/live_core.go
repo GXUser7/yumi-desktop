@@ -8,7 +8,7 @@ import (
 	xoutbound "github.com/xtls/xray-core/features/outbound"
 )
 
-func installLiveOutbound(instance *core.Instance) (*liveOutbound, error) {
+func installLiveOutbound(instance *core.Instance, groups ...*OutboundGroup) (*liveOutbound, error) {
 	manager, ok := instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager)
 	if !ok {
 		return nil, errors.New("outbound manager unavailable")
@@ -16,6 +16,13 @@ func installLiveOutbound(instance *core.Instance) (*liveOutbound, error) {
 	handler := manager.GetHandler("proxy-node")
 	if handler == nil {
 		return nil, errors.New("proxy outbound unavailable")
+	}
+	if len(groups) > 0 && groups[0] != nil {
+		var err error
+		handler, err = prepareGroupOutbound(instance, groups[0], handler)
+		if err != nil {
+			return nil, err
+		}
 	}
 	live := newLiveOutbound(handler)
 	if err := manager.RemoveHandler(context.Background(), "proxy-node"); err != nil {

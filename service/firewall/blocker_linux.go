@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
+	"sync/atomic"
 )
 
 /*
@@ -39,8 +41,7 @@ func Enable(ref TunRef, permitLAN bool) (Firewall, error) {
 	if _, err := exec.LookPath("nft"); err != nil {
 		return nil, errors.New("nft not found: " + err.Error())
 	}
-	shieldCounter++
-	table := fmt.Sprintf("yumi_shield_%d", shieldCounter)
+	table := fmt.Sprintf("yumi_shield_%d_%d", os.Getpid(), atomic.AddUint64(&shieldCounter, 1))
 	var builder strings.Builder
 	builder.WriteString(fmt.Sprintf(`table inet %s {
 chain output { type filter hook output priority 0; policy drop;
@@ -50,9 +51,9 @@ chain output { type filter hook output priority 0; policy drop;
 		builder.WriteString(fmt.Sprintf("	oifname %q accept\n", ref.Name))
 	}
 	builder.WriteString(fmt.Sprintf(`	meta skuid %d accept
-	ct state established,related accept
-	udp dport { 67, 546 } accept
-	ip6 nexthdr icmpv6 accept
+	udp sport 68 udp dport 67 accept
+	udp sport 546 udp dport 547 accept
+	icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
 `, os.Getuid()))
 	if permitLAN {
 		builder.WriteString("	" + lanPermitV4 + "\n	" + lanPermitV6 + "\n")
@@ -61,8 +62,9 @@ chain output { type filter hook output priority 0; policy drop;
 chain input { type filter hook input priority 0; policy drop;
 	iifname "lo" accept
 	ct state established,related accept
-	ip6 nexthdr icmpv6 accept
-	udp sport { 67, 546 } accept
+	icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+	udp sport 67 udp dport 68 accept
+	udp sport 547 udp dport 546 accept
 `))
 	if permitLAN {
 		builder.WriteString("	" + strings.Replace(lanPermitV4, "daddr", "saddr", 1) + "\n	" + strings.Replace(lanPermitV6, "daddr", "saddr", 1) + "\n")
@@ -90,15 +92,21 @@ CleanupLeftovers removes every yumi_shield table a previous life of this daemon 
 standing. Run once at daemon start, before anything else: at that moment no shield of ours is
 supposed to exist, and a block nobody is holding is a machine with no network.
 */
-func CleanupLeftovers() {
+func CleanupLeftovers() error {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return nil
+	}
 	out, err := exec.Command("nft", "list", "tables").Output()
 	if err != nil {
-		return
+		return err
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) == 3 && fields[0] == "table" && fields[1] == "inet" && strings.HasPrefix(fields[2], "yumi_shield") {
-			_ = exec.Command("nft", "delete", "table", "inet", fields[2]).Run()
+		if len(fields) == 3 && fields[0] == "table" && fields[1] == "inet" && regexp.MustCompile(`^yumi_shield_[0-9]+(?:_[0-9]+)?$`).MatchString(fields[2]) {
+			if err := exec.Command("nft", "delete", "table", "inet", fields[2]).Run(); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }

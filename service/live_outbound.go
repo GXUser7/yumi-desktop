@@ -121,6 +121,9 @@ func (l *liveOutbound) replace(next xoutbound.Handler, direct bool) error {
 		return errors.New("outbound closed")
 	}
 	l.current.retired = true
+	if group, ok := l.current.handler.(interface{ Retire() }); ok {
+		group.Retire()
+	}
 	l.current = lease
 	l.leases[lease] = struct{}{}
 	for old := range l.leases {

@@ -96,4 +96,30 @@ class PingTest {
             assertTrue(model.profiles.state.value.latencies.isEmpty())
         }
     }
+
+    @Test fun pingOnlyMeasuresTheSearchResultsAndAnEmptySearchResultDoesNotProbeAnything() = runTest {
+        val measured = mutableListOf<String>()
+        fixture({ node, _ -> measured += node.id; LatencyResult(node.id, 37, 1) }) { model ->
+            runCurrent()
+            model.searchServers(" server 1 ")
+            model.ping(); runCurrent()
+            assertEquals(listOf(model.profiles.nodes.last().id), measured)
+            model.searchServers("Kazakhstan")
+            model.ping(); runCurrent()
+            assertEquals(1, measured.size)
+            model.pingAll(); runCurrent()
+            assertEquals(3, measured.size, "The tray can explicitly measure all servers independently of the saved search")
+        }
+    }
+
+    @Test fun changingSearchCancelsTheSweepBeforeProbingMoreHiddenServers() = runTest {
+        val finished = mutableListOf<String>()
+        fixture({ node, _ -> delay(1000); finished += node.id; LatencyResult(node.id, 21, 1) }) { model ->
+            runCurrent()
+            model.ping(); runCurrent()
+            model.searchServers("Server 1"); runCurrent()
+            advanceTimeBy(1001); runCurrent()
+            assertEquals(listOf(model.profiles.nodes.last().id), finished)
+        }
+    }
 }

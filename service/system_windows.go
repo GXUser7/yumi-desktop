@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -43,33 +42,47 @@ func sysStatePath() string {
 	if root == "" {
 		return ""
 	}
+	return filepath.Join(root, "Yumi Desktop", "state", "sysstate.json")
+}
+
+func legacySysStatePath() string {
+	root := os.Getenv("ProgramData")
+	if root == "" {
+		return ""
+	}
 	return filepath.Join(root, "Yumi Desktop", "sysstate.json")
 }
 
-func currentWindowsTimezone() (string, error) {
-	out, err := exec.Command("tzutil", "/g").Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
+func currentWindowsTimezone() (string, error) { return runSystemCommand("tzutil", "/g") }
+func setWindowsTimezone(id string) error      { _, err := runSystemCommand("tzutil", "/s", id); return err }
 
-func setWindowsTimezone(id string) error {
-	out, err := exec.Command("tzutil", "/s", id).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("tzutil: %s", strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func locationPolicyPresent() bool {
+func captureLocationPolicies(st *sysState) error {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, locationPolicyKey, registry.QUERY_VALUE)
+	if errors.Is(err, registry.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
-		return false
+		return err
 	}
 	defer key.Close()
-	_, _, err = key.GetIntegerValue("DisableLocation")
-	return err == nil
+	return capturePolicyValues(key, st)
+}
+
+func capturePolicyValues(key registry.Key, st *sysState) error {
+	for name, dest := range map[string]*policyValue{
+		"DisableLocation":                &st.DisableLocation,
+		"DisableWindowsLocationProvider": &st.DisableWindowsLocationProvider,
+	} {
+		value, kind, err := key.GetIntegerValue(name)
+		if errors.Is(err, registry.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read location policy %s: %w", name, err)
+		}
+		*dest = policyValue{Present: true, Type: kind, Value: value}
+	}
+	return nil
 }
 
 func setLocationPolicy() error {
@@ -86,24 +99,75 @@ func setLocationPolicy() error {
 
 // A policy the machine already had is the owner's, not ours: it is left standing on restore
 // rather than deleted by something that never wrote it.
-func clearLocationPolicy(had bool) error {
-	if had {
+func restoreLocationPolicies(st *sysState) error {
+	// Old snapshots only recorded presence. Keep an existing administrator policy when its
+	// original value is unknowable; new snapshots preserve both integer types and values.
+	if st.SnapshotVersion < 2 && st.HadPolicy {
 		return nil
 	}
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, locationPolicyKey, registry.SET_VALUE)
+	key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, locationPolicyKey, registry.SET_VALUE)
 	if err != nil {
-		if errors.Is(err, registry.ErrNotExist) {
-			return nil
-		}
 		return err
 	}
 	defer key.Close()
-	for _, name := range []string{"DisableLocation", "DisableWindowsLocationProvider"} {
-		if err := key.DeleteValue(name); err != nil && !errors.Is(err, registry.ErrNotExist) {
-			return err
+	return restorePolicyValues(key, st)
+}
+
+func restorePolicyValues(key registry.Key, st *sysState) error {
+	var result error
+	for name, saved := range map[string]policyValue{
+		"DisableLocation":                st.DisableLocation,
+		"DisableWindowsLocationProvider": st.DisableWindowsLocationProvider,
+	} {
+		var err error
+		switch {
+		case !saved.Present:
+			err = key.DeleteValue(name)
+			if errors.Is(err, registry.ErrNotExist) {
+				err = nil
+			}
+		case saved.Type == registry.DWORD:
+			err = key.SetDWordValue(name, uint32(saved.Value))
+		case saved.Type == registry.QWORD:
+			err = key.SetQWordValue(name, saved.Value)
+		default:
+			err = fmt.Errorf("unsupported saved policy type %d", saved.Type)
 		}
+		result = errors.Join(result, err)
 	}
-	return nil
+	return result
+}
+
+func systemLocationOps() locationOps {
+	return locationOps{
+		currentTimezone: currentWindowsTimezone, setTimezone: setWindowsTimezone,
+		captureSources: func(st *sysState) error {
+			if err := captureLocationPolicies(st); err != nil {
+				return err
+			}
+			s, closeFn, err := openLfsvc()
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+			state, err := s.Query()
+			st.SourcesWereRunning = state.State == svc.Running
+			return err
+		},
+		silenceSources: func(*sysState) error {
+			if err := setLocationPolicy(); err != nil {
+				return err
+			}
+			return lfsvcStop()
+		},
+		restoreSources: func(st *sysState) error {
+			err := restoreLocationPolicies(st)
+			if st.SourcesWereRunning {
+				err = errors.Join(err, lfsvcStart())
+			}
+			return err
+		},
+	}
 }
 
 func openLfsvc() (*mgr.Service, func(), error) {
@@ -136,7 +200,10 @@ func lfsvcStop() error {
 	}
 	defer closeFn()
 	state, err := s.Query()
-	if err != nil || state.State != svc.Running {
+	if err != nil {
+		return err
+	}
+	if state.State != svc.Running {
 		return nil
 	}
 	halt(s)
@@ -150,90 +217,13 @@ func lfsvcStart() error {
 	}
 	defer closeFn()
 	state, err := s.Query()
-	if err != nil || state.State == svc.Running {
+	if err != nil {
+		return err
+	}
+	if state.State == svc.Running {
 		return nil
 	}
 	return s.Start()
-}
-
-/*
-Applies the mode to the machine, taking the one snapshot of how things were the first time and
-moving only the timezone on every call after that. Returns the timezone the system is now in,
-empty when the clock was left alone. Stopping lfsvc is best effort — a service that will not stop
-is not worth failing the mode over, the policy already refuses every client.
-*/
-func applyServerLocation(country string) (string, error) {
-	st, err := readSysState()
-	if err != nil {
-		return "", err
-	}
-	if st != nil && !st.Active {
-		// A restore that died halfway left its snapshot behind. Start over rather than trust a
-		// machine description that may predate changes made since.
-		_ = clearSysState()
-		st = nil
-	}
-	if st == nil {
-		tz, err := currentWindowsTimezone()
-		if err != nil {
-			return "", err
-		}
-		st = &sysState{Active: true, PrevTimezone: tz, SourcesWereRunning: lfsvcRunning(), HadPolicy: locationPolicyPresent()}
-		if err := writeSysState(st); err != nil {
-			return "", err
-		}
-	}
-	if id := countryTimezone(country); id != "" && id != st.Timezone {
-		if err := setWindowsTimezone(id); err != nil {
-			return "", err
-		}
-		st.Timezone, st.Country = id, country
-		if err := writeSysState(st); err != nil {
-			return "", err
-		}
-	}
-	if err := setLocationPolicy(); err != nil {
-		return st.Timezone, err
-	}
-	_ = lfsvcStop()
-	return st.Timezone, nil
-}
-
-/*
-Puts the machine back the way the snapshot found it. Every step is best effort and the snapshot
-survives until all of them have succeeded, so a restore that failed is retried at the service's
-next start instead of being lost with the file.
-*/
-func restoreServerLocation() error {
-	st, err := readSysState()
-	if err != nil || st == nil {
-		return err
-	}
-	var first error
-	note := func(err error) {
-		if err != nil && first == nil {
-			first = err
-		}
-	}
-	if st.Timezone != "" && st.PrevTimezone != st.Timezone {
-		note(setWindowsTimezone(st.PrevTimezone))
-	}
-	note(clearLocationPolicy(st.HadPolicy))
-	if st.SourcesWereRunning {
-		note(lfsvcStart())
-	}
-	if first != nil {
-		return first
-	}
-	return clearSysState()
-}
-
-// The service's start after a crash that left the mode applied. Best effort by design: failing
-// to start the tunnel because yesterday's timezone refused to go back would be worse.
-func restoreAbandonedLocation() {
-	if err := restoreServerLocation(); err != nil {
-		journalLine("location mode restore after start: " + detailOf(err))
-	}
 }
 
 /*

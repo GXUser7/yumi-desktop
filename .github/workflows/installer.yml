@@ -92,6 +92,14 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Tests, service, packages
         run: ./tools/build-unix.sh
+      - name: Service races and isolated nftables syntax
+        run: |
+          go -C service test -race ./... -count=1
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables
+          mkdir -p .local
+          go -C service/firewall test -c -o ../../.local/firewall-linux.test
+          sudo env YUMI_NETWORK_TESTS=1 .local/firewall-linux.test -test.run '^TestNFTRulesParseInAnIsolatedNetworkNamespace$' -test.v
       - uses: actions/upload-artifact@v4
         with:
           name: linux
@@ -114,6 +122,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Tests, service, packages
         run: ./tools/build-unix.sh
+      - name: Service races and PF syntax
+        run: |
+          go -C service test -race ./... -count=1
+          mkdir -p .local
+          go -C service/firewall test -c -o ../../.local/firewall-macos.test
+          sudo env YUMI_PF_SYNTAX_CHECK=1 .local/firewall-macos.test -test.run '^TestPFRulesAcceptedBySystemParser$' -test.v
       - uses: actions/upload-artifact@v4
         with:
           name: macos

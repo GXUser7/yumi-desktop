@@ -69,6 +69,8 @@ type supervisor struct {
 	sysCountry string
 	sysTimezone string
 	sysNote string
+	systemMu sync.Mutex
+	sysRetryAt time.Time
 
 	// Where the routing databases live, and the download in flight; see geo.go. Guarded by mu.
 	geoDir string
@@ -179,6 +181,7 @@ func (s *supervisor) stop() {
     s.status=Status{Version:1,State:"disconnecting"};s.mu.Unlock()
     if input!=nil { _=input.Close() }
     if child!=nil { select {case <-done:case <-time.After(8*time.Second):_=child.Process.Kill();<-done} }
+	restoreWorkerNetwork()
     s.releaseLocationMode()
     s.mu.Lock();s.status=Status{Version:1,State:"disconnected"};s.mu.Unlock()
 }
@@ -214,7 +217,7 @@ func (s *supervisor) connect(r Request) error {
 		// A live switch stays connected with the old server until the worker atomically
 		// publishes the new one. Do not reset counters, the timer or the UI's rate history.
 		if previous.State != "connected" { s.mu.Lock();s.status=initial;s.mu.Unlock() }
-		if err := json.NewEncoder(currentInput).Encode(obj{"config": config, "status": initial}); err != nil {
+		if err := json.NewEncoder(currentInput).Encode(obj{"config": config, "status": initial, "group": r.Group}); err != nil {
 			return errors.New("worker_unavailable")
 		}
 		return nil
@@ -302,6 +305,7 @@ func (s *supervisor) connect(r Request) error {
 		current := s.generation == generation
 		s.mu.Unlock()
 		if current {
+			restoreWorkerNetwork()
 			// A worker that died on its own leaves the machine moved; put it back. A deliberate
 			// stop has already restored by the time the generation moves.
 			s.releaseLocationMode()
@@ -317,7 +321,7 @@ func (s *supervisor) connect(r Request) error {
 		s.mu.Unlock()
 		close(done)
 	}()
-	err = json.NewEncoder(input).Encode(obj{"config": config, "status": initial})
+	err = json.NewEncoder(input).Encode(obj{"config": config, "status": initial, "group": r.Group})
 	if err != nil {
 		s.stop()
 		return errors.New("worker_unavailable")
@@ -381,18 +385,20 @@ yet. Serialized by s.commands like every other change to the system, which is wh
 goroutine hands this to one: a disconnect arriving mid-apply must win, not queue behind it.
 */
 func (s *supervisor) applyLocationMode() {
+    s.systemMu.Lock(); defer s.systemMu.Unlock()
     s.mu.Lock()
     wanted := s.status.State == "connected" && s.options != nil && s.options.MatchLocation
     country := s.status.ServerCountry
     s.mu.Unlock()
     if !wanted { return }
     s.mu.Lock()
-    done := s.sysActive && s.sysCountry == country
+    done := s.sysActive && s.sysCountry == country && (s.sysNote == "" || time.Now().Before(s.sysRetryAt))
     s.mu.Unlock()
     if done { return }
     applied, err := applyServerLocation(country)
     s.mu.Lock()
     s.sysActive = true; s.sysCountry = country
+    s.sysRetryAt = time.Now().Add(15*time.Second)
     if err != nil { s.sysNote = detailOf(err) } else { s.sysNote = ""; s.sysTimezone = applied }
     s.mu.Unlock()
     if err != nil { journalLine("server location: " + detailOf(err)) }
@@ -401,12 +407,16 @@ func (s *supervisor) applyLocationMode() {
 // Gives the machine back to itself. Idempotent and cheap when the mode was never applied, which
 // is what makes it safe to call from every teardown path there is.
 func (s *supervisor) releaseLocationMode() {
+    s.systemMu.Lock(); defer s.systemMu.Unlock()
     s.mu.Lock()
     active := s.sysActive
-    s.sysActive = false; s.sysCountry = ""; s.sysTimezone = ""; s.sysNote = ""
     s.mu.Unlock()
     if !active { return }
-    if err := restoreServerLocation(); err != nil { journalLine("server location restore: " + detailOf(err)) }
+    err := restoreServerLocation()
+    s.mu.Lock()
+    if err == nil { s.sysActive = false; s.sysCountry = ""; s.sysTimezone = ""; s.sysNote = "" } else { s.sysNote = detailOf(err) }
+    s.mu.Unlock()
+    if err != nil { journalLine("server location restore: " + detailOf(err)) }
 }
 
 /** Where the worker's stderr goes, capped and reopened each time. See the platform journals. */

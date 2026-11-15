@@ -21,6 +21,7 @@ class MissingActiveServerUiTest {
         val model = DesktopModel(DemoBackend(), directory, CoroutineScope(SupervisorJob() + StandardTestDispatcher()))
         model.status.value = ServiceStatus(state = "connected", nodeId = "removed-by-refresh", connectedAt = System.currentTimeMillis())
         model.connectionHealth.value = ConnectionHealth.Reachable
+        model.activeLatency.value = com.mydrop.vpn.core.model.LatencyResult("removed-by-refresh", 37, 1)
         try {
             runComposeUiTest {
                 val compact = mutableStateOf(false)
@@ -33,6 +34,7 @@ class MissingActiveServerUiTest {
                     runOnIdle { compact.value = small }
                     onNodeWithText("Активный · нет в списке").assertExists()
                     onNodeWithText("Защищено").assertExists()
+                    onNodeWithText("37", substring = true).assertExists()
                     onNodeWithText("Не выбран").assertDoesNotExist()
                     onNodeWithText("Первый запуск", ignoreCase = true).assertDoesNotExist()
                     onNodeWithText("Уже пользуешься Yumi?").assertDoesNotExist()

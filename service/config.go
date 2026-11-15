@@ -50,6 +50,7 @@ type Request struct {
     Command string `json:"command"`
     NodeID string `json:"nodeId"`
     Outbound map[string]any `json:"outbound"`
+    Group *OutboundGroup `json:"group,omitempty"`
     Options *Options `json:"options"`
     // The active server's country, as the app reads it off the flag in its name. Top level
     // rather than inside Options so a hot switch to a server in another country keeps the
@@ -67,6 +68,9 @@ type Status struct {
     NodeID string `json:"nodeId,omitempty"`
     // Travels with the worker's acknowledged server, including through a rejected hot switch.
     ServerCountry string `json:"serverCountry,omitempty"`
+    GroupMember int `json:"groupMember,omitempty"`
+    GroupMembers int `json:"groupMembers,omitempty"`
+    GroupLatency int `json:"groupLatency,omitempty"`
     ConnectedAt int64 `json:"connectedAt"`
     Upload int64 `json:"upload"`
     Download int64 `json:"download"`
@@ -108,6 +112,11 @@ func decodeRequest(data []byte) (Request, error) {
     if r.Options == nil || r.NodeID == "" || len(r.NodeID) > 128 { return r, errors.New("invalid_options") }
     if err := validateOptions(*r.Options); err != nil { return r, err }
     if err := validateOutbound(r.Outbound); err != nil { return r, err }
+    if r.Group != nil {
+        if len(r.Group.Members) < 1 || len(r.Group.Members) > 64 ||
+            (r.Group.Strategy != "cost" && r.Group.Strategy != "fastest") || r.Group.MaxDelayMillis < 0 || r.Group.MaxDelayMillis > 600000 { return r, errors.New("invalid_group") }
+        for _, member := range r.Group.Members { if err := validateOutbound(member); err != nil { return r, err } }
+    }
     if !validCountry(r.ServerCountry) { return r, errors.New("invalid_country") }
     return r, nil
 }

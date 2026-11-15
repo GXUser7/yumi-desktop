@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+
 package com.yumi.desktop.model
 
 import com.mydrop.vpn.core.model.*
@@ -39,11 +41,18 @@ import kotlinx.serialization.json.*
     val command: String,
     val nodeId: String? = null,
     val outbound: JsonObject? = null,
+    @kotlinx.serialization.EncodeDefault(kotlinx.serialization.EncodeDefault.Mode.NEVER)
+    val group: OutboundGroup? = null,
     val options: TunnelOptions? = null,
     /** The active server's country, read off the flag in its name. Carries the timezone the
      *  service applies in [TunnelOptions.matchLocation] mode. Top level rather than inside
      *  [options] so a hot switch to a server in another country does not restart the worker. */
     val serverCountry: String = "",
+)
+@Serializable data class OutboundGroup(
+    val members: List<JsonObject>,
+    val strategy: String,
+    val maxDelayMillis: Int,
 )
 @Serializable data class ServiceStatus(
     val version: Int = 1,
@@ -53,6 +62,9 @@ import kotlinx.serialization.json.*
     val detail: String? = null,
     val nodeId: String? = null,
     val connectedAt: Long = 0,
+    val groupMember: Int = 0,
+    val groupMembers: Int = 0,
+    val groupLatency: Int = 0,
     val upload: Long = 0,
     val download: Long = 0,
     val probePort: Int = 0,
@@ -78,13 +90,14 @@ import kotlinx.serialization.json.*
 
 object ConnectRequestFactory {
     fun create(node: ProxyNode, settings: AppSettings, desktop: DesktopSettings): ServiceRequest {
-        // One server, always the same one. The window never moves the tunnel by itself, so a
-        // provider's auto-select group is carried as its first member — the provider's own first
-        // choice — rather than as a balancer that would pick among them behind the user's back.
-        val server = node.dialed().first().copy(id = node.id)
-        val document = XrayConfigFactory.build(listOf(server), server, settings.copy(routingMode = RoutingMode.Global), geoAvailable = false)
-        val outbound = Json.parseToJsonElement(document.json).jsonObject.getValue("outbounds").jsonArray.first().jsonObject
+        fun outbound(server: ProxyNode): JsonObject {
+            val document = XrayConfigFactory.build(listOf(server), server, settings.copy(routingMode = RoutingMode.Global), geoAvailable = false)
+            return Json.parseToJsonElement(document.json).jsonObject.getValue("outbounds").jsonArray.first().jsonObject
+        }
+        val members = node.dialed().map(::outbound)
+        val outbound = members.first()
         return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
+            group = node.group?.let { OutboundGroup(members, it.strategy, it.maxDelayMillis) },
             serverCountry = WorldMap.countryCodeOf(node.name) ?: "",
             options = TunnelOptions(
                 mtu = settings.mtu,

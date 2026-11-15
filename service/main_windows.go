@@ -100,12 +100,14 @@ func listenIPC(owner string) (net.Listener,error) {
 type tunnelService struct{owner string}
 func (t *tunnelService) Execute(_ []string,requests <-chan svc.ChangeRequest,changes chan<- svc.Status)(bool,uint32){
     changes<-svc.Status{State:svc.StartPending}
+    if err:=secureDirectory(filepath.Dir(sysStatePath()));err!=nil{return true,1}
     // A previous life of this service may have died with the location mode applied and its
     // snapshot still on disk. Before anything else, the machine goes back to how that snapshot
     // found it.
     restoreAbandonedLocation()
     listener,err:=listenIPC(t.owner)
     if err!=nil{return true,1}
+    defer listener.Close()
     s:=newSupervisor()
     defer shutdownSupervisor(s)
     serveUntilClosed(listener,t.owner,s)

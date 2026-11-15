@@ -16,8 +16,7 @@ class ConnectRequestTest {
         settings = ProxySettings.Vless(uuid = "11111111-2222-3333-4444-555555555555"),
     )
 
-    /** The window never switches servers on its own: a group is ridden as its first member. */
-    @Test fun autoSelectGroupIsCarriedAsItsFirstChoice() {
+    @Test fun autoSelectGroupCarriesEveryMemberAndTheProvidersSelectionPolicy() {
         val members = listOf(server("first.example.com"), server("second.example.com"), server("last.example.com"))
         val group = members.first().copy(id = "group", name = "LTE Авто", group = NodeGroup(members))
         val request = ConnectRequestFactory.create(group, AppSettings(mtu = 1500), DesktopSettings())
@@ -25,6 +24,11 @@ class ConnectRequestTest {
         val address = request.outbound!!.getValue("settings").jsonObject.getValue("vnext").jsonArray.first()
             .jsonObject.getValue("address").jsonPrimitive.content
         assertEquals("first.example.com", address)
+        assertEquals(3, request.group!!.members.size)
+        assertEquals(NodeGroup.STRATEGY_COST, request.group!!.strategy)
+        assertEquals(listOf("first.example.com", "second.example.com", "last.example.com"), request.group!!.members.map {
+            it.getValue("settings").jsonObject.getValue("vnext").jsonArray.first().jsonObject.getValue("address").jsonPrimitive.content
+        })
     }
 
     @Test fun applicationPathsFromOlderSettingsBecomeNames() {

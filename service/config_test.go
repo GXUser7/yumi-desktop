@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,6 +40,15 @@ func TestJVMRequestsAgainstPinnedCore(t *testing.T) {
 			encoded, _ := json.Marshal(buildConfig(r, 19090, "test-user", "test-password", false))
 			if _, err := serial.LoadJSONConfig(strings.NewReader(string(encoded))); err != nil {
 				t.Fatal(err)
+			}
+			if r.Group != nil {
+				for _, member := range r.Group.Members {
+					r.Outbound = member
+					data, _ := json.Marshal(buildConfig(r, 19090, "test-user", "test-password", false))
+					if _, err := serial.LoadJSONConfig(bytes.NewReader(data)); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 		})
 	}

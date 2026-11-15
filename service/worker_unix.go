@@ -40,6 +40,7 @@ func worker() {
 	}
 	var initial struct {
 		Config json.RawMessage `json:"config"`
+		Group  *OutboundGroup  `json:"group"`
 		Status Status          `json:"status"`
 	}
 	if json.Unmarshal(line, &initial) != nil {
@@ -62,7 +63,7 @@ func worker() {
 		fail("core_initialization_failed", err)
 		return
 	}
-	live, err := installLiveOutbound(instance)
+	live, err := installLiveOutbound(instance, initial.Group)
 	if err != nil {
 		_ = instance.Close()
 		fail("core_initialization_failed", err)
@@ -85,10 +86,10 @@ func worker() {
 		// effort — a resolver we cannot point keeps the machine's own, which resolves around
 		// the tunnel rather than through it, and everything else still works.
 		if err := applySystemDNS(); err != nil {
-			journalLine("system dns not captured: " + detailOf(err))
-		} else {
-			defer revertSystemDNS()
+			fail("dns_configuration_failed", err)
+			return
 		}
+		defer restoreWorkerNetwork()
 	} else {
 		fail("tunnel_start_failed", errors.New("tunnel interface did not appear"))
 		return
@@ -96,6 +97,7 @@ func worker() {
 	manager, _ := instance.GetFeature(stats.ManagerType()).(stats.Manager)
 	type control struct {
 		Config     json.RawMessage `json:"config"`
+		Group      *OutboundGroup  `json:"group"`
 		Status     Status          `json:"status"`
 		Disconnect bool            `json:"disconnect"`
 	}
@@ -127,6 +129,7 @@ func worker() {
 			initial.Status.Upload = counter("uplink") - baseUp
 			initial.Status.Download = counter("downlink") - baseDown
 		}
+		initial.Status = live.groupStatus(initial.Status)
 		if encoder.Encode(initial.Status) != nil {
 			return
 		}
@@ -144,6 +147,9 @@ func worker() {
 			parsed, err := serial.LoadJSONConfig(bytes.NewReader(document))
 			if err == nil {
 				handler, e := prepareLiveOutbound(instance, parsed)
+				if e == nil && next.Group != nil {
+					handler, e = prepareGroupOutbound(instance, next.Group, handler)
+				}
 				err = e
 				if err == nil {
 					err = live.replace(handler, next.Disconnect)

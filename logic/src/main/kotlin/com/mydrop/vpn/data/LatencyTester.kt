@@ -1,6 +1,7 @@
 package com.mydrop.vpn.data
 
 import com.mydrop.vpn.core.model.LatencyResult
+import com.mydrop.vpn.core.model.NodeGroup
 import com.mydrop.vpn.core.model.PingMode
 import com.mydrop.vpn.core.model.ProxyNode
 import java.io.Closeable
@@ -40,8 +41,21 @@ import kotlinx.coroutines.withContext
  * unmeasurable for that reason.
  */
 class LatencyTester(private val maxConcurrency: Int = 16) {
+    private val groupProbes = Semaphore(maxConcurrency)
 
-    suspend fun measure(node: ProxyNode, mode: PingMode = PingMode.Tcp): LatencyResult =
+    suspend fun measure(node: ProxyNode, mode: PingMode = PingMode.Tcp): LatencyResult {
+        val group = node.group
+        if (group == null || group.members.isEmpty()) return measureOne(node, mode)
+        val results = coroutineScope {
+            group.members.map { member -> async { groupProbes.withPermit { measureOne(member, mode) } } }.awaitAll()
+        }
+        val delays = results.withIndex().filter { !it.value.failed }
+            .associate { it.index to it.value.millis.coerceAtLeast(1) }
+        val chosen = group.pick(delays)
+        return LatencyResult(node.id, chosen?.let(delays::get) ?: 0, System.currentTimeMillis(), failed = chosen == null)
+    }
+
+    private suspend fun measureOne(node: ProxyNode, mode: PingMode): LatencyResult =
         withContext(Dispatchers.IO) {
             val samples = if (mode == PingMode.Median) MEDIAN_SAMPLES else 1
             val measurements = ArrayList<Int>(samples)

@@ -11,7 +11,7 @@ glass over them, and dragging the window knocks them about on springs.
   what it is carrying (a scrolling pixel map of the world, or the traffic waves), and one loud
   control beside it.
 * **Servers** — a readable list with protocol/transport details, source, selection and latency
-  aligned in each row. Ping can be restarted at any time; connecting probes that server automatically. The server never changes by itself.
+  aligned in each row. Connecting measures the active tunnel immediately. Ping measures only the current search results; the search survives page navigation. Server rows never change by themselves. Happ auto-select rows keep all their members and follow the provider's cost/fastest policy, as on mobile.
 * **Tray** — one click restores the window; the menu switches servers, shows their ping and
   refreshes latency without opening the app.
 * **Connection health** — protection is shown after the tunnel carries a verified request.
@@ -27,8 +27,8 @@ glass over them, and dragging the window knocks them about on springs.
 * **Kill switch** — from connect until disconnect nothing leaves around the tunnel, even when the
   server or the core falls over.
 * **Location as the server's** — while connected, the system timezone moves onto the selected
-  server's and the system's location sources go quiet, so sites and applications that ask where
-  the machine is hear the server's country. Everything is restored on disconnect, and the machine's
+  server's and the system's location sources go quiet. Sites and applications cannot obtain a
+  fresh position from those system sources. This does not synthesize GPS coordinates or erase a browser's cached location. Everything is restored on disconnect, and the machine's
   state is written down first, so even a crash puts it back. Off until enabled in Settings.
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
 * **Fifteen palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
@@ -81,15 +81,16 @@ dmg — and start Yumi. The tunnel service is not registered at install time: th
 asks once for the administrator password (`pkexec` on Linux, the administrator dialog on macOS),
 registers `yumi-tunnel.service` with systemd or the daemon with launchd, and from then on the
 service owns the tunnel exactly as `YumiTunnel` does on Windows — same protocol, same commands,
-a unix socket at `/run/yumi/tunnel.sock` in place of the named pipe.
+a unix socket at `/run/yumi/tunnel.sock` in place of the named pipe. The privileged binary is copied into `/usr/local/libexec/yumi-desktop` on Linux or `/Library/PrivilegedHelperTools` on macOS, independent of the app bundle. Updating the app also reinstalls/restarts that helper.
 
 * The **kill switch** is an nftables table on Linux and a pf anchor on macOS, installed before the
   core starts and removed on disconnect. It permits the service's own account rather than one
   executable — nftables and pf match owners, not programs — so other root processes ride free
   alongside the tunnel; user-level traffic, which is what the shield exists to hold, does not.
+* macOS uses its existing `com.apple/*` PF anchor hook; a custom ruleset without that hook is reported as unsupported rather than replaced. Enabling the kill switch clears pre-existing PF states once; hot replacements preserve current flows.
 * The **system resolver** is pointed into the tunnel while it is up (`resolvectl` where
   systemd-resolved runs, `/etc/resolv.conf` with a kept copy where it does not, `networksetup` on
-  macOS) and given back on the way out.
+  macOS) and given back on the way out. The baseline is stored before the first change and restored after partial failures or a crashed worker as well.
 * **Location as the server's** moves the clock with `timedatectl` or `systemsetup` and silences
   GeoClue or locationd, restoring both from the written-down snapshot.
 * Packages are not code-signed. macOS asks Gatekeeper about the first launch: right-click the

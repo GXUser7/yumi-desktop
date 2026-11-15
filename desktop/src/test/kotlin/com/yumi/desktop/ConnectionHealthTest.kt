@@ -66,6 +66,9 @@ class ConnectionHealthTest {
             reachable = true
             advanceTimeBy(12_501); runCurrent()
             assertEquals(ConnectionHealth.Reachable, model.connectionHealth.value)
+            assertNotNull(model.activeLatency.value)
+            assertFalse(model.activeLatency.value!!.failed)
+            assertTrue(model.activeLatency.value!!.millis > 0)
             assertEquals(1, backend.connects, "Health recovery must not silently reconnect or switch servers")
             reachable = false
             advanceTimeBy(15_001); runCurrent()

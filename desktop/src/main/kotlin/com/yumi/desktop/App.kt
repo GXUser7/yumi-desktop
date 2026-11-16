@@ -1692,7 +1692,7 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
     "platform_not_supported" -> m.text("Служба туннеля недоступна на этой платформе.", "The tunnel service is not available on this platform.")
     "worker_stopped" -> m.text("Ядро VPN неожиданно остановилось.", "The VPN core stopped unexpectedly.")
     "hot_swap_failed" -> m.text("Не удалось сменить сервер. Предыдущее соединение сохранено.", "Could not switch servers. The previous connection is still active.")
-    "dns_configuration_failed" -> m.text("Не удалось настроить DNS. Исходные настройки сохранены для восстановления.", "Could not configure DNS. Original settings were kept for recovery.")
+    "dns_configuration_failed" -> m.text("Не удалось настроить DNS-защиту соединения.", "Could not configure DNS protection for the connection.")
     "invalid_group" -> m.text("Некорректная группа серверов в подписке.", "The subscription contains an invalid server group.")
     "invalid_dns" -> m.text("Проверь адрес DNS-резолвера.", "Check the DNS resolver address.")
     "invalid_application" -> m.text("Одно из приложений в туннелировании записано неправильно.", "One of the split-tunnelling applications is malformed.")

@@ -108,12 +108,17 @@ func TestLiveCoreKeepsDirectSocketsAndCumulativeProxyCounters(t *testing.T) {
 		t.Fatalf("first flow counted %d bytes, want5", first)
 	}
 	next("proxy-node")
-	exchange(proxy, "old-flow")
+	_ = proxy.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := proxy.Read(make([]byte, 1)); err == nil {
+		t.Fatal("old VPN socket survived a server change")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("old VPN socket was left open instead of being interrupted")
+	}
 	newest := dial(proxyPort)
 	exchange(newest, "new-flow")
 	exchange(bypass, "game-direct")
-	if got := count(); got != first+16 {
-		t.Fatalf("old/new flows counted %d, want%d", got, first+16)
+	if got := count(); got != first+8 {
+		t.Fatalf("new flow counted %d, want%d", got, first+8)
 	}
 	next("direct-forward")
 	exchange(bypass, "game-still-connected")

@@ -51,7 +51,7 @@ func startHeld(t *testing.T, live *liveOutbound, h *heldOutbound) (context.Conte
 	return await(t, h.entered), cancel
 }
 
-func TestLiveSwitchRetainsEstablishedSessionsAndRetiresDrainedHandlers(t *testing.T) {
+func TestLiveSwitchCancelsOldVPNFlowsAndRetiresTheirHandlers(t *testing.T) {
 	first, second := heldHandler(), heldHandler()
 	live := newLiveOutbound(first)
 	defer live.Close()
@@ -59,14 +59,7 @@ func TestLiveSwitchRetainsEstablishedSessionsAndRetiresDrainedHandlers(t *testin
 	if err := live.replace(second, false); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-old.Done():
-		t.Fatal("switch cancelled the old flow")
-	default:
-	}
-	if first.closes.Load() != 0 {
-		t.Fatal("active old handler was closed")
-	}
+	await(t, old.Done())
 	_, finishNew := startHeld(t, live, second)
 	finishOld()
 	await(t, first.ended)

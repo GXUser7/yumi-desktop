@@ -62,15 +62,20 @@ both, and testing on a Public one is worth doing because that is what a laptop g
 - [ ] `ipconfig` shows the Wintun adapter; a browser reports the server's country.
 - [ ] Check for leaks: the address on <https://browserleaks.com/ip> matches the exit country, and
       the DNS shown there is the resolver from settings — not your provider's.
+      Repeat immediately after the first connect, after VPN off/on, and with kill switch off
+      and LAN bypass on. Saving the same DNS value must not be needed to stop a leak.
+      Save DNS/MTU and change IPv6 while the initial connection is still starting: the eventual
+      tunnel must use the latest saved values. After VPN-off, ordinary system DNS must work.
 - [ ] Disconnect. VPN is off and new connections go direct. The Yumi adapter stays available as
       a direct forwarding stack, so existing excluded-app sockets do not have to reconnect.
       Stop the YumiTunnel service: its worker exits and Yumi's routes, DNS and addresses are removed.
 - [ ] Connect, then kill `yumi-service.exe` from Task Manager. The application must notice and say
       the service is unavailable, not sit on a stale "connected".
 - [ ] Switch servers while connected: no intermediate disconnected state, reset of the session
-      timer, traffic totals or rate graph. New connections use the selected server; established
-      connections keep their previous server until they finish. An unavailable old server cannot
-      preserve its existing remote sessions. Changing MTU, IPv6, routing/DNS or physical-adapter
+      timer, traffic totals or rate graph. Old VPN connections close and reconnect through the
+      selected server; refresh an IP check in a browser that was already open. Discord inside
+      the VPN may briefly reconnect. Existing direct connections must continue. Changing MTU,
+      IPv6, routing/DNS or physical-adapter
       options still rebuilds the forwarding stack and may reconnect applications.
 - [ ] Exclude Fortnite and run a match plus continuous direct TCP and UDP echo traffic. Switch
       servers repeatedly, then turn VPN off/on: excluded flows must keep their original socket,

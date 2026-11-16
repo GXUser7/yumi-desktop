@@ -81,30 +81,12 @@ func assertMuxFlowStopped(t *testing.T, flow muxFlow, handler *muxLikeOutbound) 
 	}
 }
 
-func TestLiveMuxSessionSurvivesSwitchAndStopsItsAsyncPumpOnDisconnect(t *testing.T) {
+func TestLiveSwitchStopsOldMuxSessionAndItsAsyncPump(t *testing.T) {
 	first := newMuxLikeOutbound()
 	live := newLiveOutbound(first)
 	defer live.Close()
 	flow := startMuxFlow(t, live, first)
 	if err := live.replace(heldHandler(), false); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-flow.context.Done():
-		t.Fatal("changing server cancelled the old mux flow")
-	case <-flow.dispatch:
-		t.Fatal("mux scheduling was mistaken for the end of its flow")
-	default:
-	}
-	if first.closed.Load() != 0 {
-		t.Fatal("the old mux handler was retired while its flow was still live")
-	}
-	buffer := buf.New()
-	_, _ = buffer.WriteString("existing flow still carries data")
-	if err := flow.upWriter.WriteMultiBuffer(buf.MultiBuffer{buffer}); err != nil {
-		t.Fatalf("server change interrupted an established mux stream: %v", err)
-	}
-	if err := live.replace(heldHandler(), true); err != nil {
 		t.Fatal(err)
 	}
 	assertMuxFlowStopped(t, flow, first)

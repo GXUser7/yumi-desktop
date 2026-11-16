@@ -73,6 +73,7 @@ class DesktopModel(
     private var tunnelMonitor: Job? = null
     private var speedJob: Job? = null
     private var startupConnectPending = desktop.value.connectOnLaunch
+    private var settingsReconnectPending = false
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
         DeviceIdentity(settings.value.deviceId, System.getProperty("os.name"), System.getProperty("os.version"), "Yumi Desktop")
     }, probeEndpoint = { status.value.probe() })
@@ -100,6 +101,13 @@ class DesktopModel(
             while (isActive) {
                 commands.withLock {
                     updateStatus(backend.request(ServiceRequest(command = "status")))
+                    if (settingsReconnectPending && status.value.state == "connected") {
+                        settingsReconnectPending = false
+                        cancelSpeed()
+                        reconnectActive()
+                    } else if (status.value.state in listOf("disconnected", "failed")) {
+                        settingsReconnectPending = false
+                    }
                     connectOnStartup()
                 }
                 sampleTraffic()
@@ -295,6 +303,7 @@ class DesktopModel(
 
     private suspend fun connectNode(node: ProxyNode?) {
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
+        settingsReconnectPending = false
         // Preserve geo/service metadata while the connect command is in flight. Dropping it
         // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
         val hotSwap = status.value.state == "connected"
@@ -317,22 +326,36 @@ class DesktopModel(
     }
     fun changeSettings(transform: (AppSettings) -> AppSettings, reconnect: Boolean = false) = action {
         commands.withLock {
+            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
             settings.update(transform)
-            if (reconnect && status.value.state == "connected") { cancelSpeed(); reconnectActive() }
+            if (reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) applyConnectionSettings()
         }
     }
     fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = action {
         commands.withLock {
+            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
             if (next.launchAtLogin != desktop.value.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
             val loweringShield = desktop.value.killSwitch && !next.killSwitch
             desktop.update { next }
             if (!next.connectOnLaunch) startupConnectPending = false
-            if (reconnect && status.value.state == "connected") { cancelSpeed(); reconnectActive() }
+            if ((reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) &&
+                status.value.state in listOf("connected", "connecting")) applyConnectionSettings()
             // Switching the kill switch off while it holds a dead tunnel means "give me my
             // internet back", not "next time": the block comes down now.
             else if (loweringShield && status.value.killSwitch && status.value.state != "connecting") {
                 updateStatus(backend.request(ServiceRequest(command = "disconnect")))
             }
+        }
+    }
+    private suspend fun applyConnectionSettings() {
+        if (status.value.state == "connected") {
+            settingsReconnectPending = false
+            cancelSpeed()
+            reconnectActive()
+        } else if (status.value.state == "connecting") {
+            // The worker is still starting with the previous snapshot. Apply the latest saved
+            // settings as soon as it acknowledges, including several changes made during startup.
+            settingsReconnectPending = true
         }
     }
     fun importText(raw: String) = action {

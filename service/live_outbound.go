@@ -13,8 +13,8 @@ import (
 )
 
 // liveOutbound keeps the TUN and the direct outbound alive when the chosen server changes.
-// Each flow leases its original handler: new flows use the new server, established flows drain
-// on the previous one. An explicit disconnect cancels VPN leases, but never direct leases.
+// Switching servers cancels VPN flows so persistent browser/DoH connections cannot retain the
+// previous exit country. Direct leases (including the VPN-off forwarder) survive every switch.
 type liveOutbound struct {
 	mu      sync.Mutex
 	current *outboundLease
@@ -131,7 +131,7 @@ func (l *liveOutbound) replace(next xoutbound.Handler, direct bool) error {
 			delete(l.leases, old)
 			closing = append(closing, old)
 		}
-		if direct && !old.direct {
+		if old.retired && !old.direct {
 			for cancel := range old.sessions {
 				cancelling = append(cancelling, *cancel)
 			}

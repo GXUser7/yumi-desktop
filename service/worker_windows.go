@@ -70,7 +70,12 @@ func worker() {
 		fail("core_initialization_failed", err)
 		return
 	}
-	defer func() { cleanAdapter(); instance.Close() }()
+	dns := newTunnelDNSProtection()
+	defer func() { cleanAdapter(); instance.Close(); dns.close() }()
+	if err = dns.enable(); err != nil {
+		fail("dns_configuration_failed", err)
+		return
+	}
 	if err = instance.Start(); err != nil {
 		fail("tunnel_start_failed", err)
 		return
@@ -127,6 +132,14 @@ func worker() {
 			if !ok {
 				return
 			}
+			wasProtected := initial.Status.State == "connected"
+			if !next.Disconnect {
+				if err := dns.enable(); err != nil {
+					initial.Status.Error = "dns_configuration_failed"
+					initial.Status.Detail = detailOf(err)
+					continue
+				}
+			}
 			document := next.Config
 			if next.Disconnect {
 				// Keep the forwarding stack and its direct flows intact while VPN is off.
@@ -145,11 +158,15 @@ func worker() {
 				}
 			}
 			if err != nil {
+				if !wasProtected {
+					dns.close()
+				}
 				initial.Status.Error = "hot_swap_failed"
 				initial.Status.Detail = detailOf(err)
 				continue
 			}
 			if next.Disconnect {
+				dns.close()
 				initial.Status = Status{Version: 1, State: "disconnected", ProbePort: initial.Status.ProbePort, ProbeUser: initial.Status.ProbeUser, ProbePassword: initial.Status.ProbePassword, TunLUID: initial.Status.TunLUID}
 			} else {
 				wasConnected := initial.Status.State == "connected"

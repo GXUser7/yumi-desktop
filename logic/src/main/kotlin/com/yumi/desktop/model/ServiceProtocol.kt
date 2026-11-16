@@ -99,19 +99,21 @@ object ConnectRequestFactory {
         return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
             group = node.group?.let { OutboundGroup(members, it.strategy, it.maxDelayMillis) },
             serverCountry = WorldMap.countryCodeOf(node.name) ?: "",
-            options = TunnelOptions(
-                mtu = settings.mtu,
-                ipv6 = settings.enableIpv6,
-                bypassLan = settings.bypassLan,
-                dns = settings.remoteDns,
-                splitMode = desktop.splitMode,
-                applications = desktop.applications.map(RuleValidation::application).distinct(),
-                domains = desktop.domains.map(RuleValidation::domain),
-                networks = desktop.networks.map(RuleValidation::network),
-                killSwitch = desktop.killSwitch,
-                matchLocation = desktop.matchServerLocation,
-                bypassRussia = desktop.bypassRussia,
-                outboundAdapter = desktop.outboundAdapter,
-            ))
+            options = options(settings, desktop))
     }
+
+    fun options(settings: AppSettings, desktop: DesktopSettings): TunnelOptions = TunnelOptions(
+        mtu = settings.mtu,
+        ipv6 = settings.enableIpv6,
+        bypassLan = settings.bypassLan,
+        dns = settings.remoteDns,
+        splitMode = desktop.splitMode,
+        applications = desktop.applications.map(RuleValidation::application).distinct(),
+        domains = desktop.domains.map(RuleValidation::domain),
+        networks = desktop.networks.map(RuleValidation::network),
+        killSwitch = desktop.killSwitch,
+        matchLocation = desktop.matchServerLocation,
+        bypassRussia = desktop.bypassRussia,
+        outboundAdapter = desktop.outboundAdapter,
+    )
 }

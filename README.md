@@ -132,13 +132,20 @@ not exist on laptops: Windows marks a new Wi-Fi network public by default, so th
 applied and the phone's connection was dropped without a word. The domain profile is deliberately
 left out.
 
-Switching servers keeps the forwarding stack alive: new connections use the selected server,
-while established connections finish on their original one. The session timer and traffic totals
+Switching servers keeps the forwarding stack alive and reconnects VPN flows through the selected
+server. Existing direct connections are preserved. The session timer and traffic totals
 continue across the switch. Turning VPN off cancels VPN connections and sends new traffic directly;
 the adapter stays up as a direct forwarding stack so excluded applications keep their existing
 sockets. Stopping the Windows service removes the adapter's routes and closes that stack.
 Changing routing, DNS, MTU, IPv6 or the physical adapter still requires rebuilding it. A connection
 whose remote server has died cannot be transferred to another server without reconnecting.
+
+Tunnel settings are applied on the first connection and immediately after a saved change. Changes
+saved while connecting are applied once the worker starts. On Windows, a separate dynamic WFP
+session restricts TCP/UDP DNS to the tunnel resolver, even with kill switch off and LAN bypass on.
+It prevents physical-adapter DNS fallback and clears the system DNS cache when enabled or removed.
+The restriction is removed when VPN is turned off or the worker exits; physical-adapter settings
+are not rewritten. Browser-managed encrypted DNS follows the browser's own settings and routing.
 
 ### Kill switch
 

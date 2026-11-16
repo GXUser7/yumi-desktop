@@ -1,4 +1,4 @@
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.3"
 #define AppImage "..\desktop\build\compose\binaries\main\app\Yumi"
 [Setup]
 AppId={{E8CB03D0-C852-4375-BF1B-A83F09E118B7}

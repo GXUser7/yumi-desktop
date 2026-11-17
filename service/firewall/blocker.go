@@ -32,7 +32,8 @@ when the process holding it dies. That is the property that makes this safe to s
 service can never leave a machine without a network, at worst without a kill switch.
 */
 type wfpShield struct {
-	session uintptr
+	session      uintptr
+	closeSession func(uintptr) error
 }
 
 func createWfpSession() (uintptr, error) {
@@ -118,57 +119,69 @@ Several may be enabled at once. Moving the kill switch onto a new adapter is don
 new one and only then closing the old, so there is no instant at which neither is installed.
 */
 func Enable(ref TunRef, permitLAN bool) (Firewall, error) {
-	session, err := createWfpSession()
+	return enableWithBackend(defaultWFPBackend, ref, permitLAN)
+}
+
+func enableWithBackend(backend wfpBackend, ref TunRef, permitLAN bool) (Firewall, error) {
+	session, err := backend.openSession()
 	if err != nil {
 		return nil, wrapErr(err)
 	}
 
 	objectInstaller := func(session uintptr) error {
-		baseObjects, err := registerBaseObjects(session)
+		baseObjects, err := backend.registerBase(session)
 		if err != nil {
 			return wrapErr(err)
 		}
 
-		err = permitWireGuardService(session, baseObjects, 15)
+		err = permitWireGuardService(backend, session, baseObjects, 15)
 		if err != nil {
 			return wrapErr(err)
 		}
 
-		err = permitLoopback(session, baseObjects, 13)
+		err = permitLoopback(backend, session, baseObjects, 13)
 		if err != nil {
 			return wrapErr(err)
 		}
 
 		if ref.LUID != 0 {
-			err = permitTunInterface(session, baseObjects, 12, ref.LUID)
+			err = permitTunInterface(backend, session, baseObjects, 12, ref.LUID)
 			if err != nil {
 				return wrapErr(err)
 			}
 		}
 
-		err = permitDHCPIPv4(session, baseObjects, 12)
+		err = permitDHCPIPv4(backend, session, baseObjects, 12)
 		if err != nil {
 			return wrapErr(err)
 		}
 
-		err = permitDHCPIPv6(session, baseObjects, 12)
+		err = permitDHCPIPv6(backend, session, baseObjects, 12)
 		if err != nil {
 			return wrapErr(err)
 		}
 
-		err = permitNdp(session, baseObjects, 12)
+		err = permitNdp(backend, session, baseObjects, 12)
+		if err != nil {
+			return wrapErr(err)
+		}
+
+		// Block DNS (53), DoT (853), and LLMNR (5355) above permitLocalNetwork (10) so LAN
+		// resolvers cannot leak name lookups even when permitLAN is set or the worker crashes,
+		// while still below permitTunInterface (12), permitLoopback (13), and the service (15).
+		err = blockNameResolution(backend, session, baseObjects, 11)
 		if err != nil {
 			return wrapErr(err)
 		}
 
 		if permitLAN {
-			err = permitLocalNetwork(session, baseObjects, 12)
+			err = permitLocalNetwork(backend, session, baseObjects, 10)
 			if err != nil {
 				return wrapErr(err)
 			}
 		}
 
-		err = blockAll(session, baseObjects, 0)
+		err = blockAll(backend, session, baseObjects, 0)
 		if err != nil {
 			return wrapErr(err)
 		}
@@ -176,13 +189,13 @@ func Enable(ref TunRef, permitLAN bool) (Firewall, error) {
 		return nil
 	}
 
-	err = runTransaction(session, objectInstaller)
+	err = backend.runTx(session, objectInstaller)
 	if err != nil {
-		fwpmEngineClose0(session)
+		_ = backend.closeSession(session)
 		return nil, wrapErr(err)
 	}
 
-	return &wfpShield{session: session}, nil
+	return &wfpShield{session: session, closeSession: backend.closeSession}, nil
 }
 
 // Close removes every filter this kill switch installed. Safe to call more than once.
@@ -190,6 +203,10 @@ func (f *wfpShield) Close() {
 	if f == nil || f.session == 0 {
 		return
 	}
-	fwpmEngineClose0(f.session)
+	closeFn := f.closeSession
+	if closeFn == nil {
+		closeFn = fwpmEngineClose0
+	}
+	_ = closeFn(f.session)
 	f.session = 0
 }

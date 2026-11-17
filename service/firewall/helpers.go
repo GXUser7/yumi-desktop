@@ -17,6 +17,33 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+type wfpBackend struct {
+	openSession  func() (uintptr, error)
+	closeSession func(uintptr) error
+	runTx        func(uintptr, wfpObjectInstaller) error
+	registerBase func(uintptr) (*baseObjects, error)
+	addFilter    func(uintptr, *wtFwpmFilter0) error
+	currentAppID func() (*wtFwpByteBlob, func(), error)
+}
+
+var defaultWFPBackend = wfpBackend{
+	openSession:  createWfpSession,
+	closeSession: fwpmEngineClose0,
+	runTx:        runTransaction,
+	registerBase: registerBaseObjects,
+	addFilter: func(session uintptr, filter *wtFwpmFilter0) error {
+		var filterID uint64
+		return fwpmFilterAdd0(session, filter, 0, &filterID)
+	},
+	currentAppID: func() (*wtFwpByteBlob, func(), error) {
+		appID, err := getCurrentProcessAppID()
+		if err != nil {
+			return nil, nil, err
+		}
+		return appID, func() { fwpmFreeMemory0(unsafe.Pointer(&appID)) }, nil
+	},
+}
+
 func runTransaction(session uintptr, operation wfpObjectInstaller) error {
 	err := fwpmTransactionBegin0(session, 0)
 	if err != nil {

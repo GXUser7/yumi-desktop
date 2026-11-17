@@ -22,8 +22,16 @@ func TestPFRulesAcceptedBySystemParser(t *testing.T) {
 		if err := os.WriteFile(path, []byte(rules), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if out, err := exec.Command("pfctl", "-n", "-a", yumiPFAnchor, "-f", path).CombinedOutput(); err != nil {
+		if out, err := exec.Command("/sbin/pfctl", "-n", "-a", yumiPFAnchor, "-f", path).CombinedOutput(); err != nil {
 			t.Fatalf("PF syntax: %s %v", out, err)
 		}
+	}
+}
+
+func TestGetPlatformPFIsSingleton(t *testing.T) {
+	first := getPlatformPF()
+	second := getPlatformPF()
+	if first == nil || first != second {
+		t.Fatalf("getPlatformPF did not return a non-nil singleton: %p vs %p", first, second)
 	}
 }

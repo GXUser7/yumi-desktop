@@ -45,7 +45,7 @@ func TestPFReplacementAndRepeatedCloseCannotRemoveTheActiveShield(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := c.enable(TunRef{Name: "utun70"}, false)
+	second, err := c.enable(TunRef{Name: "utun70"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,11 +148,60 @@ func TestPFRulesPermitTunnelLoopbackAndLANAheadOfTheFinalBlock(t *testing.T) {
 			t.Fatalf("missing exception %s", value)
 		}
 	}
+	const blockNameRule = "block drop out quick proto { tcp, udp } from any to any port { 53, 853, 5355 }"
+	idxBlockName := strings.Index(rules, blockNameRule)
+	if idxBlockName < 0 {
+		t.Fatalf("missing DNS/DoT/LLMNR block rule in:\n%s", rules)
+	}
+	for _, before := range []string{"pass quick on lo0 all", "pass quick on utun69 all", "pass out quick user root"} {
+		if idx := strings.Index(rules, before); idx < 0 || idx >= idxBlockName {
+			t.Fatalf("rule %q must precede %q:\n%s", before, blockNameRule, rules)
+		}
+	}
+	if idxLAN := strings.Index(rules, "pass out quick inet to"); idxLAN < 0 || idxBlockName >= idxLAN {
+		t.Fatalf("DNS/DoT/LLMNR block rule must precede LAN pass rules:\n%s", rules)
+	}
 	without, _ := pfRules(TunRef{Name: "utun69"}, false)
 	if strings.Contains(without, "192.168.0.0/16") {
 		t.Fatal("LAN bypass ignored its setting")
 	}
+	if !strings.Contains(without, blockNameRule) {
+		t.Fatal("DNS/DoT/LLMNR block rule missing when LAN bypass is off")
+	}
 	if _, err := pfRules(TunRef{Name: "utun69\npass all"}, true); err == nil {
 		t.Fatal("accepted an injected interface")
 	}
+}
+
+func TestPFDisablingLANBypassFlushesEstablishedStates(t *testing.T) {
+	c, f := pfFixture(t)
+	s1, err := c.enable(TunRef{Name: "utun69"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := c.enable(TunRef{Name: "utun69"}, true) // false -> true: no flush
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+	if got := strings.Count(strings.Join(f.commands, "\n"), "-F states"); got != 1 {
+		t.Fatalf("expected 1 state flush after false->true, got %d (%v)", got, f.commands)
+	}
+	s3, err := c.enable(TunRef{Name: "utun69"}, false) // true -> false: must flush
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+	if got := strings.Count(strings.Join(f.commands, "\n"), "-F states"); got != 2 {
+		t.Fatalf("expected 2 state flushes after true->false, got %d (%v)", got, f.commands)
+	}
+	s4, err := c.enable(TunRef{Name: "utun70"}, false) // false -> false: no flush
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3.Close()
+	if got := strings.Count(strings.Join(f.commands, "\n"), "-F states"); got != 2 {
+		t.Fatalf("expected 2 state flushes after false->false, got %d (%v)", got, f.commands)
+	}
+	s4.Close()
 }

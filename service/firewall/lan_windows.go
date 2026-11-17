@@ -37,44 +37,64 @@ var (
 	}
 )
 
-func permitLocalNetwork(session uintptr, baseObjects *baseObjects, weight uint8) error {
-	// Several conditions on the same field are an OR, which is what lets one filter per layer
-	// carry every range.
-	conditionsV4 := make([]wtFwpmFilterCondition0, len(lanV4))
-	for i := range lanV4 {
-		conditionsV4[i] = wtFwpmFilterCondition0{
-			fieldKey:  cFWPM_CONDITION_IP_REMOTE_ADDRESS,
-			matchType: cFWP_MATCH_EQUAL,
-			conditionValue: wtFwpConditionValue0{
-				_type: cFWP_V4_ADDR_MASK,
-				value: uintptr(unsafe.Pointer(&lanV4[i])),
-			},
-		}
-	}
-	conditionsV6 := make([]wtFwpmFilterCondition0, len(lanV6))
-	for i := range lanV6 {
-		conditionsV6[i] = wtFwpmFilterCondition0{
-			fieldKey:  cFWPM_CONDITION_IP_REMOTE_ADDRESS,
-			matchType: cFWP_MATCH_EQUAL,
-			conditionValue: wtFwpConditionValue0{
-				_type: cFWP_V6_ADDR_MASK,
-				value: uintptr(unsafe.Pointer(&lanV6[i])),
-			},
-		}
-	}
+func permitLocalNetwork(backend wfpBackend, session uintptr, baseObjects *baseObjects, weight uint8) error {
+	return permitLocalNetworkFamilies(backend, session, baseObjects, weight, true, true)
+}
 
-	filterID := uint64(0)
-	for _, def := range []struct {
+func permitLocalNetworkV6(backend wfpBackend, session uintptr, baseObjects *baseObjects, weight uint8) error {
+	return permitLocalNetworkFamilies(backend, session, baseObjects, weight, false, true)
+}
+
+func permitLocalNetworkFamilies(backend wfpBackend, session uintptr, baseObjects *baseObjects, weight uint8, allowV4, allowV6 bool) error {
+	type lanFilterDef struct {
 		name       string
 		v6         bool
 		conditions []wtFwpmFilterCondition0
 		inbound    bool
-	}{
-		{"Permit outbound to the local network (IPv4)", false, conditionsV4, false},
-		{"Permit inbound from the local network (IPv4)", false, conditionsV4, true},
-		{"Permit outbound to the local network (IPv6)", true, conditionsV6, false},
-		{"Permit inbound from the local network (IPv6)", true, conditionsV6, true},
-	} {
+	}
+	var defs []lanFilterDef
+
+	// Several conditions on the same field are an OR, which is what lets one filter per layer
+	// carry every range.
+	var conditionsV4 []wtFwpmFilterCondition0
+	if allowV4 {
+		conditionsV4 = make([]wtFwpmFilterCondition0, len(lanV4))
+		for i := range lanV4 {
+			conditionsV4[i] = wtFwpmFilterCondition0{
+				fieldKey:  cFWPM_CONDITION_IP_REMOTE_ADDRESS,
+				matchType: cFWP_MATCH_EQUAL,
+				conditionValue: wtFwpConditionValue0{
+					_type: cFWP_V4_ADDR_MASK,
+					value: uintptr(unsafe.Pointer(&lanV4[i])),
+				},
+			}
+		}
+		defs = append(defs,
+			lanFilterDef{"Permit outbound to the local network (IPv4)", false, conditionsV4, false},
+			lanFilterDef{"Permit inbound from the local network (IPv4)", false, conditionsV4, true},
+		)
+	}
+
+	var conditionsV6 []wtFwpmFilterCondition0
+	if allowV6 {
+		conditionsV6 = make([]wtFwpmFilterCondition0, len(lanV6))
+		for i := range lanV6 {
+			conditionsV6[i] = wtFwpmFilterCondition0{
+				fieldKey:  cFWPM_CONDITION_IP_REMOTE_ADDRESS,
+				matchType: cFWP_MATCH_EQUAL,
+				conditionValue: wtFwpConditionValue0{
+					_type: cFWP_V6_ADDR_MASK,
+					value: uintptr(unsafe.Pointer(&lanV6[i])),
+				},
+			}
+		}
+		defs = append(defs,
+			lanFilterDef{"Permit outbound to the local network (IPv6)", true, conditionsV6, false},
+			lanFilterDef{"Permit inbound from the local network (IPv6)", true, conditionsV6, true},
+		)
+	}
+
+	for _, def := range defs {
 		displayData, err := createWtFwpmDisplayData0(def.name, "")
 		if err != nil {
 			return wrapErr(err)
@@ -100,8 +120,7 @@ func permitLocalNetwork(session uintptr, baseObjects *baseObjects, weight uint8)
 		default:
 			filter.layerKey = cFWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6
 		}
-		err = fwpmFilterAdd0(session, &filter, 0, &filterID)
-		if err != nil {
+		if err := backend.addFilter(session, &filter); err != nil {
 			return wrapErr(err)
 		}
 	}

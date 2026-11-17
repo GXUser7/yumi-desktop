@@ -3,11 +3,13 @@
 package firewall
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func nftFixture(t *testing.T) (string, string) {
@@ -25,9 +27,18 @@ else
  if [ "$1" = "-f" ]; then cat > "$YUMI_NFT_RULES"; fi
 fi
 `
-	if err := os.WriteFile(filepath.Join(dir, "nft"), []byte(script), 0o755); err != nil {
+	nftBin := filepath.Join(dir, "nft")
+	if err := os.WriteFile(nftBin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	origFind := findNFTPath
+	origEnv := nftEnv
+	findNFTPath = func() (string, error) { return nftBin, nil }
+	nftEnv = os.Environ
+	t.Cleanup(func() {
+		findNFTPath = origFind
+		nftEnv = origEnv
+	})
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return rules, commands
 }
@@ -84,5 +95,133 @@ func TestNFTRulesParseInAnIsolatedNetworkNamespace(t *testing.T) {
 			t.Fatalf("nft syntax: %s %v", out, err)
 		}
 		shield.Close()
+	}
+}
+
+func TestNFTRulesBlockDNSDoTLLMNRBeforeLANAndEnforceForwardChain(t *testing.T) {
+	rules, err := buildRuleset("yumi_shield_10_1", TunRef{Name: "tun0"}, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(rules, "chain input")
+	if len(parts) != 2 {
+		t.Fatalf("missing input chain: %s", rules)
+	}
+	output := parts[0]
+	inAndFwd := strings.Split(parts[1], "chain forward")
+	if len(inAndFwd) != 2 {
+		t.Fatalf("missing forward chain: %s", rules)
+	}
+	forward := inAndFwd[1]
+
+	for _, required := range []string{`oifname "lo" accept`, `oifname "tun0" accept`, "meta skuid 0 accept"} {
+		if idxReq, idxDrop := strings.Index(output, required), strings.Index(output, "udp dport { 53, 853, 5355 } drop"); idxReq < 0 || idxDrop < 0 || idxReq >= idxDrop {
+			t.Fatalf("output must permit %q before port 53/853/5355 drop:\n%s", required, output)
+		}
+	}
+	for _, drop := range []string{"udp dport { 53, 853, 5355 } drop", "tcp dport { 53, 853, 5355 } drop"} {
+		idxDrop := strings.Index(output, drop)
+		idxLAN := strings.Index(output, lanPermitV4)
+		if idxDrop < 0 || idxLAN < 0 || idxDrop >= idxLAN {
+			t.Fatalf("output must drop %q before LAN permit:\n%s", drop, output)
+		}
+	}
+
+	if !strings.Contains(forward, "type filter hook forward priority 0; policy drop;") || !strings.Contains(forward, "ct state invalid drop") {
+		t.Fatalf("forward chain missing drop policy or invalid drop:\n%s", forward)
+	}
+	for _, tunRule := range []string{`oifname "tun0" accept`, `iifname "tun0" ct state established,related accept`} {
+		idxTun := strings.Index(forward, tunRule)
+		idxDrop := strings.Index(forward, "udp dport { 53, 853, 5355 } drop")
+		if idxTun < 0 || idxDrop < 0 || idxTun >= idxDrop {
+			t.Fatalf("forward must permit %q before port 53/853/5355 drop:\n%s", tunRule, forward)
+		}
+	}
+	if idxTCP, idxLAN := strings.Index(forward, "tcp dport { 53, 853, 5355 } drop"), strings.Index(forward, lanPermitV4); idxTCP < 0 || idxLAN < 0 || idxTCP >= idxLAN {
+		t.Fatalf("forward must drop 53/853/5355 before LAN permit:\n%s", forward)
+	}
+
+	crashRules, err := buildRuleset("yumi_shield_10_2", TunRef{}, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(crashRules, `oifname ""`) || strings.Contains(crashRules, `iifname ""`) {
+		t.Fatalf("empty tunnel ref emitted empty interface match:\n%s", crashRules)
+	}
+	noLAN, err := buildRuleset("yumi_shield_10_3", TunRef{Name: "tun0"}, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(noLAN, "192.168.0.0/16") || strings.Contains(noLAN, "fc00::/7") {
+		t.Fatalf("permitLAN=false leaked LAN permits:\n%s", noLAN)
+	}
+	if _, err := buildRuleset("yumi_shield_10_4", TunRef{Name: "tun0\naccept"}, false, 0); err == nil {
+		t.Fatal("accepted injected interface name")
+	}
+}
+
+func TestNFTDeleteTableRetriesOnEBUSYAndUsesSanitizedDefaultEnv(t *testing.T) {
+	defaultEnv := strings.Join(nftEnv(), "\n")
+	if !strings.Contains(defaultEnv, "PATH=/usr/sbin:/usr/bin:/sbin:/bin") {
+		t.Fatalf("default nft env missing sanitized PATH: %q", defaultEnv)
+	}
+
+	dir := t.TempDir()
+	attemptsFile := filepath.Join(dir, "attempts")
+	nftBin := filepath.Join(dir, "nft")
+	script := fmt.Sprintf(`#!/bin/sh
+n=0
+if [ -f %q ]; then n=$(cat %q); fi
+n=$((n + 1))
+printf '%%s' "$n" > %q
+if [ "$1" = "delete" ] && [ "$n" -le 2 ]; then
+  echo "Error: Could not process rule: Device or resource busy" >&2
+  exit 1
+fi
+exit 0
+`, attemptsFile, attemptsFile, attemptsFile)
+	if err := os.WriteFile(nftBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origDelay := nftRetryDelay
+	origEnv := nftEnv
+	nftRetryDelay = time.Millisecond
+	nftEnv = os.Environ
+	t.Cleanup(func() {
+		nftRetryDelay = origDelay
+		nftEnv = origEnv
+	})
+
+	shield := &nftShield{nftPath: nftBin, table: "yumi_shield_99_1"}
+	shield.Close()
+	data, err := os.ReadFile(attemptsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != "3" {
+		t.Fatalf("expected 3 attempts (2 EBUSY retries + 1 success), got %q", string(data))
+	}
+
+	if err := os.WriteFile(attemptsFile, []byte("0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	alwaysBusy := `#!/bin/sh
+n=$(cat "$YUMI_ATTEMPTS")
+n=$((n + 1))
+printf '%s' "$n" > "$YUMI_ATTEMPTS"
+echo "Device or resource busy" >&2
+exit 1
+`
+	if err := os.WriteFile(nftBin, []byte(alwaysBusy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YUMI_ATTEMPTS", attemptsFile)
+	if err := deleteNFTTable(nftBin, "yumi_shield_99_2"); err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	data, _ = os.ReadFile(attemptsFile)
+	if strings.TrimSpace(string(data)) != "4" {
+		t.Fatalf("expected 4 total attempts (1 initial + 3 retries), got %q", string(data))
 	}
 }

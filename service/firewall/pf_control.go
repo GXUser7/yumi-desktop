@@ -25,12 +25,13 @@ type pfRecovery struct {
 }
 type pfController struct {
 	sync.Mutex
-	run    firewallCommand
-	path   string
-	next   uint64
-	active map[uint64]pfSpec
-	token  string
-	bootID string
+	run     firewallCommand
+	path    string
+	next    uint64
+	active  map[uint64]pfSpec
+	prevLAN bool
+	token   string
+	bootID  string
 }
 type pfShield struct {
 	controller *pfController
@@ -52,6 +53,7 @@ func pfRules(ref TunRef, lan bool) (string, error) {
 	b.WriteString("pass out quick inet6 proto udp from any port 546 to any port 547\n")
 	b.WriteString("pass in quick inet6 proto udp from any port 547 to any port 546\n")
 	b.WriteString("pass quick inet6 proto ipv6-icmp icmp6-type { routersol, routeradv, neighbrsol, neighbradv }\n")
+	b.WriteString("block drop out quick proto { tcp, udp } from any to any port { 53, 853, 5355 }\n")
 	if lan {
 		b.WriteString("pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }\n")
 		b.WriteString("pass in quick inet from { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }\n")
@@ -92,6 +94,7 @@ func (c *pfController) enable(ref TunRef, lan bool) (Firewall, error) {
 	c.Lock()
 	defer c.Unlock()
 	first := len(c.active) == 0
+	prevLAN := !first && c.prevLAN
 	if first {
 		root, err := c.run("", "-sr")
 		if err != nil {
@@ -125,11 +128,18 @@ func (c *pfController) enable(ref TunRef, lan bool) (Firewall, error) {
 		}
 		return nil, err
 	}
-	if first {
+	if first || (prevLAN && !lan) {
 		// PF consults existing states before rules. Close pre-VPN direct states once, after the
-		// shield is in place; replacements must preserve the current tunnel's established flows.
+		// shield is in place, and flush established LAN states when BypassLAN is turned off;
+		// ordinary replacements preserve the current tunnel's established flows.
 		if _, err = c.run("", "-F", "states"); err != nil {
-			_ = c.cleanupLocked()
+			if first {
+				_ = c.cleanupLocked()
+			} else if prev, ok := c.latestActiveLocked(); ok {
+				if prevRules, rerr := pfRules(prev.ref, prev.lan); rerr == nil {
+					_, _ = c.run(prevRules, "-a", yumiPFAnchor, "-f", "-")
+				}
+			}
 			return nil, err
 		}
 	}
@@ -138,7 +148,21 @@ func (c *pfController) enable(ref TunRef, lan bool) (Firewall, error) {
 	}
 	c.next++
 	c.active[c.next] = pfSpec{ref: ref, lan: lan}
+	c.prevLAN = lan
 	return &pfShield{controller: c, id: c.next}, nil
+}
+
+func (c *pfController) latestActiveLocked() (pfSpec, bool) {
+	if len(c.active) == 0 {
+		return pfSpec{}, false
+	}
+	var maxID uint64
+	for id := range c.active {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return c.active[maxID], true
 }
 
 func (s *pfShield) Close() {
@@ -167,6 +191,7 @@ func (s *pfShield) Close() {
 			return
 		}
 		delete(c.active, s.id)
+		c.prevLAN = previous.lan
 		return
 	}
 	if c.cleanupLocked() == nil {
@@ -184,6 +209,7 @@ func (c *pfController) cleanupLocked() error {
 		}
 		c.token = ""
 	}
+	c.prevLAN = false
 	if err := os.Remove(c.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

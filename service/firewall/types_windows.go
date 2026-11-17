@@ -92,6 +92,14 @@ var cFWPM_CONDITION_IP_LOCAL_INTERFACE = windows.GUID{
 	Data4: [8]byte{0xb7, 0xf3, 0xbd, 0xa5, 0xd3, 0x28, 0x90, 0xa4},
 }
 
+// Defined in fwpmu.h. 1076b8a5-6323-4c5e-9810-e8d3fc9e6136
+var cFWPM_CONDITION_IP_FORWARD_INTERFACE = windows.GUID{
+	Data1: 0x1076b8a5,
+	Data2: 0x6323,
+	Data3: 0x4c5e,
+	Data4: [8]byte{0x98, 0x10, 0xe8, 0xd3, 0xfc, 0x9e, 0x61, 0x36},
+}
+
 // Defined in fwpmu.h. b235ae9a-1d64-49b8-a44c-5ff3d9095045
 var cFWPM_CONDITION_IP_REMOTE_ADDRESS = windows.GUID{
 	Data1: 0xb235ae9a,
@@ -227,6 +235,22 @@ var cFWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6 = windows.GUID{
 	Data4: [8]byte{0xb8, 0x7e, 0xce, 0xe9, 0xc4, 0x83, 0x25, 0x7f},
 }
 
+// FWPM_LAYER_IPFORWARD_V4 (a82acc24-4ee1-4ee1-b465-fd1d25cb10a4) defined in fwpmu.h
+var cFWPM_LAYER_IPFORWARD_V4 = windows.GUID{
+	Data1: 0xa82acc24,
+	Data2: 0x4ee1,
+	Data3: 0x4ee1,
+	Data4: [8]byte{0xb4, 0x65, 0xfd, 0x1d, 0x25, 0xcb, 0x10, 0xa4},
+}
+
+// FWPM_LAYER_IPFORWARD_V6 (7b964818-19c7-493a-b71f-832c3684d28c) defined in fwpmu.h
+var cFWPM_LAYER_IPFORWARD_V6 = windows.GUID{
+	Data1: 0x7b964818,
+	Data2: 0x19c7,
+	Data3: 0x493a,
+	Data4: [8]byte{0xb7, 0x1f, 0x83, 0x2c, 0x36, 0x84, 0xd2, 0x8c},
+}
+
 // 94c44912-9d6f-4ebf-b995-05ab8a088d1b
 var cFWPM_LAYER_OUTBOUND_MAC_FRAME_NATIVE = windows.GUID{
 	Data1: 0x94c44912,
@@ -266,7 +290,7 @@ type wtFwpConditionValue0 wtFwpValue0
 
 // FWP_DATA_TYPE defined in fwptypes.h
 // (https://docs.microsoft.com/en-us/windows/desktop/api/fwptypes/ne-fwptypes-fwp_data_type_)
-type wtFwpDataType uint
+type wtFwpDataType uint32
 
 const (
 	cFWP_EMPTY                         wtFwpDataType = 0
@@ -359,7 +383,7 @@ type wtFwpmSession0 struct {
 	processId            uint32 // Windows type: DWORD
 	sid                  *windows.SID
 	username             *uint16 // Windows type: *wchar_t
-	kernelMode           uint8   // Windows type: BOOL
+	kernelMode           uint32  // Windows type: BOOL
 }
 
 type wtFwpmSublayerFlags uint32

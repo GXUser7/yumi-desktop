@@ -20,7 +20,11 @@ data class SubscriptionUserInfo(
     val usedBytes: Long?
         get() = when {
             uploadBytes == null && downloadBytes == null -> null
-            else -> (uploadBytes ?: 0L) + (downloadBytes ?: 0L)
+            else -> {
+                val up = (uploadBytes ?: 0L).coerceAtLeast(0L)
+                val down = (downloadBytes ?: 0L).coerceAtLeast(0L)
+                if (up > Long.MAX_VALUE - down) Long.MAX_VALUE else up + down
+            }
         }
 
     /** Fraction of the plan consumed, or null when the provider does not publish a quota. */

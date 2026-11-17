@@ -1,9 +1,10 @@
 package com.mydrop.vpn.core.parse
 
 import com.mydrop.vpn.core.model.DnsProfile
-import java.util.Base64
-import com.mydrop.vpn.core.net.splitHostPort
 import com.mydrop.vpn.core.net.isNumericAddress
+import com.mydrop.vpn.core.net.splitHostPort
+import java.net.URI
+import java.util.Base64
 
 /**
  * Recognises the many ways a resolver is written down.
@@ -33,35 +34,35 @@ object DnsUriParser {
 
     /** Null when the text is not a resolver at all — a proxy link, a subscription URL, prose. */
     fun parse(text: String, subscriptionId: String? = null): DnsProfile? {
-        val trimmed = text.trim().removeSuffix("/")
-        if (trimmed.isEmpty()) return null
+        val raw = text.trim()
+        if (raw.isEmpty()) return null
 
-        val name = trimmed.substringAfter('#', "").takeIf { it.isNotBlank() }?.let(::urlDecode)
-        val body = trimmed.substringBefore('#')
+        val name = raw.substringAfter('#', "").takeIf { it.isNotBlank() }?.let(::urlDecode)
+        val body = raw.substringBefore('#').trim().removeSuffix("/")
+        if (body.isEmpty()) return null
 
         val url = when {
             // A stamp reaches the same place by another road, so the refusals below are applied
             // to what it decodes to rather than to the `sdns://` it arrived as.
-            body.startsWith("sdns://", ignoreCase = true) ->
-                fromStamp(body)?.takeIf(::carriable) ?: return null
-            body.startsWith("https://", ignoreCase = true) -> body
+            body.startsWith("sdns://", ignoreCase = true) -> {
+                val decoded = fromStamp(body)?.takeIf(::carriable) ?: return null
+                when {
+                    decoded.startsWith("https://", ignoreCase = true) -> canonicalizeHttps(decoded) ?: return null
+                    else -> canonicalizeBare(decoded, allowHostname = false) ?: return null
+                }
+            }
+            body.startsWith("https://", ignoreCase = true) -> canonicalizeHttps(body) ?: return null
             // See the note above: no DoT in this core, and DoQ only in a form that cannot be
             // routed. Both refused rather than quietly turned into something weaker.
             body.startsWith("tls://", ignoreCase = true) -> return null
             body.startsWith("quic://", ignoreCase = true) -> return null
             body.startsWith("h3://", ignoreCase = true) -> return null
-            body.startsWith("tcp://", ignoreCase = true) -> body
-            body.startsWith("udp://", ignoreCase = true) -> body.removePrefix("udp://")
+            body.startsWith("tcp://", ignoreCase = true) -> canonicalizeTcp(body) ?: return null
+            body.startsWith("udp://", ignoreCase = true) ->
+                canonicalizeBare(body.substringAfter("://"), allowHostname = true) ?: return null
             // A bare address is a plain resolver: `1.1.1.1`, `8.8.8.8:53`, `[2606:4700::1111]`.
-            looksLikeBareAddress(body) -> body
+            looksLikeBareAddress(body) -> canonicalizeBare(body, allowHostname = false) ?: return null
             else -> return null
-        }
-
-        // A DoH link and a subscription link are both https, so the caller cannot tell them apart
-        // by scheme; requiring the well-known path is what keeps a subscription from being
-        // imported as a resolver.
-        if (url.startsWith("https://") && !url.contains("/dns-query") && !url.contains("/dns")) {
-            return null
         }
 
         return DnsProfile(
@@ -70,6 +71,37 @@ object DnsUriParser {
             url = url,
             subscriptionId = subscriptionId,
         )
+    }
+
+    private fun canonicalizeHttps(raw: String): String? {
+        val uri = runCatching { URI(raw) }.getOrNull() ?: return null
+        if (!uri.scheme.equals("https", ignoreCase = true)) return null
+        if (uri.userInfo != null || uri.rawUserInfo != null) return null
+        if (uri.host.isNullOrBlank()) return null
+        val path = uri.rawPath.orEmpty().trimEnd('/')
+        if (path != "/dns-query" && !path.startsWith("/dns-query/")) return null
+        return "https://" + raw.substringAfter("://")
+    }
+
+    private fun canonicalizeTcp(raw: String): String? {
+        val uri = runCatching { URI(raw) }.getOrNull() ?: return null
+        if (!uri.scheme.equals("tcp", ignoreCase = true)) return null
+        if (uri.userInfo != null || uri.rawUserInfo != null) return null
+        if (uri.host.isNullOrBlank()) return null
+        return "tcp://" + raw.substringAfter("://")
+    }
+
+    private fun canonicalizeBare(raw: String, allowHostname: Boolean): String? {
+        if ('@' in raw || '/' in raw || '?' in raw || ' ' in raw) return null
+        val parsed = splitHostPort(raw) ?: return null
+        if (!allowHostname && !isNumericAddress(parsed.host)) return null
+        val normalizedHost = normalizeServerHost(parsed.host) ?: return null
+        val port = parsed.port
+        return when {
+            port == null || port == 53 -> normalizedHost
+            ':' in normalizedHost -> "udp://[$normalizedHost]:$port"
+            else -> "udp://$normalizedHost:$port"
+        }
     }
 
     /** Every resolver in a blob of text, for pasting a provider's whole page. */
@@ -91,24 +123,37 @@ object DnsUriParser {
      */
     private fun fromStamp(stamp: String): String? = runCatching {
         val payload = Base64.getUrlDecoder()
-            .decode(stamp.removePrefix("sdns://").removePrefix("SDNS://").trimEnd('='))
+            .decode(stamp.substringAfter("://").trimEnd('='))
         if (payload.size < 9) return null
 
         var offset = 9
         fun readField(): String {
-            val length = payload[offset].toInt() and 0x7f
+            if (offset >= payload.size) throw IllegalArgumentException("Truncated stamp")
+            val length = payload[offset].toInt() and 0xff
             val start = offset + 1
+            if (start + length > payload.size) throw IllegalArgumentException("Truncated stamp field")
             offset = start + length
             return String(payload, start, length, Charsets.UTF_8)
         }
 
         fun skipHashes() {
             while (true) {
+                if (offset >= payload.size) throw IllegalArgumentException("Truncated stamp hashes")
                 val raw = payload[offset].toInt() and 0xff
                 val length = raw and 0x7f
                 offset += 1 + length
+                if (offset > payload.size) throw IllegalArgumentException("Truncated stamp hash")
                 if (raw and 0x80 == 0) break
             }
+        }
+
+        fun formatAuthority(rawHost: String, defaultPort: Int): String? {
+            if ('@' in rawHost) return null
+            val parsed = splitHostPort(rawHost) ?: return null
+            if (parsed.host.isBlank()) return null
+            val host = if (':' in parsed.host) "[${parsed.host}]" else parsed.host
+            val port = parsed.port
+            return if (port != null && port != defaultPort) "$host:$port" else host
         }
 
         when (payload[0].toInt() and 0xff) {
@@ -118,20 +163,24 @@ object DnsUriParser {
                 val address = readField()
                 skipHashes()
                 val hostname = readField().ifEmpty { address }
-                val path = readField().ifEmpty { "/dns-query" }
-                "https://${hostname.substringBefore(':')}$path"
+                val rawPath = readField().ifEmpty { "/dns-query" }
+                val authority = formatAuthority(hostname, 443) ?: return null
+                val path = if (rawPath.startsWith('/')) rawPath else "/$rawPath"
+                "https://$authority$path"
             }
 
             0x03 -> {
                 val address = readField()
                 skipHashes()
-                "tls://${readField().ifEmpty { address }.substringBefore(':')}"
+                val authority = formatAuthority(readField().ifEmpty { address }, 853) ?: return null
+                "tls://$authority"
             }
 
             0x04 -> {
                 val address = readField()
                 skipHashes()
-                "quic://${readField().ifEmpty { address }.substringBefore(':')}"
+                val authority = formatAuthority(readField().ifEmpty { address }, 853) ?: return null
+                "quic://$authority"
             }
 
             else -> null

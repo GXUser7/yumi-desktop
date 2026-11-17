@@ -1,6 +1,8 @@
 package com.mydrop.vpn.core.parse
 
 import com.mydrop.vpn.core.model.ProxyNode
+import com.mydrop.vpn.core.model.ProxySettings
+import com.mydrop.vpn.core.model.identified
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Test
@@ -117,5 +119,18 @@ class NodeIdentityTest {
         val a = ProxyUriParser.parse("vless://$uuid@node.example.com:443?security=tls&fp=chrome#N")!!
         val b = ProxyUriParser.parse("vless://$uuid@node.example.com:443?security=tls&fp=firefox#N")!!
         assertEquals(a.id, b.id)
+    }
+
+    @Test
+    fun `vless flow and wireguard privateKey and localAddresses distinguish node identities`() {
+        val vlessPlain = ProxyNode("", "N", "example.com", 443, ProxySettings.Vless("u", flow = "")).identified()
+        val vlessVision = ProxyNode("", "N", "example.com", 443, ProxySettings.Vless("u", flow = "xtls-rprx-vision")).identified()
+        assertNotEquals(vlessPlain.id, vlessVision.id)
+
+        val wgA = ProxyNode("", "WG", "wg.example", 51820, ProxySettings.WireGuard("privA", "pub", localAddresses = listOf("10.0.0.2/32"))).identified()
+        val wgB = ProxyNode("", "WG", "wg.example", 51820, ProxySettings.WireGuard("privB", "pub", localAddresses = listOf("10.0.0.2/32"))).identified()
+        val wgC = ProxyNode("", "WG", "wg.example", 51820, ProxySettings.WireGuard("privA", "pub", localAddresses = listOf("10.0.0.3/32"))).identified()
+        assertNotEquals(wgA.id, wgB.id)
+        assertNotEquals(wgA.id, wgC.id)
     }
 }

@@ -386,4 +386,45 @@ class ProxyUriParserTest {
         )
         assertEquals("decoy.com", explicitNode.tls?.serverName)
     }
+
+    @Test
+    fun `server hosts are normalized across schemes and legacy forms`() {
+        val vless = ProxyUriParser.parse("vless://uuid@Пример.рф.:443?security=tls#IDN")!!
+        assertEquals("xn--e1afmkfd.xn--p1ai", vless.server)
+
+        val ssRaw = "aes-256-gcm:secret@Example.COM.:8388"
+        val ssLegacy = ProxyUriParser.parse("SS://" + Base64.getEncoder().encodeToString(ssRaw.toByteArray()) + "#SS")!!
+        assertEquals("Example.COM", ssLegacy.server)
+
+        val vmessJson = """{"v":"2","ps":"V","add":"[2001:db8::1].","port":443,"id":"u","tls":"tls"}"""
+        val vmess = ProxyUriParser.parse("VMESS://" + Base64.getEncoder().encodeToString(vmessJson.toByteArray()))!!
+        assertEquals("2001:db8::1", vmess.server)
+    }
+
+    @Test
+    fun `parseWireGuard requires non-empty privateKey across aliases`() {
+        assertNull(ProxyUriParser.parse("wireguard://@1.2.3.4:51820?publickey=pub"))
+        assertNull(ProxyUriParser.parse("wireguard://1.2.3.4:51820?publickey=pub"))
+        assertNotNull(ProxyUriParser.parse("wireguard://1.2.3.4:51820?private-key=priv&publickey=pub"))
+        assertNotNull(ProxyUriParser.parse("wireguard://1.2.3.4:51820?private_key=priv&public_key=pub"))
+    }
+
+    @Test
+    fun `parseVmessJson rejects reality without pbk and parses reality with pbk`() {
+        val noPbk = """{"v":"2","ps":"bad","add":"a.example","port":443,"id":"u","tls":"reality"}"""
+        assertNull(ProxyUriParser.parse("vmess://" + Base64.getEncoder().encodeToString(noPbk.toByteArray())))
+
+        val withPbk = """{"v":"2","ps":"ok","add":"a.example","port":443,"id":"u","tls":"reality","pbk":"ab+cd/ef=","sid":"01"}"""
+        val node = ProxyUriParser.parse("vmess://" + Base64.getEncoder().encodeToString(withPbk.toByteArray()))!!
+        assertEquals("ab-cd_ef", node.tls?.reality?.publicKey)
+        assertEquals("01", node.tls?.reality?.shortId)
+    }
+
+    @Test
+    fun `hysteria2 and tuic ignore stream transport query parameters`() {
+        val hy2 = ProxyUriParser.parse("hy2://pass@example.com:443?type=ws&path=%2Fws#H")!!
+        assertNull(hy2.transport)
+        val tuic = ProxyUriParser.parse("tuic://uuid:pass@example.com:443?type=ws&path=%2Fws#T")!!
+        assertNull(tuic.transport)
+    }
 }

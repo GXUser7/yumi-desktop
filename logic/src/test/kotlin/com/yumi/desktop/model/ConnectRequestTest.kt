@@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class ConnectRequestTest {
@@ -47,5 +48,26 @@ class ConnectRequestTest {
             DesktopSettings(outboundAdapter = "Беспроводная сеть"),
         )
         assertEquals("Беспроводная сеть", request.options!!.outboundAdapter)
+    }
+
+    @Test fun createRejectsDirectAndUnsupportedNodesAndClampsMtu() {
+        assertThrows(IllegalArgumentException::class.java) {
+            ConnectRequestFactory.create(
+                ProxyNode("d", "Direct", "127.0.0.1", 80, ProxySettings.Direct),
+                AppSettings(),
+                DesktopSettings(),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            ConnectRequestFactory.create(
+                ProxyNode("s4", "Socks4", "example.com", 1080, ProxySettings.Socks(version = "4")),
+                AppSettings(),
+                DesktopSettings(),
+            )
+        }
+        val lowMtu = ConnectRequestFactory.create(server("a.example.com"), AppSettings(mtu = 500), DesktopSettings())
+        assertEquals(1280, lowMtu.options!!.mtu)
+        val highMtu = ConnectRequestFactory.create(server("a.example.com"), AppSettings(mtu = 20_000), DesktopSettings())
+        assertEquals(9000, highMtu.options!!.mtu)
     }
 }

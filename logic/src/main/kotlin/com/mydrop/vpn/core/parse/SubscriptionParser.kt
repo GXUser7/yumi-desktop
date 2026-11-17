@@ -36,6 +36,10 @@ object SubscriptionParser {
         val trimmed = body.trim()
         if (trimmed.isEmpty()) return SubscriptionBody.Empty(EmptyReason.EmptyResponse)
 
+        if (trimmed.startsWith("happ://crypt", ignoreCase = true)) {
+            return SubscriptionBody.UnsupportedFormat("happ://crypt")
+        }
+
         structured(trimmed, subscriptionId)?.let { return it }
 
         // Plain-text list first: base64 decoding a list of URIs would garble it anyway, and
@@ -51,6 +55,10 @@ object SubscriptionParser {
 
         val decoded = base64DecodeOrNull(trimmed)
             ?: return SubscriptionBody.Empty(EmptyReason.NotBase64)
+
+        if (decoded.trim().startsWith("happ://crypt", ignoreCase = true)) {
+            return SubscriptionBody.UnsupportedFormat("happ://crypt")
+        }
 
         // A base64 body can hold a document just as easily as a list of links.
         structured(decoded, subscriptionId)?.let { return it }

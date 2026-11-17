@@ -7,6 +7,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import javax.imageio.ImageIO
 import javax.swing.Icon
@@ -130,19 +131,318 @@ object AppCatalog {
         }.mapNotNull(::parseDesktopEntry)
     }
 
-    private fun parseDesktopEntry(file: File): DesktopApp? {
+    internal fun parseDesktopEntry(file: File): DesktopApp? {
         val text = runCatching { file.readText() }.getOrNull() ?: return null
-        if (Regex("^NoDisplay=true", RegexOption.MULTILINE).containsMatchIn(text)) return null
-        val name = Regex("^Name=(.*)$", RegexOption.MULTILINE).find(text)?.groupValues?.get(1)?.trim()
-        val exec = Regex("^Exec=(.*)$", RegexOption.MULTILINE).find(text)?.groupValues?.get(1)?.trim() ?: return null
-        // Exec carries field codes (%f, %u) and the occasional quoting; what the core matches is
-        // the program the line runs. A token with a path in it is more specific than `flatpak`.
-        val tokens = exec.split(' ').map { it.trim().trim('"') }.filter { it.isNotEmpty() && !it.startsWith("%") }
-        val binary = tokens.firstOrNull { it.contains('/') } ?: tokens.firstOrNull() ?: return null
+        val entrySection = desktopEntrySection(text) ?: return null
+        if (Regex("^NoDisplay\\s*=\\s*true\\b", RegexOption.MULTILINE).containsMatchIn(entrySection)) return null
+        if (Regex("^Hidden\\s*=\\s*true\\b", RegexOption.MULTILINE).containsMatchIn(entrySection)) return null
+        val name = Regex("^Name=(.*)$", RegexOption.MULTILINE).find(entrySection)?.groupValues?.get(1)?.trim()
+        val exec = Regex("^Exec=(.*)$", RegexOption.MULTILINE).find(entrySection)?.groupValues?.get(1)?.trim() ?: return null
+        val binary = unwrapDesktopExec(exec) ?: return null
         val process = File(binary).name
         if (process.isEmpty()) return null
-        return DesktopApp(process, name ?: prettify(process), desktopIcon(text) ?: binary, running = false)
+        return DesktopApp(process, name?.takeIf { it.isNotEmpty() } ?: prettify(process), desktopIcon(entrySection) ?: binary, running = false)
     }
+
+    private fun desktopEntrySection(text: String): String? {
+        val lines = text.lineSequence().iterator()
+        var inEntry = false
+        val out = StringBuilder()
+        while (lines.hasNext()) {
+            val line = lines.next()
+            val trimmed = line.trim()
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                if (trimmed == "[Desktop Entry]") {
+                    inEntry = true
+                    continue
+                }
+                if (inEntry) break
+            } else if (inEntry) {
+                out.append(line).append('\n')
+            }
+        }
+        return out.toString().takeIf { inEntry }
+    }
+
+    internal fun unwrapDesktopExec(exec: String): String? = unwrapTokens(tokenizeDesktopExec(exec), depth = 0)
+
+    private fun unwrapTokens(rawTokens: List<String>, depth: Int): String? {
+        if (depth > 8) return null
+        var idx = 0
+        while (idx < rawTokens.size) {
+            val token = rawTokens[idx]
+            if (isFieldCodeToken(token) || isEnvAssignment(token) || token == "exec") {
+                idx++
+                continue
+            }
+            val headName = File(token).name
+            return when (headName) {
+                "env" -> unwrapEnv(rawTokens, idx + 1, depth + 1)
+                "flatpak" -> if (rawTokens.getOrNull(idx + 1) == "run") unwrapFlatpakRun(rawTokens, idx + 2) else token
+                "snap" -> if (rawTokens.getOrNull(idx + 1) == "run") unwrapSnapRun(rawTokens, idx + 2) else token
+                "sh", "bash", "dash", "zsh" -> unwrapShell(rawTokens, idx + 1, depth + 1) ?: token
+                else -> token
+            }
+        }
+        return null
+    }
+
+    private fun unwrapEnv(tokens: List<String>, start: Int, depth: Int): String? {
+        var i = start
+        while (i < tokens.size) {
+            val tok = tokens[i]
+            if (tok == "--") {
+                i++
+                break
+            }
+            if (tok == "-u" || tok == "--unset" || tok == "-C" || tok == "--chdir") {
+                i += 2
+                continue
+            }
+            if (tok == "-S" || tok == "--split-string") {
+                val script = tokens.getOrNull(i + 1) ?: return null
+                return unwrapTokens(tokenizeDesktopExec(script), depth + 1)
+            }
+            if (tok.startsWith("-")) {
+                i++
+                continue
+            }
+            if (isEnvAssignment(tok)) {
+                i++
+                continue
+            }
+            break
+        }
+        return if (i < tokens.size) unwrapTokens(tokens.subList(i, tokens.size), depth + 1) else null
+    }
+
+    private fun unwrapFlatpakRun(tokens: List<String>, start: Int): String? {
+        val valueFlags = setOf(
+            "--branch", "--arch", "--commit", "--runtime", "--runtime-version", "--filesystem",
+            "--env", "--share", "--unshare", "--socket", "--nosocket", "--device", "--allow",
+            "--disallow", "--own-name", "--talk-name", "--system-own-name", "--system-talk-name",
+            "--persist", "--cwd",
+        )
+        var i = start
+        var endOfFlags = false
+        while (i < tokens.size) {
+            val tok = tokens[i]
+            if (!endOfFlags) {
+                if (tok == "--") {
+                    endOfFlags = true
+                    i++
+                    continue
+                }
+                if (tok.startsWith("--command=")) {
+                    return tok.substringAfter('=').takeIf { it.isNotBlank() }
+                }
+                if (tok == "--command") {
+                    return tokens.getOrNull(i + 1)?.takeIf { it.isNotBlank() }
+                }
+                if (tok in valueFlags) {
+                    i += 2
+                    continue
+                }
+                if (tok.startsWith("-")) {
+                    i++
+                    continue
+                }
+            }
+            if (isFieldCodeToken(tok) || tok.startsWith("@@")) {
+                i++
+                continue
+            }
+            return tok.takeIf { it.isNotBlank() }
+        }
+        return null
+    }
+
+    private fun unwrapSnapRun(tokens: List<String>, start: Int): String? {
+        val valueFlags = setOf("--command", "--color", "--unicode", "--shell")
+        var i = start
+        var endOfFlags = false
+        while (i < tokens.size) {
+            val tok = tokens[i]
+            if (!endOfFlags) {
+                if (tok == "--") {
+                    endOfFlags = true
+                    i++
+                    continue
+                }
+                if (tok in valueFlags && '=' !in tok) {
+                    // `--shell` takes no arg; others like `--color=never` usually have `=`.
+                    i += if (tok == "--shell") 1 else 2
+                    continue
+                }
+                if (tok.startsWith("-")) {
+                    i++
+                    continue
+                }
+            }
+            if (isFieldCodeToken(tok)) {
+                i++
+                continue
+            }
+            val app = tok.substringAfterLast('.')
+            return app.takeIf { it.isNotBlank() }
+        }
+        return null
+    }
+
+    private fun unwrapShell(tokens: List<String>, start: Int, depth: Int): String? {
+        var i = start
+        while (i < tokens.size) {
+            val tok = tokens[i]
+            if (tok == "--") {
+                i++
+                break
+            }
+            val isCommandFlag = tok == "-c" || (tok.startsWith("-") && !tok.startsWith("--") && 'c' in tok)
+            if (isCommandFlag) {
+                val script = tokens.getOrNull(i + 1) ?: return null
+                for (clause in splitShellClauses(script)) {
+                    val clauseTokens = tokenizeDesktopExec(clause)
+                    val first = clauseTokens.firstOrNull { !isEnvAssignment(it) } ?: continue
+                    if (first in setOf("cd", "export", "unset", "umask", "ulimit", "source", ".", "true", ":")) continue
+                    val resolved = unwrapTokens(clauseTokens, depth + 1)
+                    if (resolved != null) return resolved
+                }
+                return null
+            }
+            if (tok.startsWith("-")) {
+                i++
+                continue
+            }
+            return tok
+        }
+        return tokens.getOrNull(i)
+    }
+
+    private fun splitShellClauses(script: String): List<String> {
+        val clauses = mutableListOf<String>()
+        val current = StringBuilder()
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
+        var i = 0
+        while (i < script.length) {
+            val ch = script[i]
+            if (escaped) {
+                current.append(ch)
+                escaped = false
+                i++
+                continue
+            }
+            if (ch == '\\' && !inSingle) {
+                escaped = true
+                current.append(ch)
+                i++
+                continue
+            }
+            if (ch == '\'' && !inDouble) {
+                inSingle = !inSingle
+                current.append(ch)
+                i++
+                continue
+            }
+            if (ch == '"' && !inSingle) {
+                inDouble = !inDouble
+                current.append(ch)
+                i++
+                continue
+            }
+            if (!inSingle && !inDouble) {
+                if (ch == ';') {
+                    clauses += current.toString()
+                    current.clear()
+                    i++
+                    continue
+                }
+                if ((ch == '&' || ch == '|') && i + 1 < script.length && script[i + 1] == ch) {
+                    clauses += current.toString()
+                    current.clear()
+                    i += 2
+                    continue
+                }
+            }
+            current.append(ch)
+            i++
+        }
+        if (current.isNotEmpty()) clauses += current.toString()
+        return clauses
+    }
+
+    private fun tokenizeDesktopExec(exec: String): List<String> {
+        val tokens = mutableListOf<String>()
+        val current = StringBuilder()
+        var inToken = false
+        var inDouble = false
+        var inSingle = false
+        var i = 0
+        while (i < exec.length) {
+            val ch = exec[i]
+            if (inSingle) {
+                if (ch == '\'') inSingle = false else current.append(ch)
+                inToken = true
+                i++
+                continue
+            }
+            if (inDouble) {
+                if (ch == '\\' && i + 1 < exec.length) {
+                    val next = exec[i + 1]
+                    if (next == '\\' || next == '"' || next == '$' || next == '`') {
+                        current.append(next)
+                        i += 2
+                        continue
+                    }
+                }
+                if (ch == '"') inDouble = false else current.append(ch)
+                inToken = true
+                i++
+                continue
+            }
+            when {
+                ch == ' ' || ch == '\t' -> {
+                    if (inToken) {
+                        tokens += current.toString()
+                        current.clear()
+                        inToken = false
+                    }
+                }
+                ch == '"' -> {
+                    inDouble = true
+                    inToken = true
+                }
+                ch == '\'' -> {
+                    inSingle = true
+                    inToken = true
+                }
+                ch == '\\' && i + 1 < exec.length -> {
+                    current.append(exec[i + 1])
+                    inToken = true
+                    i += 2
+                    continue
+                }
+                else -> {
+                    current.append(ch)
+                    inToken = true
+                }
+            }
+            i++
+        }
+        if (inToken) tokens += current.toString()
+        return tokens.filterNot { it.isEmpty() }
+    }
+
+    private fun isEnvAssignment(token: String): Boolean {
+        val eq = token.indexOf('=')
+        if (eq <= 0) return false
+        val name = token.substring(0, eq)
+        return (name[0].isLetter() || name[0] == '_') && name.all { it.isLetterOrDigit() || it == '_' }
+    }
+
+    private fun isFieldCodeToken(token: String): Boolean =
+        token.length == 2 && token[0] == '%' && token[1] in "fFuUdDnNickvm"
 
     /** The entry's icon resolved to a file ImageIO can read, or null where the theme does not. */
     private fun desktopIcon(entry: String): String? {
@@ -172,17 +472,35 @@ object AppCatalog {
             }
     }
 
+    internal fun resolveMacIconFile(bundle: File, iconFile: String?): File? {
+        if (iconFile.isNullOrBlank()) return null
+        if (".." in iconFile || '/' in iconFile || '\\' in iconFile || '\u0000' in iconFile) return null
+        val resources = File(bundle, "Contents/Resources")
+        val resourcesCanonical = runCatching { resources.canonicalFile.toPath() }.getOrNull() ?: return null
+        val spelled = if (iconFile.endsWith(".icns", ignoreCase = true)) iconFile else "$iconFile.icns"
+        val icns = File(resources, spelled)
+        val icnsCanonical = runCatching { icns.canonicalFile.toPath() }.getOrNull() ?: return null
+        if (!icnsCanonical.startsWith(resourcesCanonical) || icnsCanonical == resourcesCanonical) return null
+        return icns.takeIf { Files.isRegularFile(icnsCanonical) }
+    }
+
     /** A bundle's `.icns` turned into a png once, by the system's own converter, into our cache. */
     private fun macIcon(bundle: File, iconFile: String?): String? {
-        if (iconFile == null) return null
-        val spelled = if (iconFile.endsWith(".icns")) iconFile else "$iconFile.icns"
-        val icns = File(bundle, "Contents/Resources/$spelled")
-        if (!icns.isFile) return null
-        val out = File(DesktopPlatform.dataDirectory(), "icons/${bundle.nameWithoutExtension}.png")
+        val icns = resolveMacIconFile(bundle, iconFile) ?: return null
+        val iconsDir = File(DesktopPlatform.dataDirectory(), "icons")
+        val safeName = bundle.nameWithoutExtension.replace(Regex("[^a-zA-Z0-9._-]"), "_").ifBlank { "app" }
+        val out = File(iconsDir, "$safeName.png")
         return runCatching {
-            out.parentFile.mkdirs()
-            val process = ProcessBuilder("sips", "-s", "format", "png", icns.path, "--out", out.path).start()
-            if (process.waitFor(10, TimeUnit.SECONDS) && process.exitValue() == 0) out.path else null
+            iconsDir.mkdirs()
+            val process = ProcessBuilder("sips", "-s", "format", "png", icns.path, "--out", out.path)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return@runCatching null
+            }
+            if (process.exitValue() == 0) out.path else null
         }.getOrNull()
     }
 
@@ -275,7 +593,12 @@ object AppCatalog {
             .joinToString(" ") { word -> word.replaceFirstChar { it.uppercase() } }
             .ifEmpty { process }
 
-    private val icons = HashMap<String, BufferedImage?>()
+    private const val MAX_ICON_BYTES = 8L * 1024L * 1024L
+    private const val MAX_ICON_DIMENSION = 2048
+
+    private val icons = object : LinkedHashMap<String, BufferedImage?>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BufferedImage?>?): Boolean = size > 512
+    }
 
     /**
      * The program's own icon, as Explorer draws it, or null where there is none to be had.
@@ -302,16 +625,35 @@ object AppCatalog {
         }
     }
 
-    private fun readImageFile(file: File, size: Int): BufferedImage? {
-        val source = ImageIO.read(file) ?: return null
-        val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
-        val graphics = image.createGraphics()
-        try {
-            graphics.drawImage(source, 0, 0, size, size, null)
-        } finally {
-            graphics.dispose()
-        }
-        return image
+    internal fun readImageFile(file: File, size: Int): BufferedImage? {
+        if (size <= 0 || !file.isFile) return null
+        val length = file.length()
+        if (length <= 0L || length > MAX_ICON_BYTES) return null
+        return runCatching {
+            val stream = ImageIO.createImageInputStream(file) ?: return@runCatching null
+            stream.use { input ->
+                val readers = ImageIO.getImageReaders(input)
+                if (!readers.hasNext()) return@runCatching null
+                val reader = readers.next()
+                try {
+                    reader.setInput(input, true, true)
+                    val width = reader.getWidth(0)
+                    val height = reader.getHeight(0)
+                    if (width !in 1..MAX_ICON_DIMENSION || height !in 1..MAX_ICON_DIMENSION) return@runCatching null
+                    val source = reader.read(0) ?: return@runCatching null
+                    val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
+                    val graphics = image.createGraphics()
+                    try {
+                        graphics.drawImage(source, 0, 0, size, size, null)
+                    } finally {
+                        graphics.dispose()
+                    }
+                    image
+                } finally {
+                    reader.dispose()
+                }
+            }
+        }.getOrNull()
     }
 }
 
@@ -323,46 +665,66 @@ object AppCatalog {
  * header, an optional item-ID list to step over, and the link-info block that holds the local path.
  */
 internal object ShellLink {
+    private const val HEADER_SIZE = 0x4C
     private const val HAS_ID_LIST = 0x1
     private const val HAS_LINK_INFO = 0x2
     private const val VOLUME_ID_AND_LOCAL_BASE_PATH = 0x1
+    private const val MIN_LINK_INFO_HEADER = 0x1C
+    private const val UNICODE_LINK_INFO_HEADER = 0x24
 
     fun target(file: File): String? {
-        if (file.length() !in 0x4C..1_048_576) return null
-        val bytes = RandomAccessFile(file, "r").use { raf -> ByteArray(raf.length().toInt()).also { raf.readFully(it) } }
+        if (file.length() !in HEADER_SIZE.toLong()..1_048_576L) return null
+        val bytes = RandomAccessFile(file, "r").use { raf ->
+            val len = raf.length()
+            if (len !in HEADER_SIZE.toLong()..1_048_576L) return null
+            ByteArray(len.toInt()).also { raf.readFully(it) }
+        }
+        if (bytes.size < HEADER_SIZE) return null
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        if (buffer.getInt(0) != 0x4C) return null
+        if (buffer.getInt(0) != HEADER_SIZE) return null
         val flags = buffer.getInt(0x14)
-        var offset = 0x4C
-        if (flags and HAS_ID_LIST != 0) offset += 2 + (buffer.getShort(offset).toInt() and 0xFFFF)
-        if (flags and HAS_LINK_INFO == 0 || offset + 0x1C > bytes.size) return null
-        val info = offset
-        val headerSize = buffer.getInt(info + 4)
+        var offset = HEADER_SIZE.toLong()
+        if (flags and HAS_ID_LIST != 0) {
+            if (offset + 2L > bytes.size.toLong()) return null
+            val idListSize = buffer.getShort(offset.toInt()).toInt() and 0xFFFF
+            offset += 2L + idListSize.toLong()
+        }
+        if (flags and HAS_LINK_INFO == 0) return null
+        if (offset < HEADER_SIZE.toLong() || offset + MIN_LINK_INFO_HEADER.toLong() > bytes.size.toLong()) return null
+        val info = offset.toInt()
+        val linkInfoSize = buffer.getInt(info).toLong() and 0xFFFF_FFFFL
+        if (linkInfoSize < MIN_LINK_INFO_HEADER.toLong() || offset + linkInfoSize > bytes.size.toLong()) return null
+        val infoEnd = (offset + linkInfoSize).toInt()
+        val headerSize = buffer.getInt(info + 4).toLong() and 0xFFFF_FFFFL
+        if (headerSize < MIN_LINK_INFO_HEADER.toLong() || headerSize > linkInfoSize) return null
         val infoFlags = buffer.getInt(info + 8)
         if (infoFlags and VOLUME_ID_AND_LOCAL_BASE_PATH == 0) return null
-        // A Unicode path where the header is long enough to carry one; the ANSI one otherwise.
-        if (headerSize >= 0x24) {
-            val unicode = buffer.getInt(info + 0x1C)
-            if (unicode > 0) return readUtf16(bytes, info + unicode)
+        // A Unicode path where LinkInfo and its header are large enough to carry one; ANSI otherwise.
+        if (linkInfoSize >= UNICODE_LINK_INFO_HEADER.toLong() && headerSize >= UNICODE_LINK_INFO_HEADER.toLong()) {
+            val unicodeOffset = buffer.getInt(info + 0x1C).toLong() and 0xFFFF_FFFFL
+            if (unicodeOffset in headerSize until linkInfoSize) {
+                readUtf16(bytes, (offset + unicodeOffset).toInt(), infoEnd)?.let { return it }
+            }
         }
-        val ansi = buffer.getInt(info + 0x10)
-        return readAnsi(bytes, info + ansi)
+        val ansiOffset = buffer.getInt(info + 0x10).toLong() and 0xFFFF_FFFFL
+        if (ansiOffset !in headerSize until linkInfoSize) return null
+        return readAnsi(bytes, (offset + ansiOffset).toInt(), infoEnd)
     }
 
-    private fun readAnsi(bytes: ByteArray, start: Int): String? {
-        if (start !in bytes.indices) return null
+    private fun readAnsi(bytes: ByteArray, start: Int, endLimit: Int): String? {
+        if (start !in 0 until endLimit || endLimit > bytes.size) return null
         var end = start
-        while (end < bytes.size && bytes[end] != 0.toByte()) end++
+        while (end < endLimit && bytes[end] != 0.toByte()) end++
         // The ANSI path is in the machine's own code page — 1251 on a Russian Windows — which the
         // JVM reports as its native encoding even where its default is UTF-8.
         val codePage = runCatching { charset(System.getProperty("native.encoding") ?: "windows-1252") }.getOrDefault(Charsets.ISO_8859_1)
         return String(bytes, start, end - start, codePage).takeIf { it.isNotBlank() }
     }
 
-    private fun readUtf16(bytes: ByteArray, start: Int): String? {
-        if (start !in bytes.indices) return null
+    private fun readUtf16(bytes: ByteArray, start: Int, endLimit: Int): String? {
+        if (start !in 0 until endLimit || endLimit > bytes.size) return null
         var end = start
-        while (end + 1 < bytes.size && (bytes[end] != 0.toByte() || bytes[end + 1] != 0.toByte())) end += 2
+        while (end + 1 < endLimit && (bytes[end] != 0.toByte() || bytes[end + 1] != 0.toByte())) end += 2
         return String(bytes, start, end - start, Charsets.UTF_16LE).takeIf { it.isNotBlank() }
     }
 }

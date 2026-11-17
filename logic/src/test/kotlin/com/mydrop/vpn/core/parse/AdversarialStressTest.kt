@@ -32,6 +32,9 @@ class AdversarialStressTest {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; prettyPrint = true }
 
+    private fun validRealityKey(seed: Int = 1): String =
+        Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { (it + seed).toByte() })
+
     private fun config(node: ProxyNode, settings: AppSettings = AppSettings()): JsonObject =
         json.parseToJsonElement(
             XrayConfigFactory.build(
@@ -79,8 +82,9 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality with all uppercase query parameter keys parses and emits correct config`() {
+        val pbk = validRealityKey(1)
         val uri = "vless://11111111-2222-3333-4444-555555555555@node.vless.monster:443" +
-            "?SECURITY=REALITY&SERVER_NAME=learn.microsoft.com&PUBLIC_KEY=PUB_KEY_UPPER" +
+            "?SECURITY=REALITY&SERVER_NAME=learn.microsoft.com&PUBLIC_KEY=$pbk" +
             "&SHORT_ID=a1b2c3d4&SPIDER_X=%2Fcustom&CLIENT_FINGERPRINT=firefox" +
             "&PACKET_ENCODING=packetaddr&FLOW=xtls-rprx-vision#UpperReality"
 
@@ -99,7 +103,7 @@ class AdversarialStressTest {
         assertEquals("learn.microsoft.com", tls.serverName)
         assertEquals("firefox", tls.fingerprint)
         val reality = requireNotNull(tls.reality)
-        assertEquals("PUB_KEY_UPPER", reality.publicKey)
+        assertEquals(pbk, reality.publicKey)
         assertEquals("a1b2c3d4", reality.shortId)
         assertEquals("/custom", reality.spiderX)
 
@@ -115,45 +119,48 @@ class AdversarialStressTest {
         val realityObj = cfg.realitySettings
         assertEquals("learn.microsoft.com", realityObj["serverName"]!!.jsonPrimitive.content)
         assertEquals("firefox", realityObj["fingerprint"]!!.jsonPrimitive.content)
-        assertEquals("PUB_KEY_UPPER", realityObj["publicKey"]!!.jsonPrimitive.content)
+        assertEquals(pbk, realityObj["publicKey"]!!.jsonPrimitive.content)
         assertEquals("a1b2c3d4", realityObj["shortId"]!!.jsonPrimitive.content)
     }
 
     @Test
     fun `vless reality with mixed case keys and alternative aliases`() {
+        val pbk = validRealityKey(2)
         val uri = "vless://user-uuid@sub.domain.org:8443" +
-            "?Security=Reality&ServerName=www.google.com&PubKey=MIXED_PUB" +
+            "?Security=Reality&ServerName=www.google.com&PubKey=$pbk" +
             "&ShortId=1234abcd&Spx=%2Ftest%2Fpath&Fp=safari#MixedCaseNode"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         val tls = requireNotNull(node.tls)
         assertEquals("www.google.com", tls.serverName)
         assertEquals("safari", tls.fingerprint)
-        assertEquals("MIXED_PUB", tls.reality?.publicKey)
+        assertEquals(pbk, tls.reality?.publicKey)
         assertEquals("1234abcd", tls.reality?.shortId)
         assertEquals("/test/path", tls.reality?.spiderX)
     }
 
     @Test
     fun `vless reality with empty short_id succeeds and omits short_id in sing-box config`() {
+        val pbk = validRealityKey(3)
         val uri = "vless://user-uuid@proxy.domain.net:443" +
-            "?security=reality&sni=decoy.com&pbk=MYKEY&sid=&fp=chrome#NoShortId"
+            "?security=reality&sni=decoy.com&pbk=$pbk&sid=&fp=chrome#NoShortId"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         val reality = requireNotNull(node.tls?.reality)
-        assertEquals("MYKEY", reality.publicKey)
+        assertEquals(pbk, reality.publicKey)
         assertEquals("", reality.shortId)
 
         val cfg = config(node)
         val realityObj = cfg.realitySettings
-        assertEquals("MYKEY", realityObj["publicKey"]!!.jsonPrimitive.content)
+        assertEquals(pbk, realityObj["publicKey"]!!.jsonPrimitive.content)
         assertNull("shortId must be omitted when empty", realityObj["shortId"])
     }
 
     @Test
     fun `vless reality without sid parameter defaults to empty shortId and omits in JSON`() {
+        val pbk = validRealityKey(4)
         val uri = "vless://user-uuid@proxy.domain.net:443" +
-            "?security=reality&sni=decoy.com&pbk=MYKEY#OmittedShortId"
+            "?security=reality&sni=decoy.com&pbk=$pbk#OmittedShortId"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertEquals("", node.tls?.reality?.shortId)
@@ -165,8 +172,9 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality missing fingerprint defaults to utls chrome in sing-box config`() {
+        val pbk = validRealityKey(5)
         val uri = "vless://user-uuid@proxy.domain.net:443" +
-            "?security=reality&sni=decoy.com&pbk=MYKEY&sid=1122#NoFp"
+            "?security=reality&sni=decoy.com&pbk=$pbk&sid=1122#NoFp"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertNull(node.tls?.fingerprint)
@@ -177,8 +185,9 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality with unknown fingerprint is sanitized to chrome`() {
+        val pbk = validRealityKey(6)
         val uri = "vless://user-uuid@proxy.domain.net:443" +
-            "?security=reality&sni=decoy.com&pbk=MYKEY&fp=some_invalid_fp#BadFp"
+            "?security=reality&sni=decoy.com&pbk=$pbk&fp=some_invalid_fp#BadFp"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertEquals("some_invalid_fp", node.tls?.fingerprint)
@@ -189,12 +198,13 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality with all supported utls fingerprints preserves each fingerprint`() {
+        val pbk = validRealityKey(7)
         val fingerprints = listOf(
             "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android",
             "random", "randomized", "hellochrome_133", "hellofirefox_148",
         )
         fingerprints.forEach { fp ->
-            val uri = "vless://user-uuid@proxy.domain.net:443?security=reality&sni=decoy.com&pbk=KEY&fp=$fp#FpTest"
+            val uri = "vless://user-uuid@proxy.domain.net:443?security=reality&sni=decoy.com&pbk=$pbk&fp=$fp#FpTest"
             val node = requireNotNull(ProxyUriParser.parse(uri))
             assertEquals(fp, node.tls?.fingerprint)
 
@@ -206,7 +216,8 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality with punycode and hyphenated special characters in SNI`() {
-        val uri = "vless://uuid@proxy.com:443?security=reality&sni=xn--e1afmkfd.xn--p1ai&pbk=KEY&sid=ab#Punycode"
+        val pbk = validRealityKey(8)
+        val uri = "vless://uuid@proxy.com:443?security=reality&sni=xn--e1afmkfd.xn--p1ai&pbk=$pbk&sid=ab#Punycode"
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertEquals("xn--e1afmkfd.xn--p1ai", node.tls?.serverName)
 
@@ -216,7 +227,8 @@ class AdversarialStressTest {
 
     @Test
     fun `vless reality preserves proxy domain and never replaces reality sni with proxy host`() {
-        val uri = "vless://uuid@de-01.vless.monster:443?security=reality&server_name=learn.microsoft.com&pbk=PUBKEY&sid=12#DecoyTest"
+        val pbk = validRealityKey(9)
+        val uri = "vless://uuid@de-01.vless.monster:443?security=reality&server_name=learn.microsoft.com&pbk=$pbk&sid=12#DecoyTest"
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertEquals("de-01.vless.monster", node.server)
         assertEquals("learn.microsoft.com", node.tls?.serverName)
@@ -335,9 +347,10 @@ class AdversarialStressTest {
 
     @Test
     fun `trojan with reality parameters and uppercase query keys`() {
+        val pbk = validRealityKey(10)
         val uri = "trojan://p%40ss%3A123@trojan.monster.net:443" +
-            "?SECURITY=REALITY&SERVER_NAME=decoy.trojan.com&PUBLIC_KEY=TR_PUB" +
-            "&SHORT_ID=tr_sid&SPIDER_X=%2Ftr_path&CLIENT_FINGERPRINT=edge#TrojanReality"
+            "?SECURITY=REALITY&SERVER_NAME=decoy.trojan.com&PUBLIC_KEY=$pbk" +
+            "&SHORT_ID=ab:cd&SPIDER_X=%2Ftr_path&CLIENT_FINGERPRINT=edge#TrojanReality"
 
         val node = requireNotNull(ProxyUriParser.parse(uri))
         assertEquals(Protocol.TROJAN, node.protocol)
@@ -347,8 +360,8 @@ class AdversarialStressTest {
         val tls = requireNotNull(node.tls)
         assertEquals("decoy.trojan.com", tls.serverName)
         assertEquals("edge", tls.fingerprint)
-        assertEquals("TR_PUB", tls.reality?.publicKey)
-        assertEquals("tr_sid", tls.reality?.shortId)
+        assertEquals(pbk, tls.reality?.publicKey)
+        assertEquals("ab:cd", tls.reality?.shortId)
         assertEquals("/tr_path", tls.reality?.spiderX)
 
         val cfg = config(node)
@@ -357,7 +370,8 @@ class AdversarialStressTest {
         assertEquals("p@ss:123", cfg.endpoint["password"]!!.jsonPrimitive.content)
         assertEquals("trojan.monster.net", cfg.endpoint["address"]!!.jsonPrimitive.content)
         assertEquals("decoy.trojan.com", cfg.realitySettings["serverName"]!!.jsonPrimitive.content)
-        assertEquals("TR_PUB", cfg.realitySettings["publicKey"]!!.jsonPrimitive.content)
+        assertEquals(pbk, cfg.realitySettings["publicKey"]!!.jsonPrimitive.content)
+        assertEquals("abcd", cfg.realitySettings["shortId"]!!.jsonPrimitive.content)
     }
 
     @Test

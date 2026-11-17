@@ -1,5 +1,6 @@
 package com.mydrop.vpn.pairing
 
+import com.mydrop.vpn.core.net.isNumericAddress
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.Inet4Address
@@ -10,9 +11,11 @@ import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import javax.net.SocketFactory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -40,8 +43,8 @@ class PairingReceiver(
     val state: StateFlow<PairingReceiverState> = _state.asStateFlow()
 
     @Volatile private var generation = 0L
-    private var job: Job? = null
-    private var socket: ServerSocket? = null
+    @Volatile private var job: Job? = null
+    @Volatile private var socket: ServerSocket? = null
     @Volatile private var activeClient: Socket? = null
 
     fun start(deviceName: String) {
@@ -92,15 +95,15 @@ class PairingReceiver(
                         //
                         // A close while the job is still active is a real fault instead - the
                         // Wi-Fi interface going away, say - and the screen offers a retry.
-                        if (isActive) publish(PairingReceiverState.Failed("Pairing socket closed"))
+                        if (isActive && generation == mine) publish(PairingReceiverState.Failed("Pairing socket closed"))
                         return@launch
                     }
                     client.use {
                         activeClient = client
                         if (!isActive || generation != mine) return@launch
-                        it.soTimeout = 8_000
-                        val output = DataOutputStream(it.getOutputStream())
-                        val outcome = runCatching {
+                        var claimed = false
+                        try {
+                            it.soTimeout = 2_000
                             val bytes = DataInputStream(it.getInputStream()).readFrame()
                             val envelope = PairingCrypto.json.decodeFromString<RequestEnvelope>(bytes.decodeToString())
                             require(session.isCurrent(envelope.sessionId)) { "Expired or invalid pairing session" }
@@ -108,16 +111,24 @@ class PairingReceiver(
                             val valid = requireNotNull(transfer.validate())
                             check(isActive && generation == mine)
                             check(session.claim()) { "Pairing session was already used" }
+                            claimed = true
+                            it.soTimeout = 8_000
                             publish(PairingReceiverState.Receiving)
+                            val output = DataOutputStream(it.getOutputStream())
                             val result = onTransfer(valid)
                             val reply = PairingCrypto.reply(result, key, sessionId)
                             output.writeFrame(PairingCrypto.json.encodeToString(reply).toByteArray())
                             output.flush()
-                            result
-                        }
-                        outcome.onSuccess { publish(PairingReceiverState.Complete(it)) }
-                        outcome.onFailure {
-                            publish(PairingReceiverState.Failed("Transfer failed"))
+                            publish(PairingReceiverState.Complete(result))
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Throwable) {
+                            if (claimed) {
+                                publish(PairingReceiverState.Failed("Transfer failed"))
+                            }
+                            // Unauthenticated connections failing before session.claim() are ignored; keep Waiting.
+                        } finally {
+                            if (generation == mine) activeClient = null
                         }
                         if (session.isUsed) break
                     }
@@ -166,6 +177,7 @@ class PairingClient {
     suspend fun send(invite: PairingInvite, transfer: SubscriptionTransfer): PairingResult =
         withContext(Dispatchers.IO) {
             requireNotNull(transfer.validate())
+            require(isNumericAddress(invite.host)) { "The TV address must be a numeric IP address" }
             require(isPrivateIpv4(invite.host)) { "The TV address is not on a private local network" }
             val (request, key) = PairingCrypto.request(invite, transfer)
             val bytes = PairingCrypto.json.encodeToString(request).toByteArray()
@@ -173,20 +185,28 @@ class PairingClient {
 
             var lastError: Throwable? = null
             for (factory in listOf(SocketFactory.getDefault())) {
-                val result = runCatching {
-                    withTimeout(10_000) {
-                        val socket = factory.createSocket() as Socket
-                        socket.use {
-                            it.connect(InetSocketAddress(invite.host, invite.port), 5_000)
-                            it.soTimeout = 8_000
-                            val output = DataOutputStream(it.getOutputStream())
-                            output.writeFrame(bytes)
-                            output.flush()
-                            val replyBytes = DataInputStream(it.getInputStream()).readFrame()
-                            val reply = PairingCrypto.json.decodeFromString<ReplyEnvelope>(replyBytes.decodeToString())
-                            PairingCrypto.openReply(reply, key, invite.sessionId)
-                        }
-                    }
+                val result = try {
+                    Result.success(
+                        withTimeout(10_000) {
+                            val socket = factory.createSocket() as Socket
+                            socket.use {
+                                it.connect(InetSocketAddress(invite.host, invite.port), 5_000)
+                                it.soTimeout = 8_000
+                                val output = DataOutputStream(it.getOutputStream())
+                                output.writeFrame(bytes)
+                                output.flush()
+                                val replyBytes = DataInputStream(it.getInputStream()).readFrame()
+                                val reply = PairingCrypto.json.decodeFromString<ReplyEnvelope>(replyBytes.decodeToString())
+                                PairingCrypto.openReply(reply, key, invite.sessionId)
+                            }
+                        },
+                    )
+                } catch (timeout: TimeoutCancellationException) {
+                    Result.failure(timeout)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Result.failure(error)
                 }
                 result.getOrNull()?.let { return@withContext it }
                 lastError = result.exceptionOrNull()
@@ -207,7 +227,7 @@ private fun DataOutputStream.writeFrame(bytes: ByteArray) {
     write(bytes)
 }
 
-private fun isPrivateIpv4(host: String): Boolean = runCatching {
+private fun isPrivateIpv4(host: String): Boolean = isNumericAddress(host) && runCatching {
     val address = InetAddress.getByName(host)
     address is Inet4Address && address.isSiteLocalAddress && !address.isLoopbackAddress
 }.getOrDefault(false)

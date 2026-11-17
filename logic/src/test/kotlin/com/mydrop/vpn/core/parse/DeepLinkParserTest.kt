@@ -110,4 +110,21 @@ class DeepLinkParserTest {
         val fileScheme = DeepLinkParser.parse("happ://add/file:///etc/passwd")
         assertTrue(fileScheme is DeepLinkPayload.Unsupported)
     }
+
+    @Test
+    fun `unencoded proxy and dns app links preserve fragment name`() {
+        val vless = DeepLinkParser.parse(
+            "happ://add/vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#DeepNode",
+        ) as DeepLinkPayload.AddNodes
+        assertEquals(1, vless.nodes.size)
+        assertEquals("DeepNode", vless.nodes.single().name)
+
+        val encodedFrag = DeepLinkParser.parse(
+            "happ://add/vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#My%20Deep%20Node",
+        ) as DeepLinkPayload.AddNodes
+        assertEquals("My Deep Node", encodedFrag.nodes.single().name)
+
+        val dns = DeepLinkParser.parse("happ://add/tcp://1.1.1.1#MyTcpDns") as DeepLinkPayload.AddDns
+        assertEquals("MyTcpDns", dns.profiles.single().name)
+    }
 }

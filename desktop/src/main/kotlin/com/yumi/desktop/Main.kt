@@ -64,9 +64,11 @@ fun main(args: Array<String>) {
         val settings by model.settings.settings.collectAsState()
         val status by model.status.collectAsState()
         var closing by remember { mutableStateOf(false) }
-        suspend fun launchReadyUpdate(@Suppress("UNUSED_PARAMETER") relaunch: Boolean): Boolean {
+        suspend fun launchReadyUpdate(relaunch: Boolean): Boolean {
             val ready = model.updates.readyToInstall() ?: return false
-            return withContext(Dispatchers.IO) { DesktopPlatform.installUpdate(ready.file) }
+            return withContext(Dispatchers.IO) {
+                DesktopPlatform.installUpdate(ready.file, expectedSha256 = ready.sha256, relaunch = relaunch)
+            }
         }
         val close = {
             if (!closing) {

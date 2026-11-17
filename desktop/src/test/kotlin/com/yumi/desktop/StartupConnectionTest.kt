@@ -154,7 +154,8 @@ class StartupConnectionTest {
                 assertTrue(model.profiles.state.value.dnsProfiles.any { it.url == "https://dns.google/dns-query" })
 
                 val nodeTarget = "vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#DeepNode"
-                model.importText("happ://add/$nodeTarget").join()
+                val encodedTarget = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(nodeTarget.toByteArray())
+                model.importText("happ://add/$encodedTarget").join()
                 assertTrue(model.profiles.nodes.any { it.name == "DeepNode" })
 
                 // Unreachable subscription URL via deep link must surface a refresh error message.

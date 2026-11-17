@@ -8,7 +8,9 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -20,8 +22,12 @@ import androidx.compose.ui.unit.dp
 import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlinx.coroutines.delay
 import com.yumi.desktop.LocalAnimationsActive
+import com.yumi.desktop.LocalFramePacing
+import com.yumi.desktop.LocalUiFrameProbe
 
 /**
  * The traffic figure: soft bands drifting across the tunnel's main shape.
@@ -49,9 +55,11 @@ fun TrafficWaves(
 
     val bands = remember { defaultBands() }
     val motion = remember { WaveMotion(bands) }
-    val frames = rememberWaveFrames(motion)
+    val idle = !warming && downloadBytesPerSecond == 0L && uploadBytesPerSecond == 0L
+    val frames = rememberWaveFrames(motion, idle)
     val active = LocalAnimationsActive.current
     val path = remember { Path() }
+    val brushes = remember(bands.size) { Array<BandBrushCache?>(bands.size) { null } }
 
     Canvas(modifier = modifier.fillMaxSize()) {
         // Everything animated is read here, in the draw scope, so a frame costs a redraw rather
@@ -65,10 +73,18 @@ fun TrafficWaves(
         bands.forEachIndexed { index, band ->
             val swell = if (band.upload) motion.upSwell else motion.downSwell
             val ink = if (band.upload) uploadColor else downloadColor
-            drawBand(band, motion.phaseAt(index), swell, ink, path, stroke)
+            drawBand(band, motion.phaseAt(index), swell, ink, path, stroke, brushes, index)
         }
     }
 }
+
+private class BandBrushCache(
+    val ink: Color,
+    val alphaBucket: Int,
+    val startY: Float,
+    val endY: Float,
+    val brush: Brush,
+)
 
 private fun DrawScope.drawBand(
     band: Band,
@@ -77,6 +93,8 @@ private fun DrawScope.drawBand(
     ink: Color,
     path: Path,
     stroke: Float,
+    brushes: Array<BandBrushCache?>,
+    index: Int,
 ) {
     val width = size.width
     val height = size.height
@@ -88,7 +106,7 @@ private fun DrawScope.drawBand(
     path.reset()
     path.moveTo(0f, baseline)
 
-    val step = 6f
+    val step = 8f
     var x = 0f
     while (x <= width) {
         path.lineTo(x, waveAt(x / width, drift, band) * amplitude + baseline)
@@ -108,16 +126,30 @@ private fun DrawScope.drawBand(
     path.lineTo(0f, height)
     path.close()
 
+    val fillAlpha = band.fillAlpha * (0.3f + swell * 0.7f)
+    val alphaBucket = (fillAlpha * 512f).roundToInt()
+    val startY = ((baseline - amplitude) * 2f).roundToInt() / 2f
+    val cached = brushes[index]
+    val brush = if (cached != null &&
+        cached.ink == ink &&
+        cached.alphaBucket == alphaBucket &&
+        cached.startY == startY &&
+        cached.endY == height
+    ) {
+        cached.brush
+    } else {
+        Brush.verticalGradient(
+            colors = listOf(ink.copy(alpha = fillAlpha), ink.copy(alpha = 0f)),
+            startY = startY,
+            endY = height,
+        ).also { created ->
+            brushes[index] = BandBrushCache(ink, alphaBucket, startY, height, created)
+        }
+    }
+
     drawPath(
         path = path,
-        brush = Brush.verticalGradient(
-            colors = listOf(
-                ink.copy(alpha = band.fillAlpha * (0.3f + swell * 0.7f)),
-                ink.copy(alpha = 0f),
-            ),
-            startY = baseline - amplitude,
-            endY = height,
-        ),
+        brush = brush,
         // Bands overlap; multiplying them would muddy the colour, so they simply add up and the
         // crossings read as a lighter tone.
         blendMode = BlendMode.Plus,
@@ -191,12 +223,32 @@ internal class WaveMotion(private val bands: List<Band>) {
 }
 
 @Composable
-private fun rememberWaveFrames(motion: WaveMotion): State<Long> {
+private fun rememberWaveFrames(motion: WaveMotion, idle: Boolean): State<Long> {
     val active = LocalAnimationsActive.current
-    return produceState(0L, active, motion) {
+    val paced = LocalFramePacing.current
+    val focused = LocalUiFrameProbe.current != null || LocalWindowInfo.current.isWindowFocused
+    val currentFocused by rememberUpdatedState(focused)
+    val currentIdle by rememberUpdatedState(idle)
+    return produceState(0L, active, paced, motion) {
         motion.pause()
         if (!active) return@produceState
-        while (true) withInfiniteAnimationFrameNanos { value = it }
+        if (!paced) {
+            while (true) withInfiniteAnimationFrameNanos { value = it }
+        } else {
+            while (true) {
+                val started = withInfiniteAnimationFrameNanos { frame ->
+                    value = frame
+                    System.nanoTime()
+                }
+                val interval = when {
+                    !currentFocused -> 100_000_000L
+                    currentIdle && motion.downSwell < 0.02f && motion.upSwell < 0.02f -> 41_666_667L
+                    else -> 33_333_333L
+                }
+                val remaining = (started + interval - System.nanoTime()) / 1_000_000L
+                if (remaining > 0) delay(remaining)
+            }
+        }
     }
 }
 

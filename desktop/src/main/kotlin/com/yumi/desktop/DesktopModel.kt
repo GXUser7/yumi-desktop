@@ -46,6 +46,10 @@ class DesktopModel(
     val strings = Strings { settings.value.language }
     val logs = LogRepository(strings)
     val status = MutableStateFlow(ServiceStatus(state = "unavailable"))
+    /** Status without 1 Hz byte/second-resolution ticks so screens that do not display them stay idle. */
+    val uiStatus: Flow<ServiceStatus> = status
+        .map(ServiceStatus::forUi)
+        .distinctUntilChanged()
     /** A running core is not proof that its server can carry traffic. Never changes the selected server. */
     val connectionHealth = MutableStateFlow(ConnectionHealth.Unchecked)
     val switching = MutableStateFlow(false)
@@ -674,3 +678,9 @@ class DesktopModel(
         val DefaultCheckTunnel: suspend (ProbeEndpoint) -> Boolean = { DefaultProbe.reachable(it) }
     }
 }
+
+internal fun ServiceStatus.forUi(): ServiceStatus = copy(
+    upload = 0,
+    download = 0,
+    geoUpdatedAt = if (geoUpdatedAt > 0) geoUpdatedAt / 60_000 * 60_000 else geoUpdatedAt,
+)

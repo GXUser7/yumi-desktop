@@ -10,10 +10,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.layer.drawLayer
 import org.jetbrains.skia.Image
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -74,8 +76,8 @@ const val PageGlassAlpha = 0.84f
 /** The scene under the window, recorded once per frame for every pane of glass to show. */
 @Stable
 class BackdropState {
-    internal var scene by mutableStateOf<SceneFrame?>(null)
-    internal val frost get() = scene?.frost
+    internal var frostImage by mutableStateOf<Image?>(null)
+    internal val frost get() = frostImage
     /** How many times smaller [frost] is recorded than the window. */
     internal var shrink = 8f
     /** The current window, including the interval before a resized scene is ready. */
@@ -238,7 +240,28 @@ private fun sceneShapes() = listOf(
     SceneShape(MaterialShapes.Pill, MaterialShapes.Sunny, cx = 0.22f, cy = 0.96f, size = 0.42f, depth = 0.95f, spin = -3f, morphSeconds = 14f),
 )
 
-private data class ScenePalette(val ground: Color, val body: Color, val light: Color, val dark: Color, val darkTheme: Boolean)
+private data class ShapeShading(
+    val face: List<Color>,
+    val highlight: List<Color>,
+    val rim: List<Color>,
+)
+
+private data class ScenePalette(val ground: Color, val body: Color, val light: Color, val dark: Color, val darkTheme: Boolean) {
+    val shadowColor: Color = Color.Black.copy(alpha = if (darkTheme) 0.38f else 0.12f)
+    private val shadings = HashMap<Float, ShapeShading>()
+
+    fun shading(depth: Float): ShapeShading = shadings.getOrPut(depth) {
+        val bodyColor = lerp(ground, body, 0.45f + 0.55f * depth)
+        val lit = lerp(bodyColor, light, if (darkTheme) 0.22f else 0.5f)
+        val shaded = lerp(bodyColor, dark, if (darkTheme) 0.3f else 0.16f)
+        val highlightAlpha = (if (darkTheme) 0.10f else 0.22f) * (0.4f + depth)
+        ShapeShading(
+            face = listOf(lit, bodyColor, shaded),
+            highlight = listOf(Color.White.copy(alpha = highlightAlpha), Color.Transparent),
+            rim = listOf(lit.copy(alpha = 0.7f), Color.Transparent),
+        )
+    }
+}
 
 @Composable
 private fun scenePalette(): ScenePalette {
@@ -269,32 +292,39 @@ private fun scenePalette(): ScenePalette {
 fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
     val state = remember { BackdropState() }
     val palette = scenePalette()
-    val shapes = remember { sceneShapes() }
+    val uiShapes = remember { sceneShapes() }
+    val farIndices = remember { uiShapes.indices.filter { uiShapes[it].depth < 0.6f } }
+    val nearIndices = remember { uiShapes.indices.filter { uiShapes[it].depth >= 0.6f } }
+    val farLayer = rememberGraphicsLayer()
+    val nearLayer = rememberGraphicsLayer()
     val focused = LocalUiFrameProbe.current != null || LocalWindowInfo.current.isWindowFocused
     val active = LocalAnimationsActive.current
     val running = animated && active
     val window = LocalWindowMotion.current
     val density = LocalDensity.current
-    val motion = remember { SceneMotion(shapes.size) }
+    val motion = remember { SceneMotion(uiShapes.size) }
     val timeline = remember { floatArrayOf(0f) }
     val lighting = remember { arrayOf(Offset(-0.55f, -0.75f)) }
     var dimensions by remember { mutableStateOf(IntSize.Zero) }
     val dispatcher = LocalBackdropDispatcher.current
+    val paced = LocalFramePacing.current
     val currentDimensions by rememberUpdatedState(dimensions)
     val currentDensity by rememberUpdatedState(density)
     val currentPalette by rememberUpdatedState(palette)
     val currentRunning by rememberUpdatedState(running)
     val currentActive by rememberUpdatedState(active)
     val currentFocused by rememberUpdatedState(focused)
+    val currentPaced by rememberUpdatedState(paced)
 
     DisposableEffect(state) {
-        onDispose { state.scene?.close(); state.scene = null }
+        onDispose { state.frostImage?.close(); state.frostImage = null }
     }
     LaunchedEffect(Unit) {
-        val renderer = SceneRenderer()
-        var pending: SceneFrame? = null
+        val renderer = FrostRenderer()
+        var pendingFrost: Image? = null
         var preparedSize = IntSize.Zero
         var preparedDensity: Density? = null
+        var layerDensity: Density? = null
         try {
             var last = 0L
             var lastX = window.x
@@ -309,16 +339,16 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                     targetDensity = currentDensity
                     last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
                 }
-                if (!currentActive && state.scene != null) {
+                if (!currentActive && state.frost != null) {
                     snapshotFlow { currentActive }.first { it }
                     targetSize = currentDimensions
                     targetDensity = currentDensity
                     last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
                 }
                 val animateFrame = currentRunning
-                val started = withInfiniteAnimationFrameNanos { now ->
-                    val dt = if (last == 0L || !animateFrame) 0f else ((now - last) / 1e9f).coerceIn(0f, 0.1f)
-                    last = now
+                fun stepScene(clockNanos: Long) {
+                    val dt = if (last == 0L || !animateFrame) 0f else ((clockNanos - last) / 1e9f).coerceIn(0f, 0.1f)
+                    last = clockNanos
                     timeline[0] += dt
                     val x = window.x
                     val y = window.y
@@ -326,10 +356,27 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                     val frameSize = currentDimensions
                     val frameDensity = currentDensity
                     motion.step(dt, if (moved) (x - lastX) * frameDensity.density else 0f,
-                        if (moved) (y - lastY) * frameDensity.density else 0f, shapes, min(frameSize.width, frameSize.height) * 0.3f)
+                        if (moved) (y - lastY) * frameDensity.density else 0f, uiShapes, min(frameSize.width, frameSize.height) * 0.3f)
                     lastX = x; lastY = y; wasKnown = window.known
                     val target = Offset(-0.55f + state.pointer.x * 0.35f, -0.75f + state.pointer.y * 0.3f)
-                    lighting[0] += (target - lighting[0]) * (1f - kotlin.math.exp(-2.5f * dt))
+                    val delta = target - lighting[0]
+                    if (delta.getDistance() <= 0.01f) lighting[0] = target
+                    else lighting[0] += delta * (1f - kotlin.math.exp(-3.5f * dt))
+                }
+                val started = if (!currentPaced) {
+                    withInfiniteAnimationFrameNanos { now ->
+                        stepScene(now)
+                        now
+                    }
+                } else if (state.frost == null) {
+                    withInfiniteAnimationFrameNanos {
+                        val now = System.nanoTime()
+                        stepScene(now)
+                        now
+                    }
+                } else {
+                    val now = System.nanoTime()
+                    stepScene(now)
                     now
                 }
                 targetSize = currentDimensions
@@ -340,17 +387,35 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                 val pointer = state.pointer
                 val pose = motion.pose()
                 val renderedPalette = currentPalette
-                withContext(dispatcher) {
+                pendingFrost = withContext(dispatcher) {
                     if (preparedSize != targetSize || preparedDensity != targetDensity) {
                         renderer.prepare(targetSize, targetDensity)
                         preparedSize = targetSize
                         preparedDensity = targetDensity
                     }
-                    pending = renderer.render(renderedPalette, time, light, pointer, pose)
+                    renderer.render(renderedPalette, time, light, pointer, pose)
                 }
-                val previous = state.scene
-                state.scene = checkNotNull(pending)
-                pending = null
+                val full = Size(targetSize.width.toFloat(), targetSize.height.toFloat())
+                if (layerDensity != targetDensity) {
+                    val farRadius = 8f * targetDensity.density / 4f
+                    val nearRadius = 3f * targetDensity.density / 2f
+                    farLayer.renderEffect = if (farRadius > 0f) BlurEffect(farRadius, farRadius, TileMode.Decal) else null
+                    nearLayer.renderEffect = if (nearRadius > 0f) BlurEffect(nearRadius, nearRadius, TileMode.Decal) else null
+                    layerDensity = targetDensity
+                }
+                farLayer.record(targetDensity, LayoutDirection.Ltr, scaled(full, 4f)) {
+                    scale(0.25f, 0.25f, Offset.Zero) {
+                        drawScene(uiShapes, farIndices, renderedPalette, time, light, pointer, pose, full, targetDensity.density)
+                    }
+                }
+                nearLayer.record(targetDensity, LayoutDirection.Ltr, scaled(full, 2f)) {
+                    scale(0.5f, 0.5f, Offset.Zero) {
+                        drawScene(uiShapes, nearIndices, renderedPalette, time, light, pointer, pose, full, targetDensity.density)
+                    }
+                }
+                val previous = state.frostImage
+                state.frostImage = checkNotNull(pendingFrost)
+                pendingFrost = null
                 state.shrink = renderer.shrink
                 state.recorded()
                 previous?.close()
@@ -368,13 +433,20 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                     last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
                     continue
                 }
-                val lightMoving = (Offset(-0.55f + pointer.x * 0.35f, -0.75f + pointer.y * 0.3f) - lighting[0]).getDistance() > 0.005f
-                val interval = when { motion.active || lightMoving -> 0L; currentFocused -> 33_333_333L; else -> 100_000_000L }
-                val remaining = (started + interval - System.nanoTime()) / 1_000_000L
-                if (remaining > 0) delay(remaining)
+                if (currentPaced) {
+                    val lightMoving = (Offset(-0.55f + pointer.x * 0.35f, -0.75f + pointer.y * 0.3f) - lighting[0]).getDistance() > 0.01f
+                    val interval = when {
+                        motion.active -> 16_666_667L
+                        lightMoving -> 33_333_333L
+                        currentFocused -> 50_000_000L
+                        else -> 125_000_000L
+                    }
+                    val remaining = (started + interval - System.nanoTime()) / 1_000_000L
+                    if (remaining > 0) delay(remaining)
+                }
             }
         } finally {
-            withContext(NonCancellable + dispatcher) { pending?.close(); renderer.close() }
+            withContext(NonCancellable + dispatcher) { pendingFrost?.close(); renderer.close() }
         }
     }
 
@@ -384,35 +456,33 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
             while (true) {
                 val event = awaitPointerEvent(PointerEventPass.Initial)
                 val position = event.changes.firstOrNull()?.position ?: continue
-                state.pointer = Offset((position.x / size.width.coerceAtLeast(1)) * 2f - 1f,
+                val next = Offset((position.x / size.width.coerceAtLeast(1)) * 2f - 1f,
                     (position.y / size.height.coerceAtLeast(1)) * 2f - 1f)
+                if (kotlin.math.abs(next.x - state.pointer.x) + kotlin.math.abs(next.y - state.pointer.y) > 0.004f) {
+                    state.pointer = next
+                }
             }
         }
     }) {
-        Box(Modifier.matchParentSize().graphicsLayer().drawBehind {
-            val scene = state.scene
-            if (scene == null) drawRect(palette.ground)
-            else scale(size.width / scene.image.width, size.height / scene.image.height, pivot = Offset.Zero) { drawSceneImage(scene.image) }
+        Box(Modifier.matchParentSize().clipToBounds().drawBehind {
+            val ready = state.frame > 0L
+            drawRect(palette.ground)
+            if (ready) {
+                scale(4f, 4f, pivot = Offset.Zero) { drawLayer(farLayer) }
+                scale(2f, 2f, pivot = Offset.Zero) { drawLayer(nearLayer) }
+            }
         })
         CompositionLocalProvider(LocalBackdrop provides state, content = content)
     }
 }
 
-/** CPU raster work runs away from the UI thread; a new frame is published only when complete. */
+/** Tiny single-pass frost raster work runs away from the UI thread; the GPU scene records into GraphicsLayers. */
 internal val LocalBackdropDispatcher = staticCompositionLocalOf<CoroutineDispatcher> { Dispatchers.Default }
 
-internal class SceneFrame(val image: Image, val frost: Image) : AutoCloseable {
-    override fun close() { image.close(); frost.close() }
-}
-
-private class SceneRenderer : AutoCloseable {
+private class FrostRenderer : AutoCloseable {
     private val shapes = sceneShapes()
-    private val farIndices = shapes.indices.filter { shapes[it].depth < 0.6f }
-    private val nearIndices = shapes.indices.filter { shapes[it].depth >= 0.6f }
-    private val far = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
-    private val near = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
-    private val scene = SceneBuffer()
-    private val frost = FrostBuffer(retainedFrames = 2)
+    private val allIndices = shapes.indices.toList()
+    private val frost = FrostBuffer(retainedFrames = 2, parallelism = 1)
     private var full = Size.Zero
     private var density = Density(1f)
     var shrink = 8f
@@ -422,34 +492,20 @@ private class SceneRenderer : AutoCloseable {
         this.density = density
         full = Size(dimensions.width.toFloat(), dimensions.height.toFloat())
         shrink = shrinkFor(FrostBlur.value * density.density)
-        far.prepare(scaled(full, 4f), 8f * density.density / 4f)
-        near.prepare(scaled(full, 2f), 3f * density.density / 2f)
-        scene.prepare(scaled(full, 2f))
         frost.prepare(scaled(full, shrink), FrostBlur.value * density.density / shrink)
     }
-    fun render(palette: ScenePalette, time: Float, light: Offset, pointer: Offset, pose: ScenePose): SceneFrame {
+
+    fun render(palette: ScenePalette, time: Float, light: Offset, pointer: Offset, pose: ScenePose): Image {
         val pixels = density.density
-        val farImage = far.record(density, LayoutDirection.Ltr) {
-            scale(0.25f, 0.25f, Offset.Zero) { drawScene(shapes, farIndices, palette, time, light, pointer, pose, full, pixels) }
-        }
-        val nearImage = near.record(density, LayoutDirection.Ltr) {
-            scale(0.5f, 0.5f, Offset.Zero) { drawScene(shapes, nearIndices, palette, time, light, pointer, pose, full, pixels) }
-        }
-        try {
-            val image = scene.record(density, LayoutDirection.Ltr) {
-                drawRect(palette.ground)
-                scale(2f, 2f, Offset.Zero) { drawSceneImage(farImage) }
-                drawSceneImage(nearImage)
+        return frost.record(density, LayoutDirection.Ltr) {
+            drawRect(palette.ground)
+            scale(1f / shrink, 1f / shrink, Offset.Zero) {
+                drawScene(shapes, allIndices, palette, time, light, pointer, pose, full, pixels, frostOnly = true)
             }
-            try {
-                val frosted = frost.record(density, LayoutDirection.Ltr) {
-                    scale(2f / shrink, 2f / shrink, Offset.Zero) { drawSceneImage(image) }
-                }
-                return SceneFrame(image, frosted)
-            } catch (error: Throwable) { image.close(); throw error }
-        } finally { farImage.close(); nearImage.close() }
+        }
     }
-    override fun close() { far.close(); near.close(); scene.close(); frost.close() }
+
+    override fun close() { frost.close() }
 }
 
 private fun shrinkFor(blurPx: Float): Float = (blurPx / 6f).toInt().coerceIn(1, 8).toFloat()
@@ -476,6 +532,7 @@ private fun DrawScope.drawScene(
     motion: ScenePose,
     full: Size,
     density: Float,
+    frostOnly: Boolean = false,
 ) {
     // [density] is handed in rather than read off this scope: inside a layer being recorded the
     // scope's own density points back at the node drawing it, and reading it never returns.
@@ -496,10 +553,7 @@ private fun DrawScope.drawScene(
             morph.toPath(progress, shape.path)
         }
         val angle = time * shape.spin + i * 37f + motion.turn[i]
-
-        val bodyColor = lerp(palette.ground, palette.body, 0.45f + 0.55f * shape.depth)
-        val lit = lerp(bodyColor, palette.light, if (palette.darkTheme) 0.22f else 0.5f)
-        val shaded = lerp(bodyColor, palette.dark, if (palette.darkTheme) 0.3f else 0.16f)
+        val shading = palette.shading(shape.depth)
 
         fun place(block: DrawScope.() -> Unit) = withTransform({
             translate(center.x - radius, center.y - radius)
@@ -510,7 +564,7 @@ private fun DrawScope.drawScene(
         // A shadow thrown away from the light; nearer shapes float higher, so theirs falls further.
         val distance = (8f + 20f * shape.depth) * density
         translate(-light.x * distance, -light.y * distance) {
-            place { drawPath(shape.path, Color.Black.copy(alpha = if (palette.darkTheme) 0.38f else 0.12f)) }
+            place { drawPath(shape.path, palette.shadowColor) }
         }
         // The light is one light for the whole scene, so it is turned into each shape's own box:
         // whatever the shape's rotation, its lit side faces the same way as every other's.
@@ -518,22 +572,24 @@ private fun DrawScope.drawScene(
         val middle = Offset(0.5f, 0.5f)
         place {
             // Lit face to shaded, across the whole shape from the light's side.
-            drawPath(shape.path, Brush.linearGradient(listOf(lit, bodyColor, shaded), start = middle + local * 0.5f, end = middle - local * 0.5f))
-            // A soft highlight toward the light, inside the shape.
-            drawPath(
-                shape.path,
-                Brush.radialGradient(
-                    listOf(Color.White.copy(alpha = (if (palette.darkTheme) 0.10f else 0.22f) * (0.4f + shape.depth)), Color.Transparent),
-                    center = middle + local * 0.225f,
-                    radius = 0.425f,
-                ),
-            )
-            // A rim of light along the lit edge, gone by the middle.
-            drawPath(
-                shape.path,
-                Brush.linearGradient(listOf(lit.copy(alpha = 0.7f), Color.Transparent), start = middle + local * 0.5f, end = middle),
-                style = Stroke(width = 1.5f * density / diameter),
-            )
+            drawPath(shape.path, Brush.linearGradient(shading.face, start = middle + local * 0.5f, end = middle - local * 0.5f))
+            if (!frostOnly) {
+                // A soft highlight toward the light, inside the shape.
+                drawPath(
+                    shape.path,
+                    Brush.radialGradient(
+                        shading.highlight,
+                        center = middle + local * 0.225f,
+                        radius = 0.425f,
+                    ),
+                )
+                // A rim of light along the lit edge, gone by the middle.
+                drawPath(
+                    shape.path,
+                    Brush.linearGradient(shading.rim, start = middle + local * 0.5f, end = middle),
+                    style = Stroke(width = 1.5f * density / diameter),
+                )
+            }
         }
     }
 }

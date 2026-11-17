@@ -44,6 +44,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
@@ -92,6 +93,9 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     Speed("Тест скорости", "Speed test", Icons.Rounded.Speed),
     Settings("Настройки", "Settings", Icons.Rounded.Settings),
 }
+
+@Composable internal fun DesktopModel.collectUiStatus(): State<ServiceStatus> =
+    uiStatus.collectAsState(remember(this) { status.value.forUi() })
 
 @Composable fun YumiApp(model: DesktopModel, initialPage: Page = Page.Connect, onInstallUpdate: () -> Unit = {}) {
     val settings by model.settings.settings.collectAsState()
@@ -157,7 +161,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
 
 /** The three islands keep the same positions on every page, rather than following its content. */
 @Composable private fun Dock(m: DesktopModel, page: Page, compact: Boolean, onSelect: (Page) -> Unit) {
-    val status by m.status.collectAsState()
+    val status by m.collectUiStatus()
     val dense = LocalDenseLayout.current
     val button by animateDpAsState(if (dense) 40.dp else if (compact) 44.dp else 56.dp, tween(220), label = "dock-button-size")
     val endButton by animateDpAsState(if (dense) 40.dp else if (compact) 44.dp else 56.dp, tween(220), label = "dock-end-button")
@@ -369,8 +373,7 @@ private val ReadingWidth = 860.dp
 /* ── Connect ──────────────────────────────────────────────────────────────────────────────── */
 
 @Composable private fun ConnectPage(m: DesktopModel, onServers: () -> Unit, onPair: () -> Unit) {
-    val status by m.status.collectAsState()
-    val traffic by m.traffic.collectAsState()
+    val status by m.collectUiStatus()
     val profiles by m.profiles.state.collectAsState()
     val activeNode by m.activeNode.collectAsState()
     val activeLatency by m.activeLatency.collectAsState()
@@ -378,8 +381,6 @@ private val ReadingWidth = 860.dp
     val node = if (running) activeNode ?: profiles.nodes.firstOrNull { it.id == status.nodeId }
         else profiles.nodes.firstOrNull { it.id == profiles.selectedNodeId }
     val latency = if (running) activeLatency ?: profiles.latencies[node?.id] else profiles.latencies[node?.id]
-
-    val history by m.trafficHistory.collectAsState()
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val narrow = LocalCompactLayout.current || maxWidth < 720.dp
@@ -399,14 +400,14 @@ private val ReadingWidth = 860.dp
             translationY = (1f - entry.value) * 8.dp.toPx()
         } else Modifier)) {
             if (narrow) {
-                CompactConnectPage(m, status, traffic, profiles, node, latency, onServers, onPair)
+                CompactConnectPage(m, status, profiles, node, latency, onServers, onPair)
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(Modifier.fillMaxWidth().height(pageHeaderHeight()).testTag("page-header").glass(PanelShape, glassTint())) {
                             Headline(m, status, node, tight, Modifier.padding(if (LocalCompactLayout.current) TileRim else TileRim + 4.dp))
                         }
-                        FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
+                        FlowFigure(m, status, node, Modifier.weight(1f).fillMaxWidth())
                     }
                     Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         ServerRow(m, node, latency, onServers, running)
@@ -427,7 +428,7 @@ private val ReadingWidth = 860.dp
                             )
                             status.state in listOf("failed", "unavailable") -> ConnectionProblem(m, status)
                             !running && profiles.nodes.isEmpty() && profiles.subscriptions.isEmpty() -> TransferCard(m, onPair)
-                            else -> SessionTile(m, traffic, history.map { it.downloadBytesPerSecond }, history.map { it.uploadBytesPerSecond })
+                            else -> LiveSessionTile(m)
                         }
                     }
                 }
@@ -438,7 +439,7 @@ private val ReadingWidth = 860.dp
 
 /** A small window keeps the same hierarchy without squeezing two poster columns together. */
 @Composable private fun CompactConnectPage(
-    m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, profiles: ProfileState, node: ProxyNode?, latency: LatencyResult?,
+    m: DesktopModel, status: ServiceStatus, profiles: ProfileState, node: ProxyNode?, latency: LatencyResult?,
     onServers: () -> Unit, onPair: () -> Unit,
 ) {
     val groupHeight by animateDpAsState(LocalCompactContentTop.current - 12.dp, tween(220), label = "compact-connection-height")
@@ -455,7 +456,7 @@ private val ReadingWidth = 860.dp
                 ControlTile(m, status, node != null, Modifier.fillMaxSize(), m::toggleConnection)
             }
         }
-        FlowFigure(m, status, traffic, node, Modifier.weight(1f).fillMaxWidth())
+        FlowFigure(m, status, node, Modifier.weight(1f).fillMaxWidth())
         if (status.killSwitch && status.state !in listOf("connected", "connecting")) {
             QuietButton(m.text("Снять блокировку интернета", "Lift the network block"), Modifier.fillMaxWidth(), Icons.Rounded.GppMaybe) { m.releaseKillSwitch() }
         } else if (status.state in listOf("failed", "unavailable")) {
@@ -464,11 +465,7 @@ private val ReadingWidth = 860.dp
             profiles.nodes.isEmpty() && profiles.subscriptions.isEmpty()) {
             QuietButton(m.text("Перенести с телефона", "Transfer from phone"), Modifier.fillMaxWidth(), Icons.Rounded.QrCodeScanner, onClick = onPair)
         } else {
-            val semantic = LocalSemanticColors.current
-            Row(Modifier.fillMaxWidth().glass(TileShape, glassTint()).padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_download), m.strings.rate(traffic.downloadBytesPerSecond), semantic.download) }
-                Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_upload), m.strings.rate(traffic.uploadBytesPerSecond), semantic.upload) }
-            }
+            CompactSessionRates(m)
         }
     }
 }
@@ -559,13 +556,6 @@ private val ReadingWidth = 860.dp
     health: ConnectionHealth = m.connectionHealth.collectAsState().value,
 ) {
     val semantic = LocalSemanticColors.current
-    var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(status.state, status.connectedAt) {
-        while (status.state == "connected") {
-            now = System.currentTimeMillis()
-            delay(1000)
-        }
-    }
     val connected = status.state == "connected"
     val unreachable = connected && health == ConnectionHealth.Unreachable
     val checking = connected && health in listOf(ConnectionHealth.Unchecked, ConnectionHealth.Checking)
@@ -581,7 +571,7 @@ private val ReadingWidth = 860.dp
             secondary = when {
                 unreachable -> m.text("недоступен", "unavailable")
                 checking -> m.text("соединение", "connection")
-                else -> formatDuration(now - status.connectedAt)
+                else -> ""
             }
         }
         "connecting" -> {
@@ -634,22 +624,39 @@ private val ReadingWidth = 860.dp
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(label, Modifier.weight(1f), style = poster, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (connected && !unreachable && !checking) Text(secondary, style = poster.copy(fontSize = 20.sp, lineHeight = 26.sp, fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
+                if (connected && !unreachable && !checking) {
+                    ConnectedDurationLabel(status.connectedAt, poster.copy(fontSize = 20.sp, lineHeight = 26.sp, fontFeatureSettings = "tnum"), ink)
+                }
             }
         } else {
-        Text(primary, style = poster, color = ink, maxLines = 1)
-        // Keyed on the state, never on the text: keying on the text would crossfade the whole line
-        // once a second while the timer ticks. Tabular figures keep it from twitching sideways.
-        @Suppress("UnusedContentLambdaTargetStateParameter")
-        AnimatedContent(
-            targetState = status.state to health,
-            transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
-            label = "headline-second-line",
-        ) { _ ->
-            Text(secondary, style = poster.copy(fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
-        }
+            Text(primary, style = poster, color = ink, maxLines = 1)
+            // Keyed on the state, never on the text: keying on the text would crossfade the whole line
+            // once a second while the timer ticks. Tabular figures keep it from twitching sideways.
+            @Suppress("UnusedContentLambdaTargetStateParameter")
+            AnimatedContent(
+                targetState = status.state to health,
+                transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
+                label = "headline-second-line",
+            ) { _ ->
+                if (connected && !unreachable && !checking) {
+                    ConnectedDurationLabel(status.connectedAt, poster.copy(fontFeatureSettings = "tnum"), ink)
+                } else {
+                    Text(secondary, style = poster.copy(fontFeatureSettings = "tnum"), color = ink, maxLines = 1)
+                }
+            }
         }
     }
+}
+
+@Composable private fun ConnectedDurationLabel(connectedAt: Long, style: TextStyle, color: Color) {
+    var now by remember(connectedAt) { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(connectedAt) {
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    Text(formatDuration(now - connectedAt), style = style, color = color, maxLines = 1)
 }
 
 /** Keep diagnostics outside the fixed poster, so the dock grid also holds for service errors. */
@@ -683,7 +690,7 @@ private val ReadingWidth = 860.dp
     )
 }
 
-@Composable private fun FlowFigure(m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, node: ProxyNode?, modifier: Modifier) {
+@Composable private fun FlowFigure(m: DesktopModel, status: ServiceStatus, node: ProxyNode?, modifier: Modifier) {
     val semantic = LocalSemanticColors.current
     val settings by m.settings.settings.collectAsState()
     val running = status.state == "connected"
@@ -694,13 +701,16 @@ private val ReadingWidth = 860.dp
     val veil by animateFloatAsState(if (running) 0.62f else 0.5f, colorTween(), label = "figure-veil")
     Box(modifier.testTag("flow-figure").glass(FigureShape, glassTint(veil))) {
         when (settings.visualizer) {
-            Visualizer.Waves -> TrafficWaves(
-                downloadBytesPerSecond = traffic.downloadBytesPerSecond,
-                uploadBytesPerSecond = traffic.uploadBytesPerSecond,
-                downloadColor = semantic.download,
-                uploadColor = semantic.upload,
-                warming = warming,
-            )
+            Visualizer.Waves -> {
+                val traffic by m.traffic.collectAsState()
+                TrafficWaves(
+                    downloadBytesPerSecond = traffic.downloadBytesPerSecond,
+                    uploadBytesPerSecond = traffic.uploadBytesPerSecond,
+                    downloadColor = semantic.download,
+                    uploadColor = semantic.upload,
+                    warming = warming,
+                )
+            }
             Visualizer.Planet -> {
                 val mask = WorldLandMask
                 // The flag in the server's own name is its country code. Nothing is asked of the
@@ -818,6 +828,21 @@ private val ReadingWidth = 860.dp
     }
 }
 
+@Composable private fun LiveSessionTile(m: DesktopModel) {
+    val traffic by m.traffic.collectAsState()
+    val history by m.trafficHistory.collectAsState()
+    SessionTile(m, traffic, history.map { it.downloadBytesPerSecond }, history.map { it.uploadBytesPerSecond })
+}
+
+@Composable private fun CompactSessionRates(m: DesktopModel) {
+    val traffic by m.traffic.collectAsState()
+    val semantic = LocalSemanticColors.current
+    Row(Modifier.fillMaxWidth().glass(TileShape, glassTint()).padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+        Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_download), m.strings.rate(traffic.downloadBytesPerSecond), semantic.download) }
+        Box(Modifier.weight(1f)) { SessionRate(m.strings.get(R.string.connect_rate_upload), m.strings.rate(traffic.uploadBytesPerSecond), semantic.upload) }
+    }
+}
+
 @Composable private fun SessionTile(m: DesktopModel, traffic: TrafficStats, download: List<Long>, upload: List<Long>) {
     val semantic = LocalSemanticColors.current
     GlassPanel(Modifier.fillMaxWidth(), shape = TileShape, padding = PaddingValues(18.dp), spacing = 9.dp) {
@@ -866,7 +891,7 @@ private val ReadingWidth = 860.dp
 @Composable private fun ServersPage(m: DesktopModel) {
     val profiles by m.profiles.state.collectAsState()
     val pinging by m.pinging.collectAsState()
-    val status by m.status.collectAsState()
+    val status by m.collectUiStatus()
     val activeNode by m.activeNode.collectAsState()
     val query by m.serverQuery.collectAsState()
     val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
@@ -1075,7 +1100,7 @@ private val ReadingWidth = 860.dp
 @Composable private fun RoutingPage(m: DesktopModel) {
     val current by m.desktop.state.collectAsState()
     val settings by m.settings.settings.collectAsState()
-    val status by m.status.collectAsState()
+    val status by m.collectUiStatus()
     var domains by remember(current.domains) { mutableStateOf(current.domains.joinToString("\n")) }
     var networks by remember(current.networks) { mutableStateOf(current.networks.joinToString("\n")) }
     var invalid by remember { mutableStateOf(false) }
@@ -1276,7 +1301,7 @@ private val ReadingWidth = 860.dp
 @Composable private fun SpeedPage(m: DesktopModel) {
     val semantic = LocalSemanticColors.current
     val speed by m.speed.collectAsState()
-    val status by m.status.collectAsState()
+    val status by m.collectUiStatus()
     val running = speed.running
     val accent = if (speed.phase == SpeedPhase.Upload) semantic.upload else semantic.download
 
@@ -1411,7 +1436,7 @@ private val ReadingWidth = 860.dp
 @Composable private fun SettingsPage(m: DesktopModel, onInstallUpdate: () -> Unit) {
     val settings by m.settings.settings.collectAsState()
     val desktop by m.desktop.state.collectAsState()
-    val status by m.status.collectAsState()
+    val status by m.collectUiStatus()
     val adapters by m.adapters.collectAsState()
     var dns by remember(settings.remoteDns) { mutableStateOf(settings.remoteDns) }
     var mtu by remember(settings.mtu) { mutableStateOf(settings.mtu.toString()) }

@@ -9,7 +9,12 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalWindowInfo
+import kotlinx.coroutines.delay
+import com.yumi.desktop.LocalFramePacing
+import com.yumi.desktop.LocalUiFrameProbe
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asSkiaBitmap
@@ -61,7 +66,7 @@ fun PixelPlanet(
     modifier: Modifier = Modifier,
 ) {
     val planet = LocalPlanetState.current ?: remember { PlanetState() }
-    val tick by rememberPlanetTicks(planet)
+    val tick by rememberPlanetTicks(planet, warming)
 
     val strip = remember(planet, mask, seaColor, landColor, gapColor) {
         planet.strip(mask, seaColor, landColor, gapColor)
@@ -180,6 +185,8 @@ internal class MapCamera {
      */
     var markerOffsetY = 0f
         private set
+    var inFlight = false
+        private set
 
     private var scroll = 0.0
     private var scrollSpeed = 0.0
@@ -224,6 +231,7 @@ internal class MapCamera {
         stripHeight = pitch * ROWS
         stripWidth = stripHeight * STRIP_ASPECT
 
+        val scrollSettled: Boolean
         if (connected && latitude != null && longitude != null) {
             val turn = stripWidth.toDouble()
             var target = (longitude + 180.0) / 360.0 * turn - width / 2.0
@@ -233,10 +241,13 @@ internal class MapCamera {
             while (target - scroll < -turn / 2) target += turn
             scrollSpeed += (-STIFFNESS * (scroll - target) - DAMPING * scrollSpeed) * step
             scroll += scrollSpeed * step
+            scrollSettled = abs(scroll - target) < 0.5 && abs(scrollSpeed) < 0.5
         } else {
             scroll += step * stripWidth * if (warming) FAST_DRIFT else IDLE_DRIFT
             scrollSpeed = 0.0
+            scrollSettled = !warming
         }
+        inFlight = !settled || !scrollSettled
 
         originX = -scroll.toFloat()
 
@@ -416,16 +427,37 @@ internal class PlanetState {
 /** Three frames at sixty hertz: enough to ride out a stutter, short enough not to fast-forward. */
 private const val MAX_STEP_SECONDS = 0.05
 
-/** Ticks [planet] once per frame, and counts the frames so that the figure redraws with them. */
+/** Ticks [planet] once per frame, pacing live windows cleanly while keeping tests lockstep. */
 @Composable
-private fun rememberPlanetTicks(planet: PlanetState): State<Long> {
+private fun rememberPlanetTicks(planet: PlanetState, warming: Boolean): State<Long> {
     val active = LocalAnimationsActive.current
-    return produceState(0L, active, planet) {
+    val paced = LocalFramePacing.current
+    val focused = LocalUiFrameProbe.current != null || LocalWindowInfo.current.isWindowFocused
+    val currentFocused by rememberUpdatedState(focused)
+    val currentWarming by rememberUpdatedState(warming)
+    return produceState(0L, active, paced, planet) {
         if (!active) return@produceState
-        while (true) {
-            withInfiniteAnimationFrameNanos { frame ->
-                planet.tick(frame)
-                value += 1
+        if (!paced) {
+            while (true) {
+                withInfiniteAnimationFrameNanos { frame ->
+                    planet.tick(frame)
+                    value += 1
+                }
+            }
+        } else {
+            while (true) {
+                val started = withInfiniteAnimationFrameNanos { frame ->
+                    planet.tick(frame)
+                    value += 1
+                    System.nanoTime()
+                }
+                val interval = when {
+                    !currentFocused -> 100_000_000L
+                    planet.camera.inFlight || currentWarming -> 16_666_667L
+                    else -> 33_333_333L
+                }
+                val remaining = (started + interval - System.nanoTime()) / 1_000_000L
+                if (remaining > 0) delay(remaining)
             }
         }
     }

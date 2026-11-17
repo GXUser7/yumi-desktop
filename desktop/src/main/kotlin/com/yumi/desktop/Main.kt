@@ -62,7 +62,7 @@ fun main(args: Array<String>) {
         val frameProbe = remember { if (benchmark) UiFrameProbe(launchedAt) else null }
         val scope=rememberCoroutineScope()
         val settings by model.settings.settings.collectAsState()
-        val status by model.status.collectAsState()
+        val status by model.collectUiStatus()
         var closing by remember { mutableStateOf(false) }
         suspend fun launchReadyUpdate(relaunch: Boolean): Boolean {
             val ready = model.updates.readyToInstall() ?: return false
@@ -175,6 +175,7 @@ fun main(args: Array<String>) {
             CompositionLocalProvider(
                 LocalWindowMotion provides windowMotion,
                 LocalAnimationsActive provides (visible && !windowState.isMinimized),
+                LocalFramePacing provides true,
                 LocalUiFrameProbe provides frameProbe,
             ) { YumiApp(model,smokePage, onInstallUpdate = installUpdate) }
             if (benchmark) DisposableEffect(window) {

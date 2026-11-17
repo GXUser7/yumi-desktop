@@ -93,4 +93,42 @@ class TrayTest {
             } finally { window.dispose() }
         }
     }
+
+    @Test fun trayMenuHighlightsActiveNodeAndCapsLargeListsWithOpenItem() {
+        val nodes = (1..55).map { index ->
+            ProxyNode("", "Server $index", "192.0.2.$index", 443,
+                ProxySettings.Vless("11111111-2222-3333-4444-555555555555")).identified()
+        }
+        val active = nodes[49] // Beyond the 40-item cap; must still stay visible and checked.
+        val profiles = ProfileState(nodes = nodes, selectedNodeId = nodes[0].id)
+        val strings = Strings { AppLanguage.English }
+        val popup = PopupMenu()
+        var opened = 0
+        runComposeUiTest {
+            setContent {
+                val parent = rememberCompositionContext()
+                DisposableEffect(popup) {
+                    val composition = popup.setContent(parent) {
+                        TrayServers(profiles, strings, pinging = false, switching = false, activeNodeId = active.id, onSelect = {}, onOpen = { opened++ }, onPing = {})
+                    }
+                    onDispose { composition.dispose() }
+                }
+            }
+            runOnIdle {
+                val servers = popup.getItem(0) as Menu
+                // 40 server items + "Open Yumi…" + separator + "Measure latency" = 43
+                assertEquals(43, servers.itemCount)
+                assertFalse((servers.getItem(0) as CheckboxMenuItem).state)
+                assertTrue(servers.getItem(0).isEnabled)
+                val activeItem = servers.getItem(39) as CheckboxMenuItem
+                assertTrue(activeItem.label.startsWith("Server 50 "))
+                assertTrue(activeItem.state)
+                assertFalse(activeItem.isEnabled)
+                val openMore = servers.getItem(40)
+                assertEquals("Open Yumi…", openMore.label)
+                openMore.actionListeners.forEach { it.actionPerformed(ActionEvent(openMore, ActionEvent.ACTION_PERFORMED, openMore.label)) }
+                assertEquals(1, opened)
+            }
+        }
+    }
 }

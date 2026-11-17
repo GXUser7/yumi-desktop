@@ -63,7 +63,11 @@ object ProxyUriParser {
         text.lineSequence()
             .map(String::trim)
             .filter { it.contains("://") }
-            .mapNotNull { line -> splitUri(line)?.unsupportedTransport() }
+            .mapNotNull { line ->
+                splitUri(line)
+                    ?.takeUnless { it.scheme in setOf("hysteria2", "hy2", "tuic") }
+                    ?.unsupportedTransport()
+            }
             .groupingBy { it }
             .eachCount()
 
@@ -92,7 +96,7 @@ object ProxyUriParser {
     // ---------------------------------------------------------------- VMess
 
     private fun parseVmess(uri: String, subId: String?): ProxyNode? {
-        val payload = uri.removePrefix("vmess://").substringBefore('#')
+        val payload = uri.substringAfter("://").substringBefore('#')
         // Canonical form is base64(JSON); some panels emit a plain URI instead.
         val json = base64DecodeOrNull(payload)?.let {
             runCatching { lenientJson.parseToJsonElement(it) as? JsonObject }.getOrNull()
@@ -101,7 +105,7 @@ object ProxyUriParser {
     }
 
     private fun parseVmessJson(o: JsonObject, uri: String, subId: String?): ProxyNode? {
-        val host = o.str("add") ?: return null
+        val host = normalizeServerHost(o.str("add")) ?: return null
         val port = o.str("port")?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
         val uuid = o.str("id") ?: return null
 
@@ -122,8 +126,8 @@ object ProxyUriParser {
         }
 
         val tlsMode = o.str("tls")?.lowercase().orEmpty()
-        val tls = if (tlsMode == "tls" || tlsMode == "reality") {
-            TlsOptions(
+        val tls = when (tlsMode) {
+            "tls" -> TlsOptions(
                 enabled = true,
                 serverName = o.str("sni")?.ifEmpty { null } ?: headerHost.ifEmpty { null } ?: host,
                 alpn = splitCsv(o.str("alpn")),
@@ -131,8 +135,23 @@ object ProxyUriParser {
                 insecure = o.str("allowinsecure", "allow_insecure", "insecure", "skip-cert-verify")
                     ?.let { it == "1" || it.equals("true", ignoreCase = true) } ?: false,
             )
-        } else {
-            null
+            "reality" -> {
+                val pbk = o.str("pbk", "publickey", "public-key", "public_key")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: return null
+                TlsOptions(
+                    enabled = true,
+                    serverName = o.str("sni")?.ifEmpty { null } ?: headerHost.ifEmpty { null } ?: host,
+                    fingerprint = o.str("fp")?.ifEmpty { null },
+                    reality = RealityOptions(
+                        publicKey = normalizeRealityKey(pbk),
+                        shortId = o.str("sid", "shortid", "short-id", "short_id").orEmpty(),
+                        spiderX = o.str("spx", "spiderx", "spider-x", "spider_x") ?: "/",
+                    ),
+                )
+            }
+            "", "none", "0", "false" -> null
+            else -> return null
         }
 
         val settings = ProxySettings.Vmess(
@@ -177,7 +196,7 @@ object ProxyUriParser {
     // ---------------------------------------------------------- Shadowsocks
 
     private fun parseShadowsocks(uri: String, subId: String?): ProxyNode? {
-        val withoutScheme = uri.removePrefix("ss://")
+        val withoutScheme = uri.substringAfter("://")
         val name = withoutScheme.substringAfter('#', "").let(::urlDecode)
         val body = withoutScheme.substringBefore('#')
 
@@ -188,7 +207,8 @@ object ProxyUriParser {
             if (at < 0) return null
             val (method, password) = decoded.substring(0, at).split(':', limit = 2)
                 .takeIf { it.size == 2 } ?: return null
-            val (host, port) = splitHostAndPort(decoded.substring(at + 1)) ?: return null
+            val (rawHost, port) = splitHostAndPort(decoded.substring(at + 1)) ?: return null
+            val host = normalizeServerHost(rawHost) ?: return null
             val settings = ProxySettings.Shadowsocks(method, password)
             return ProxyNode(
                 id = "",
@@ -282,10 +302,15 @@ object ProxyUriParser {
      */
     private fun parseWireGuard(uri: String, subId: String?): ProxyNode? {
         val p = splitUri(uri) ?: return null
+        val privateKey = urlDecode(p.userInfo).takeIf { it.isNotBlank() }
+            ?: p.q("privatekey", "private-key", "private_key")?.takeIf { it.isNotBlank() }
+            ?: return null
+        val peerPublicKey = p.q("publickey", "public-key", "public_key")?.takeIf { it.isNotBlank() }
+            ?: return null
         val settings = ProxySettings.WireGuard(
-            privateKey = urlDecode(p.userInfo).ifEmpty { p.query["privatekey"].orEmpty() },
-            peerPublicKey = p.query["publickey"] ?: p.query["public-key"] ?: return null,
-            preSharedKey = p.query["presharedkey"] ?: p.query["pre-shared-key"].orEmpty(),
+            privateKey = privateKey,
+            peerPublicKey = peerPublicKey,
+            preSharedKey = p.q("presharedkey", "pre-shared-key", "pre_shared_key").orEmpty(),
             localAddresses = (p.query["address"] ?: p.query["ip"]).orEmpty()
                 .split(',')
                 .map(String::trim)
@@ -375,9 +400,12 @@ object ProxyUriParser {
         // "reality verification failed", because the server is framing a protocol we are not
         // speaking. XHTTP is the one that turned up in the wild; sing-box implements five stream
         // transports and that is not among them. Refusing the line says so at import instead.
-        p.unsupportedTransport()?.let { return null }
+        val isQuicTransportless = settings is ProxySettings.Hysteria2 || settings is ProxySettings.Tuic
+        if (!isQuicTransportless) {
+            p.unsupportedTransport()?.let { return null }
+        }
 
-        val transport = p.transport()
+        val transport = if (isQuicTransportless) null else p.transport()
         return ProxyNode(
             id = "",
             name = p.fragment.ifEmpty { "${p.host}:${p.port}" },

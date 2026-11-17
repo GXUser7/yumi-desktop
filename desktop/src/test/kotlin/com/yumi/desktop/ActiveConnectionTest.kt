@@ -100,7 +100,7 @@ class ActiveConnectionTest {
         } finally { model.close(); directory.deleteRecursively() }
     }
 
-    @Test fun rejectedSwitchKeepsTheOldHealthAndActiveServer() = runTest {
+    @Test fun rejectedSwitchKeepsTheOldHealthAndActiveServerAndSurfacesError() = runTest {
         val directory = Files.createTempDirectory("yumi-active-reject-").toFile()
         val backend = Backend()
         val model = model(directory, backend)
@@ -115,6 +115,43 @@ class ActiveConnectionTest {
             model.selectNode(other.id).join(); runCurrent()
             assertEquals(original, model.activeNode.value)
             assertEquals(ConnectionHealth.Reachable, model.connectionHealth.value)
+            assertNotNull(model.message.value)
+            assertTrue(model.message.value!!.contains("Could not switch servers") || model.message.value!!.contains("Не удалось сменить сервер"))
+        } finally { model.close(); directory.deleteRecursively() }
+    }
+
+    @Test fun selectingServerDuringConnectingStateSwitchesTargetServer() = runTest {
+        val directory = Files.createTempDirectory("yumi-connecting-select-").toFile()
+        val first = node("192.0.2.1")
+        val second = node("192.0.2.2")
+        val connectingBackend = object : TunnelBackend {
+            val connects = mutableListOf<String?>()
+            var current = ServiceStatus(state = "disconnected", geoReady = true)
+            override suspend fun request(request: ServiceRequest): ServiceStatus {
+                when (request.command) {
+                    "connect" -> {
+                        connects += request.nodeId
+                        current = current.copy(state = "connecting", nodeId = request.nodeId)
+                    }
+                    "disconnect" -> current = current.copy(state = "disconnected", nodeId = null)
+                }
+                return current
+            }
+        }
+        val model = DesktopModel(
+            connectingBackend, directory,
+            CoroutineScope(backgroundScope.coroutineContext + SupervisorJob(backgroundScope.coroutineContext[Job])),
+            measureLatency = { n, _ -> LatencyResult(n.id, 10, 1) },
+            checkTunnel = { true },
+        )
+        try {
+            model.settings.update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+            model.profiles.addNodes(listOf(first, second))
+            runCurrent()
+            model.toggleConnection().join(); runCurrent()
+            assertEquals("connecting", model.status.value.state)
+            model.selectNode(second.id).join(); runCurrent()
+            assertEquals(listOf<String?>(first.id, second.id), connectingBackend.connects)
         } finally { model.close(); directory.deleteRecursively() }
     }
 }

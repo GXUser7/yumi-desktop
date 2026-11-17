@@ -167,7 +167,7 @@ class ProfileRepository(
     fun selectNode(nodeId: String) = store.update { it.copy(selectedNodeId = nodeId) }
 
     fun selectedNode(): ProxyNode? = store.value.let { s ->
-        s.nodes.firstOrNull { it.id == s.selectedNodeId }
+        s.visibleNodes.firstOrNull { it.id == s.selectedNodeId }
     }
 
     fun addNodes(newNodes: List<ProxyNode>) = store.update { current ->
@@ -232,19 +232,21 @@ class ProfileRepository(
         userAgentOverride: String?,
         headers: Map<String, String>,
     ): Subscription {
-        val existing = store.value.subscriptions.firstOrNull { it.url == url }
-        val imported = existing?.copy(
-            name = name,
-            userAgentOverride = userAgentOverride,
-            headers = headers,
-        ) ?: Subscription(
-            id = UUID.randomUUID().toString(),
-            name = name,
-            url = url,
-            userAgentOverride = userAgentOverride,
-            headers = headers,
-        )
+        lateinit var result: Subscription
         store.update { current ->
+            val existing = current.subscriptions.firstOrNull { it.url == url }
+            val imported = existing?.copy(
+                name = name,
+                userAgentOverride = userAgentOverride,
+                headers = headers,
+            ) ?: Subscription(
+                id = UUID.randomUUID().toString(),
+                name = name,
+                url = url,
+                userAgentOverride = userAgentOverride,
+                headers = headers,
+            )
+            result = imported
             current.copy(
                 subscriptions = if (existing == null) {
                     current.subscriptions + imported
@@ -253,7 +255,7 @@ class ProfileRepository(
                 },
             )
         }
-        return imported
+        return result
     }
 
     fun removeSubscription(subscriptionId: String) = store.update { current ->
@@ -390,6 +392,26 @@ class ProfileRepository(
 
     fun recordLatencies(results: List<LatencyResult>) = store.update { current ->
         current.copy(latencies = current.latencies + results.associateBy { it.nodeId })
+    }
+
+    fun recordLatencies(results: Map<String, Long?>) {
+        if (results.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val entries = results.mapValues { (nodeId, millis) ->
+            if (millis == null || millis < 0L) {
+                LatencyResult(nodeId = nodeId, millis = 0, measuredAtEpochMillis = now, failed = true)
+            } else {
+                LatencyResult(
+                    nodeId = nodeId,
+                    millis = millis.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    measuredAtEpochMillis = now,
+                    failed = false,
+                )
+            }
+        }
+        store.update { current ->
+            current.copy(latencies = current.latencies + entries)
+        }
     }
 
     fun clearLatencies() = store.update { it.copy(latencies = emptyMap()) }

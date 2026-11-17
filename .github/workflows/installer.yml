@@ -29,9 +29,26 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Version tag gate
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release, 'v')
+        shell: bash
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          root_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' build.gradle.kts | head -1)
+          desktop_version=$(sed -n 's/.*releaseVersion = "\([^"]*\)".*/\1/p' desktop/build.gradle.kts | head -1)
+          [ "$tag_version" = "$root_version" ] && [ "$tag_version" = "$desktop_version" ] || {
+            echo "Tag $TAG disagrees with build.gradle.kts ($root_version) or desktop/build.gradle.kts ($desktop_version)" >&2
+            exit 1
+          }
 
       - uses: actions/setup-java@v4
         with:
@@ -79,8 +96,23 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Version tag gate
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release, 'v')
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          root_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' build.gradle.kts | head -1)
+          desktop_version=$(sed -n 's/.*releaseVersion = "\([^"]*\)".*/\1/p' desktop/build.gradle.kts | head -1)
+          [ "$tag_version" = "$root_version" ] && [ "$tag_version" = "$desktop_version" ] || {
+            echo "Tag $TAG disagrees with build.gradle.kts ($root_version) or desktop/build.gradle.kts ($desktop_version)" >&2
+            exit 1
+          }
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -109,8 +141,23 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Version tag gate
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release, 'v')
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          root_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' build.gradle.kts | head -1)
+          desktop_version=$(sed -n 's/.*releaseVersion = "\([^"]*\)".*/\1/p' desktop/build.gradle.kts | head -1)
+          [ "$tag_version" = "$root_version" ] && [ "$tag_version" = "$desktop_version" ] || {
+            echo "Tag $TAG disagrees with build.gradle.kts ($root_version) or desktop/build.gradle.kts ($desktop_version)" >&2
+            exit 1
+          }
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -144,7 +191,22 @@ jobs:
       # Checked out first: checkout cleans the workspace, and the installer lands in it next.
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: docs/releases
+          sparse-checkout: |
+            docs/releases
+            build.gradle.kts
+            desktop/build.gradle.kts
+          sparse-checkout-cone-mode: false
+      - name: Version tag gate
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          root_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' build.gradle.kts | head -1)
+          desktop_version=$(sed -n 's/.*releaseVersion = "\([^"]*\)".*/\1/p' desktop/build.gradle.kts | head -1)
+          [ -n "$root_version" ] && [ -n "$desktop_version" ]
+          [ "$tag_version" = "$root_version" ] || { echo "Tag $TAG disagrees with build.gradle.kts ($root_version)" >&2; exit 1; }
+          [ "$tag_version" = "$desktop_version" ] || { echo "Tag $TAG disagrees with desktop/build.gradle.kts ($desktop_version)" >&2; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           path: dist

@@ -4,23 +4,30 @@ import com.mydrop.vpn.shared.R
 import com.mydrop.vpn.core.model.ProxyNode
 import com.mydrop.vpn.core.model.Subscription
 import com.mydrop.vpn.core.model.SubscriptionUpdate
+import com.mydrop.vpn.core.net.isNumericAddress
 import com.mydrop.vpn.core.parse.SubscriptionBody
 import com.mydrop.vpn.core.parse.ProxyUriParser
 import com.mydrop.vpn.core.xray.XrayConfigFactory
 import com.mydrop.vpn.core.parse.SubscriptionParser
 import com.mydrop.vpn.core.model.ProbeEndpoint
-import java.net.Authenticator
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.EOFException
+import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.PasswordAuthentication
-import java.net.Proxy
+import java.net.Socket
+import java.net.URI
 import java.net.URL
+import java.net.UnknownHostException
 import java.util.Base64
 import java.util.zip.GZIPInputStream
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 
 /**
  * What a panel with device binding wants to know about the client asking for the list.
@@ -73,8 +80,12 @@ class SubscriptionService(
 
         const val CONNECT_TIMEOUT_MILLIS = 15_000
         const val READ_TIMEOUT_MILLIS = 30_000
+        const val PROXY_CONNECT_TIMEOUT_MILLIS = 12_000
+        const val PROXY_READ_TIMEOUT_MILLIS = 15_000
         const val MAX_REDIRECTS = 5
+        const val MAX_HEADER_BYTES = 32 * 1024
         const val MAX_BODY_BYTES = 8L * 1024 * 1024
+        const val MAX_WEB_PAGE_URL_LENGTH = 2048
 
         /** A panel's subscription link: one opaque id as the whole path, as Remnawave writes them. */
         val PANEL_LINK_PATH = Regex("^/[A-Za-z0-9_-]{8,64}/?$")
@@ -284,7 +295,7 @@ class SubscriptionService(
         return links.map { link -> byName[link.name] ?: link } + groups.filter { it.name !in names }
     }
 
-    private data class Response(
+    internal data class Response(
         val code: Int,
         val body: String,
         val userInfoHeader: String?,
@@ -342,14 +353,14 @@ class SubscriptionService(
      *   the user sees.
      */
     private fun fetch(url: String, subscription: Subscription): Response = try {
-        get(url, subscription, through = null)
-    } catch (direct: java.io.IOException) {
+        getDirect(url, subscription)
+    } catch (direct: IOException) {
         val probe = probeEndpoint()
         if (probe == null) throw direct
         logs.debug(R.string.log_subscription_via_tunnel, subscription.name)
         try {
-            get(url, subscription, through = probe)
-        } catch (viaTunnel: java.io.IOException) {
+            getViaHttpProxy(url, subscription, probe)
+        } catch (viaTunnel: IOException) {
             // The direct failure is the one worth reporting: it names the provider rather than a
             // loopback port the user has never heard of.
             direct.addSuppressed(viaTunnel)
@@ -357,48 +368,105 @@ class SubscriptionService(
         }
     }
 
-    /**
-     * Hands the loopback inbound its credentials, and nothing else.
-     *
-     * `Authenticator` is process-wide, which is why this checks the requestor before answering: it
-     * must never offer these to a real proxy the user has configured, and it has nothing to say
-     * about server authentication — the link's own credentials travel as a header, under the
-     * same-origin rule above.
-     */
-    private fun installProbeAuthenticator() {
-        Authenticator.setDefault(object : Authenticator() {
-            override fun getPasswordAuthentication(): PasswordAuthentication? {
-                val probe = probeEndpoint() ?: return null
-                // Not filtered by requestor type: an HTTP proxy asks as PROXY and Java's SOCKS
-                // client asks as SERVER, and the inbound below answers both. The address is what
-                // makes this safe — these credentials are only ever offered to our own loopback.
-                if (requestingHost != LOOPBACK || requestingPort != probe.port) return null
-                return PasswordAuthentication(probe.username, probe.password.toCharArray())
-            }
-        })
+    private fun validateHttpUrl(raw: String): URL {
+        require(raw.none { it.isISOControl() }) { "Invalid URL characters" }
+        val url = runCatching { URI(raw).toURL() }.getOrElse { URL(raw) }
+        val scheme = url.protocol.lowercase()
+        require(scheme in setOf("http", "https")) { "Unsupported URL scheme: $scheme" }
+        require(url.host.removeSurrounding("[", "]").isNotBlank()) { "Missing URL host" }
+        return url
     }
 
-    private fun get(url: String, subscription: Subscription, through: ProbeEndpoint?): Response {
-        val origin = URL(url)
-        var current = url
-        repeat(MAX_REDIRECTS) {
-            val target = URL(current)
-            val trusted = sameOrigin(origin, target)
-            val opened = if (through == null) {
-                target.openConnection()
-            } else {
-                installProbeAuthenticator()
-                // SOCKS rather than HTTP, and the difference is where the proxy sits. Java
-                // implements SOCKS underneath the socket, so TLS and everything above it are
-                // carried without knowing about it; the HTTP form has to be understood by the
-                // connection itself, and Android's implementation quietly declined to use it —
-                // the request went straight out and failed exactly as it had without a proxy.
-                // The inbound speaks both, so this costs nothing.
-                target.openConnection(
-                    Proxy(Proxy.Type.SOCKS, InetSocketAddress(LOOPBACK, through.port)),
-                )
+    private fun isPrivateOrigin(url: URL): Boolean {
+        val host = url.host.removeSurrounding("[", "]")
+        if (!isNumericAddress(host) && !host.equals("localhost", ignoreCase = true)) return false
+        return runCatching { InetAddress.getAllByName(host).any(::isPrivateOrSpecial) }
+            .getOrDefault(false)
+    }
+
+    private fun validateRedirect(
+        originIsPrivate: Boolean,
+        current: String,
+        location: String,
+        allowUnresolvedHostname: Boolean,
+    ): URL {
+        val cleanLocation = location.trim()
+        if (cleanLocation.any { it.isISOControl() }) {
+            throw SecurityException("Invalid redirect Location")
+        }
+        val next = runCatching { URI(current).resolve(cleanLocation).toURL() }
+            .getOrElse { URL(URL(current), cleanLocation) }
+        val scheme = next.protocol.lowercase()
+        if (scheme !in setOf("http", "https")) {
+            throw SecurityException("Refused redirect to disallowed scheme: $scheme")
+        }
+        val host = next.host.removeSurrounding("[", "]")
+        if (host.isBlank()) {
+            throw SecurityException("Refused redirect with empty host")
+        }
+        val addresses = try {
+            InetAddress.getAllByName(host)
+        } catch (unresolved: UnknownHostException) {
+            if (allowUnresolvedHostname && !isNumericAddress(host) && !host.equals("localhost", ignoreCase = true)) {
+                return next
             }
-            val connection = (opened as HttpURLConnection).apply {
+            throw unresolved
+        }
+        for (addr in addresses) {
+            if (addr.isAnyLocalAddress || addr.isLinkLocalAddress || addr.isMulticastAddress) {
+                throw SecurityException("Refused redirect to restricted address")
+            }
+            if (!originIsPrivate && isPrivateOrSpecial(addr)) {
+                throw SecurityException("Refused redirect to private or loopback address")
+            }
+        }
+        return next
+    }
+
+    private fun isPrivateOrSpecial(addr: InetAddress): Boolean {
+        if (addr.isLoopbackAddress ||
+            addr.isAnyLocalAddress ||
+            addr.isLinkLocalAddress ||
+            addr.isMulticastAddress ||
+            addr.isSiteLocalAddress
+        ) {
+            return true
+        }
+        val bytes = addr.address
+        if (bytes.size == 4) {
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            return b0 == 0 ||
+                b0 == 10 ||
+                (b0 == 100 && (b1 and 0xC0) == 64) ||
+                b0 == 127 ||
+                (b0 == 169 && b1 == 254) ||
+                (b0 == 172 && b1 in 16..31) ||
+                (b0 == 192 && b1 == 168)
+        }
+        if (bytes.size == 16) {
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            if ((b0 and 0xFE) == 0xFC) return true // fc00::/7 ULA
+            if (b0 == 0xFE && (b1 and 0xC0) == 0x80) return true // fe80::/10 link-local
+            if (b0 == 0xFF) return true // ff00::/8 multicast
+            val isV4Mapped = (0..9).all { bytes[it].toInt() == 0 } &&
+                bytes[10].toInt() == -1 && bytes[11].toInt() == -1
+            if (isV4Mapped) {
+                return isPrivateOrSpecial(InetAddress.getByAddress(bytes.copyOfRange(12, 16)))
+            }
+        }
+        return false
+    }
+
+    private fun getDirect(url: String, subscription: Subscription): Response {
+        val origin = validateHttpUrl(url)
+        val originIsPrivate = isPrivateOrigin(origin)
+        var current = origin.toString()
+        repeat(MAX_REDIRECTS) {
+            val target = validateHttpUrl(current)
+            val trusted = sameOrigin(origin, target)
+            val connection = (target.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = CONNECT_TIMEOUT_MILLIS
                 readTimeout = READ_TIMEOUT_MILLIS
@@ -423,7 +491,9 @@ class SubscriptionService(
                 // rule as the rest of the credentials.
                 if (trusted) {
                     subscription.headers.forEach { (name, value) ->
-                        runCatching { setRequestProperty(name, value) }
+                        if (isSafeHeader(name, value)) {
+                            runCatching { setRequestProperty(name, value) }
+                        }
                     }
                 }
                 setRequestProperty("Accept", "*/*")
@@ -449,12 +519,22 @@ class SubscriptionService(
                 if (code in 300..399) {
                     val location = connection.getHeaderField("Location")
                         ?: return Response(code, "", null, null, null)
-                    current = URL(URL(current), location).toString()
+                    current = validateRedirect(
+                        originIsPrivate = originIsPrivate,
+                        current = current,
+                        location = location,
+                        allowUnresolvedHostname = false,
+                    ).toString()
                     return@repeat
                 }
 
-                val stream = (connection.errorStream ?: connection.inputStream)
-                    .let { if (connection.contentEncoding == "gzip") GZIPInputStream(it) else it }
+                val rawStream = (connection.errorStream ?: if (code < 400) connection.inputStream else null)
+                    ?: ByteArrayInputStream(ByteArray(0))
+                val stream = if (code < 400 && isGzipEncoding(connection.contentEncoding)) {
+                    GZIPInputStream(rawStream)
+                } else {
+                    rawStream
+                }
                 // One byte past the ceiling, so a body that is merely at the limit still reads
                 // whole while an oversized one is caught. Silently keeping the first 8 MB turned a
                 // truncated document into a valid-looking short list, and every server past the
@@ -471,7 +551,7 @@ class SubscriptionService(
                     userInfoHeader = connection.getHeaderField("subscription-userinfo"),
                     profileTitle = connection.getHeaderField("profile-title")
                         ?.let(::decodeProfileTitle),
-                    webPageUrl = connection.getHeaderField("profile-web-page-url"),
+                    webPageUrl = sanitizeWebPageUrl(connection.getHeaderField("profile-web-page-url")),
                     hwidRequired = connection.getHeaderField("x-hwid-active") != null ||
                         connection.getHeaderField("x-hwid-not-supported") != null,
                     deviceLimitReached =
@@ -482,6 +562,310 @@ class SubscriptionService(
             }
         }
         throw IllegalStateException(strings.get(R.string.error_too_many_redirects))
+    }
+
+    internal fun getViaHttpProxy(
+        url: String,
+        subscription: Subscription,
+        through: ProbeEndpoint,
+    ): Response {
+        val origin = validateHttpUrl(url)
+        val originIsPrivate = isPrivateOrigin(origin)
+        var current = origin.toString()
+        val proxyCredentials = Base64.getEncoder()
+            .encodeToString("${through.username}:${through.password}".toByteArray(Charsets.UTF_8))
+
+        repeat(MAX_REDIRECTS) {
+            val target = validateHttpUrl(current)
+            val trusted = sameOrigin(origin, target)
+            val bareHost = target.host.removeSurrounding("[", "]")
+            val connectHost = if (':' in bareHost) "[$bareHost]" else bareHost
+            val port = effectivePort(target)
+            val isHttps = target.protocol.equals("https", ignoreCase = true)
+
+            val raw = Socket()
+            try {
+                raw.soTimeout = PROXY_READ_TIMEOUT_MILLIS
+                raw.connect(
+                    InetSocketAddress(InetAddress.getByName(LOOPBACK), through.port),
+                    PROXY_CONNECT_TIMEOUT_MILLIS,
+                )
+                val connectReq = buildString {
+                    append("CONNECT $connectHost:$port HTTP/1.1\r\n")
+                    append("Host: $connectHost:$port\r\n")
+                    append("Proxy-Authorization: Basic $proxyCredentials\r\n\r\n")
+                }
+                raw.getOutputStream().apply {
+                    write(connectReq.toByteArray(Charsets.UTF_8))
+                    flush()
+                }
+                val connectHead = readHttpHead(raw.getInputStream())
+                val connectCode = parseStatusCode(connectHead)
+                if (connectCode != 200) {
+                    throw IOException("HTTP CONNECT failed with status $connectCode")
+                }
+
+                val ioSocket: Socket = if (isHttps) {
+                    val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                    (factory.createSocket(raw, bareHost, port, true) as SSLSocket).apply {
+                        soTimeout = PROXY_READ_TIMEOUT_MILLIS
+                        sslParameters = sslParameters.apply {
+                            endpointIdentificationAlgorithm = "HTTPS"
+                        }
+                        startHandshake()
+                    }
+                } else {
+                    raw
+                }
+
+                ioSocket.use { sock ->
+                    val pathAndQuery = target.file.let {
+                        when {
+                            it.isEmpty() -> "/"
+                            it.startsWith('/') -> it
+                            else -> "/$it"
+                        }
+                    }
+                    val hostHeader = if (target.port != -1 && target.port != target.defaultPort) {
+                        "$connectHost:${target.port}"
+                    } else {
+                        connectHost
+                    }
+                    val agent = sanitizeHeaderValue(subscription.userAgentOverride ?: userAgent)
+                    val requestText = buildString {
+                        append("GET $pathAndQuery HTTP/1.1\r\n")
+                        append("Host: $hostHeader\r\n")
+                        append("User-Agent: $agent\r\n")
+                        target.userInfo?.takeIf { it.isNotEmpty() && trusted }?.let { credentials ->
+                            val decoded = com.mydrop.vpn.core.parse.urlDecode(credentials)
+                            val encoded = Base64.getEncoder().encodeToString(decoded.toByteArray())
+                            append("Authorization: Basic $encoded\r\n")
+                        }
+                        if (trusted) {
+                            subscription.headers.forEach { (name, value) ->
+                                if (isSafeHeader(name, value) &&
+                                    !name.equals("connection", ignoreCase = true) &&
+                                    !name.equals("host", ignoreCase = true)
+                                ) {
+                                    append("$name: $value\r\n")
+                                }
+                            }
+                        }
+                        append("Accept: */*\r\n")
+                        append("Accept-Encoding: gzip\r\n")
+                        append("Cache-Control: no-cache\r\n")
+                        append("Pragma: no-cache\r\n")
+                        identity()?.takeIf { trusted }?.let {
+                            append("x-hwid: ${sanitizeHeaderValue(it.hwid)}\r\n")
+                            append("x-device-os: ${sanitizeHeaderValue(it.os)}\r\n")
+                            append("x-ver-os: ${sanitizeHeaderValue(it.osVersion)}\r\n")
+                            append("x-device-model: ${sanitizeHeaderValue(it.model)}\r\n")
+                        }
+                        append("Connection: close\r\n\r\n")
+                    }
+                    sock.getOutputStream().apply {
+                        write(requestText.toByteArray(Charsets.UTF_8))
+                        flush()
+                    }
+
+                    val input = sock.getInputStream()
+                    val head = readHttpHead(input)
+                    val code = parseStatusCode(head)
+                        ?: throw IOException("Malformed HTTP status line")
+                    val headers = parseHeaders(head)
+
+                    if (code in 300..399) {
+                        val location = headers["location"]?.firstOrNull()
+                            ?: return Response(code, "", null, null, null)
+                        current = validateRedirect(
+                            originIsPrivate = originIsPrivate,
+                            current = current,
+                            location = location,
+                            allowUnresolvedHostname = true,
+                        ).toString()
+                        return@repeat
+                    }
+
+                    val isChunked = headers["transfer-encoding"].orEmpty()
+                        .flatMap { it.split(',') }
+                        .any { it.trim().equals("chunked", ignoreCase = true) }
+                    val contentLength = headers["content-length"]?.firstOrNull()?.trim()?.toLongOrNull()
+                    if (contentLength != null && contentLength < 0L) {
+                        throw IOException("Invalid Content-Length")
+                    }
+
+                    val bodyStream: InputStream = when {
+                        isChunked -> ChunkedInputStream(input)
+                        contentLength != null -> BoundedInputStream(input, contentLength)
+                        else -> input
+                    }
+                    val rawWireBounded = BoundedInputStream(bodyStream, MAX_BODY_BYTES + 1)
+                    val contentEncoding = headers["content-encoding"]?.firstOrNull()
+                    val decodedStream = if (code < 400 && isGzipEncoding(contentEncoding) && contentLength != 0L) {
+                        GZIPInputStream(rawWireBounded)
+                    } else {
+                        rawWireBounded
+                    }
+                    val rawBytes = decodedStream.use { it.readAtMost(MAX_BODY_BYTES + 1) }
+                    if (rawBytes.size > MAX_BODY_BYTES) {
+                        throw IllegalStateException(strings.get(R.string.error_body_too_large))
+                    }
+                    val body = String(rawBytes, Charsets.UTF_8)
+
+                    return Response(
+                        code = code,
+                        body = body,
+                        userInfoHeader = headers["subscription-userinfo"]?.firstOrNull(),
+                        profileTitle = headers["profile-title"]?.firstOrNull()?.let(::decodeProfileTitle),
+                        webPageUrl = sanitizeWebPageUrl(headers["profile-web-page-url"]?.firstOrNull()),
+                        hwidRequired = headers.containsKey("x-hwid-active") ||
+                            headers.containsKey("x-hwid-not-supported"),
+                        deviceLimitReached = headers.containsKey("x-hwid-max-devices-reached"),
+                    )
+                }
+            } finally {
+                runCatching { raw.close() }
+            }
+        }
+        throw IllegalStateException(strings.get(R.string.error_too_many_redirects))
+    }
+
+    private fun readHttpHead(stream: InputStream): String {
+        val bytes = ByteArrayOutputStream()
+        var newlines = 0
+        while (newlines < 2) {
+            val byte = stream.read()
+            if (byte < 0) break
+            if (bytes.size() >= MAX_HEADER_BYTES) {
+                throw IOException("Response headers exceeded $MAX_HEADER_BYTES bytes")
+            }
+            bytes.write(byte)
+            when (byte) {
+                '\n'.code -> newlines++
+                '\r'.code -> Unit
+                else -> newlines = 0
+            }
+        }
+        return String(bytes.toByteArray(), Charsets.UTF_8)
+    }
+
+    private fun parseStatusCode(head: String): Int? {
+        val statusLine = head.lineSequence().firstOrNull()?.trim().orEmpty()
+        if (!statusLine.startsWith("HTTP/", ignoreCase = true)) return null
+        return statusLine.split(' ', limit = 3).getOrNull(1)?.toIntOrNull()
+    }
+
+    private fun parseHeaders(head: String): Map<String, List<String>> {
+        val map = linkedMapOf<String, MutableList<String>>()
+        head.lineSequence().drop(1).forEach { line ->
+            if (line.isBlank()) return@forEach
+            val colon = line.indexOf(':')
+            if (colon <= 0) return@forEach
+            val key = line.substring(0, colon).trim().lowercase()
+            val value = line.substring(colon + 1).trim()
+            map.getOrPut(key) { mutableListOf() }.add(value)
+        }
+        return map
+    }
+
+    private fun isGzipEncoding(value: String?): Boolean =
+        value.orEmpty()
+            .split(',')
+            .any { it.trim().equals("gzip", ignoreCase = true) }
+
+    private fun isSafeHeader(name: String, value: String): Boolean =
+        name.isNotBlank() &&
+            ':' !in name &&
+            name.none { it.isISOControl() || it.isWhitespace() } &&
+            value.none { it == '\r' || it == '\n' || it == '\u0000' }
+
+    private fun sanitizeHeaderValue(value: String): String =
+        value.filterNot { it == '\r' || it == '\n' || it == '\u0000' }
+
+    internal fun sanitizeWebPageUrl(raw: String?): String? {
+        val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= MAX_WEB_PAGE_URL_LENGTH }
+            ?: return null
+        if (trimmed.any { it.isISOControl() }) return null
+        val uri = runCatching { URI(trimmed) }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase() ?: return null
+        if (scheme !in setOf("http", "https")) return null
+        if (uri.host.isNullOrBlank()) return null
+        return trimmed
+    }
+
+    private class BoundedInputStream(
+        private val source: InputStream,
+        private var remaining: Long,
+    ) : InputStream() {
+        override fun read(): Int {
+            if (remaining <= 0L) return -1
+            val b = source.read()
+            if (b >= 0) remaining--
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining <= 0L) return -1
+            val n = source.read(b, off, minOf(len.toLong(), remaining).toInt())
+            if (n > 0) remaining -= n
+            return n
+        }
+    }
+
+    private class ChunkedInputStream(private val source: InputStream) : InputStream() {
+        private var remainingInChunk = 0L
+        private var finished = false
+
+        override fun read(): Int {
+            val single = ByteArray(1)
+            val n = read(single, 0, 1)
+            return if (n <= 0) -1 else single[0].toInt() and 0xFF
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (finished || len == 0) return if (finished) -1 else 0
+            if (remainingInChunk == 0L && !nextChunk()) return -1
+            val toRead = minOf(len.toLong(), remainingInChunk).toInt()
+            val n = source.read(b, off, toRead)
+            if (n < 0) throw EOFException("Unexpected EOF inside chunked body")
+            remainingInChunk -= n
+            if (remainingInChunk == 0L) {
+                val line = readLineAscii()
+                if (line != null && line.isNotEmpty()) {
+                    throw IOException("Expected CRLF after chunk")
+                }
+            }
+            return n
+        }
+
+        private fun nextChunk(): Boolean {
+            val sizeLine = readLineAscii() ?: throw EOFException("Unexpected EOF reading chunk size")
+            val sizeHex = sizeLine.substringBefore(';').trim()
+            val size = sizeHex.toLongOrNull(16)?.takeIf { it >= 0L }
+                ?: throw IOException("Invalid chunk size: $sizeHex")
+            if (size == 0L) {
+                while (true) {
+                    val trailer = readLineAscii() ?: break
+                    if (trailer.isEmpty()) break
+                }
+                finished = true
+                return false
+            }
+            remainingInChunk = size
+            return true
+        }
+
+        private fun readLineAscii(): String? {
+            val sb = StringBuilder()
+            while (true) {
+                val ch = source.read()
+                if (ch < 0) return if (sb.isEmpty()) null else sb.toString()
+                if (ch == '\n'.code) break
+                if (ch != '\r'.code) sb.append(ch.toChar())
+                if (sb.length > 8192) throw IOException("Chunk line too long")
+            }
+            return sb.toString()
+        }
     }
 
     /**

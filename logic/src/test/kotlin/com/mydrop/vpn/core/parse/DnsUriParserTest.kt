@@ -98,4 +98,40 @@ class DnsUriParserTest {
             DnsUriParser.parseAll(page).map { it.url },
         )
     }
+
+    @Test
+    fun `doh check is case-insensitive, exact on path, and rejects userinfo`() {
+        assertNull(DnsUriParser.parse("HTTPS://sub.example.com/secret"))
+        assertNull(DnsUriParser.parse("https://sub.example.com/dns"))
+        assertNull(DnsUriParser.parse("https://sub.example.com/dns-query-fake"))
+        assertNull(DnsUriParser.parse("https://evil.com@1.1.1.1/dns-query"))
+        assertNull(DnsUriParser.parse("tcp://user@1.1.1.1"))
+        assertNull(DnsUriParser.parse("udp://user@1.1.1.1"))
+        assertEquals(
+            "https://dns.example.com/dns-query/alt",
+            DnsUriParser.parse("HTTPS://dns.example.com/dns-query/alt")?.url,
+        )
+    }
+
+    @Test
+    fun `bare ipv6 and custom port dns are canonicalized for xray and go`() {
+        assertEquals("2606:4700::1111", DnsUriParser.parse("[2606:4700::1111]")?.url)
+        assertEquals("8.8.8.8", DnsUriParser.parse("8.8.8.8:53")?.url)
+        assertEquals("8.8.8.8", DnsUriParser.parse("UDP://8.8.8.8")?.url)
+        assertEquals("udp://8.8.8.8:5353", DnsUriParser.parse("8.8.8.8:5353")?.url)
+        assertEquals("udp://[2606:4700::1111]:5353", DnsUriParser.parse("[2606:4700::1111]:5353")?.url)
+    }
+
+    @Test
+    fun `sdns stamp handles length over 127, missing leading slash, ipv6, custom port, and uppercase prefix`() {
+        val longHost = "a".repeat(130) + ".example.com"
+        val longStamp = stamp(0x02, "1.1.1.1:443", longHost, "dns-query").replaceFirst("sdns://", "SDNS://")
+        assertEquals("https://$longHost/dns-query", DnsUriParser.parse(longStamp)?.url)
+
+        val v6PortStamp = stamp(0x02, "[2606:4700::1111]:8443", "", "dns-query")
+        assertEquals("https://[2606:4700::1111]:8443/dns-query", DnsUriParser.parse(v6PortStamp)?.url)
+
+        // Truncated stamp fails cleanly.
+        assertNull(DnsUriParser.parse("sdns://" + Base64.getUrlEncoder().withoutPadding().encodeToString(byteArrayOf(0x02, 0, 0, 0, 0, 0, 0, 0, 0, 50, 1))))
+    }
 }

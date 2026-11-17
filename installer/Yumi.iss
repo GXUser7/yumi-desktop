@@ -7,6 +7,7 @@ AppVersion={#AppVersion}
 AppPublisher=Yumi
 DefaultDirName={autopf}\Yumi Desktop
 DefaultGroupName=Yumi Desktop
+DisableDirPage=yes
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -53,14 +54,43 @@ function WaitForSingleObject(Handle: THandle; Milliseconds: LongWord): LongWord;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseHandle(Handle: THandle): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
+function CreateFileW(FileName: String; DesiredAccess, ShareMode, SecurityAttributes, CreationDisposition, FlagsAndAttributes: LongWord; TemplateFile: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
 
 function InitializeSetup(): Boolean;
 begin
   Result := True;
 end;
 
+function StopExistingService(): Boolean;
+var
+  ServiceExe: String;
+  Code: Integer;
+  Attempts: Integer;
+  Handle: THandle;
+begin
+  Result := True;
+  ServiceExe := ExpandConstant('{app}\service\yumi-service.exe');
+  if not FileExists(ServiceExe) then Exit;
+  if not Exec(ServiceExe, '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then begin
+    Result := False;
+    Exit;
+  end;
+  { Wait for the SCM service process to finish exiting and release its binary lock before
+    overwriting or deleting files. }
+  for Attempts := 1 to 50 do begin
+    Handle := CreateFileW(ServiceExe, $40000000, 0, 0, 3, $80, 0);
+    if (Handle <> 0) and (Handle <> $FFFFFFFF) then begin
+      CloseHandle(Handle);
+      Exit;
+    end;
+    Sleep(200);
+  end;
+  Result := False;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var Code: Integer; Pid: Integer; Handle: THandle; WaitResult: LongWord;
+var Pid: Integer; Handle: THandle; WaitResult: LongWord;
 begin
   Result := '';
   { An accepted update first lets the app disconnect and exit, releasing its JVM files. }
@@ -79,9 +109,8 @@ begin
     end;
   end;
   { Stop only Yumi before replacing its service binary. Profiles live outside the installation. }
-  if FileExists(ExpandConstant('{app}\service\yumi-service.exe')) then
-    if not Exec(ExpandConstant('{app}\service\yumi-service.exe'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
-      Result := 'Could not stop the previous Yumi service. Close Yumi and retry.';
+  if not StopExistingService() then
+    Result := 'Could not stop the previous Yumi service. Close Yumi and retry.';
 end;
 
 { The SID of the person who will actually run Yumi, which is not the same question as "who is
@@ -92,29 +121,32 @@ end;
   logged-in user, which reports its own SID and nothing else. It needs no privilege and touches
   nothing else.
 
-  The hand-off is a file under ProgramData because ExecAsOriginalUser returns an exit code and no
-  output, and the two processes share no temp directory. Empty on any failure, and the caller then
-  falls back to the old behaviour rather than refusing to install. }
+  The hand-off uses a file in Setup's private temp directory rather than ProgramData so unprivileged
+  users cannot pre-stage or tamper with the file. Empty on failure, falling back to --install. }
 function OriginalUserSid(): String;
 var Code: Integer; Path: String; Raw: AnsiString; I: Integer; Ch: Char;
 begin
   Result := '';
-  if not ForceDirectories(ExpandConstant('{commonappdata}\Yumi Desktop')) then Exit;
-  Path := ExpandConstant('{commonappdata}\Yumi Desktop\install-owner.txt');
+  Path := ExpandConstant('{tmp}\install-owner.txt');
   DeleteFile(Path);
-  if not ExecAsOriginalUser(ExpandConstant('{app}\service\yumi-service.exe'),
-      '--owner-out "' + Path + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then Exit;
-  if not LoadStringFromFile(Path, Raw) then Exit;
+  if ExecAsOriginalUser(ExpandConstant('{app}\service\yumi-service.exe'),
+      '--owner-out "' + Path + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) and
+      LoadStringFromFile(Path, Raw) then
+    Result := Trim(String(Raw));
   DeleteFile(Path);
-  Result := Trim(String(Raw));
-  { Nothing but a SID goes onto a command line. The string comes from our own binary, so this is
-    belt and braces rather than a real defence - but a command line assembled out of a file is
-    exactly the shape of thing worth not having to think about twice. }
-  if Copy(Result, 1, 2) <> 'S-' then begin Result := ''; Exit; end;
-  for I := 1 to Length(Result) do begin
-    Ch := Result[I];
-    if not (((Ch >= '0') and (Ch <= '9')) or (Ch = '-') or (Ch = 'S')) then begin Result := ''; Exit; end;
+  if (Length(Result) < 5) or (Length(Result) > 184) or (Copy(Result, 1, 2) <> 'S-') then begin
+    Result := '';
+    Exit;
   end;
+  for I := 3 to Length(Result) do begin
+    Ch := Result[I];
+    if not (((Ch >= '0') and (Ch <= '9')) or (Ch = '-')) then begin Result := ''; Exit; end;
+  end;
+end;
+
+function ShouldRelaunchAfterInstall(): Boolean;
+begin
+  Result := ExpandConstant('{param:YUMIRESTART|0}') = '1';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -125,17 +157,12 @@ begin
     if Owner <> '' then Params := '--install --owner ' + Owner else Params := '--install';
     if not Exec(ExpandConstant('{app}\service\yumi-service.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
       RaiseException('Yumi tunnel service could not be installed. Please run the installer again.');
-    { Pairing needs one inbound port while the QR screen is open, and it is scoped to the local
-      subnet on both profiles rather than to the private one alone. Private-only was the safer
-      setting and it made the feature not exist on laptops: Windows marks a new Wi-Fi network
-      public by default, so the rule never applied and the phone's attempt was dropped in silence.
-      The domain profile is deliberately left out - on a managed network an unexpected inbound rule
-      is the administrator's decision and not this installer's. }
+    { Pairing needs one inbound port while the QR screen is open, scoped to private local networks. }
     Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall delete rule name="Yumi Desktop Pairing"', '', SW_HIDE, ewWaitUntilTerminated, Code);
-    if not Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall add rule name="Yumi Desktop Pairing" dir=in action=allow program="' + ExpandConstant('{app}\Yumi.exe') + '" enable=yes profile=private,public remoteip=localsubnet protocol=TCP', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    if not Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall add rule name="Yumi Desktop Pairing" dir=in action=allow program="' + ExpandConstant('{app}\Yumi.exe') + '" enable=yes profile=private remoteip=localsubnet protocol=TCP', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
       RaiseException('Yumi was installed, but its local-network pairing rule could not be added.');
   end;
-  if (CurStep = ssDone) and (ExpandConstant('{param:YUMIUPDATE|0}') = '1') then
+  if (CurStep = ssDone) and ShouldRelaunchAfterInstall() then
     ExecAsOriginalUser(ExpandConstant('{app}\Yumi.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
@@ -143,7 +170,8 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var Code: Integer;
 begin
   if CurUninstallStep = usUninstall then begin
-    Exec(ExpandConstant('{app}\service\yumi-service.exe'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    if FileExists(ExpandConstant('{app}\service\yumi-service.exe')) then
+      StopExistingService();
     Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall delete rule name="Yumi Desktop Pairing"', '', SW_HIDE, ewWaitUntilTerminated, Code);
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'YumiDesktop');
   end;

@@ -113,4 +113,19 @@ class ConnectionSettingsTest {
             assertFalse(f.model.status.value.killSwitch)
         } finally { f.close() }
     }
+
+    @Test fun remoteDnsValidationNormalizesDomainsAndRejectsWildcardsOrLocalTargets() {
+        assertEquals("example.com", validateRemoteDns(" Example.COM. "))
+        assertEquals("https://dns.google/dns-query", validateRemoteDns("HTTPS://DNS.Google./dns-query"))
+        assertEquals("https://[2606:4700:4700::1111]/dns-query", validateRemoteDns("https://[2606:4700:4700::1111]/dns-query"))
+        assertEquals("tcp://8.8.8.8:53", validateRemoteDns("TCP://8.8.8.8:53"))
+        assertEquals("1.1.1.1", validateRemoteDns("1.1.1.1"))
+        assertNull(validateRemoteDns("*.example.com"))
+        assertNull(validateRemoteDns("https://*.example.com/dns-query"))
+        assertNull(validateRemoteDns("localhost"))
+        assertNull(validateRemoteDns("https://localhost/dns-query"))
+        assertNull(validateRemoteDns("fakedns"))
+        assertNull(validateRemoteDns("udp://user@1.1.1.1"))
+        assertNull(validateRemoteDns("1.1.1.1/24"))
+    }
 }

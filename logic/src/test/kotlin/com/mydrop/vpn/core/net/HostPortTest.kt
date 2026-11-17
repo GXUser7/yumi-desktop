@@ -90,5 +90,18 @@ class HostPortTest {
         assertFalse(isNumericAddress("2001:db8::1::2"))
         assertFalse(isNumericAddress("12345::1"))
         assertFalse(isNumericAddress("1:2:3:4:5:6:7:8:9"))
+        assertFalse(isNumericAddress(":1:2:3:4:5:6:7:8"))
+        assertFalse(isNumericAddress("1:2:3:4:5:6:7:8:"))
+        assertFalse(isNumericAddress(":1::2"))
+        assertFalse(isNumericAddress("1::2:"))
+        assertFalse(isNumericAddress("1:2:3:4:5:6::192.0.2.1"))
+        assertFalse(isNumericAddress("2001:db8:::192.0.2.1"))
+    }
+
+    @Test
+    fun `embedded IPv4 IPv6 literals are recognised`() {
+        assertTrue(isNumericAddress("::192.0.2.1"))
+        assertTrue(isNumericAddress("64:ff9b::192.0.2.1"))
+        assertTrue(isNumericAddress("1:2:3:4:5:6:192.0.2.1"))
     }
 }

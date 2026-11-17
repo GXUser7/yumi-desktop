@@ -56,7 +56,18 @@ compose.desktop {
             targetFormats(TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm, TargetFormat.Dmg, TargetFormat.Pkg)
             packageName = "Yumi"
             packageVersion = releaseVersion
-            includeAllModules = true
+            modules(
+                "java.desktop",
+                "java.instrument",
+                "java.logging",
+                "java.management",
+                "java.net.http",
+                "jdk.charsets",
+                "jdk.crypto.ec",
+                "jdk.localedata",
+                "jdk.management",
+                "jdk.unsupported",
+            )
             appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
             windows { menu = true; shortcut = true; upgradeUuid = "e8cb03d0-c852-4375-bf1b-a83f09e118b7"
                 iconFile.set(project.file("icon/yumi.ico")) }

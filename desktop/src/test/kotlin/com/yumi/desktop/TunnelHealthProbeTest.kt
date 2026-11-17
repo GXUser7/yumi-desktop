@@ -144,6 +144,23 @@ class TunnelHealthProbeTest {
         }
     }
 
+    @Test fun probeMeasuresPostTlsRequestLatencyWithoutProxyConnectSetupTime() = runBlocking {
+        Fixture { socket ->
+            readHead(socket.inputStream)
+            Thread.sleep(250)
+            socket.outputStream.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+            serverTls(socket).use { tls ->
+                readHead(tls.inputStream)
+                tls.outputStream.write("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".toByteArray())
+                tls.outputStream.flush()
+            }
+        }.use { fixture ->
+            val rtt = probe().probe(fixture.endpoint)
+            assertTrue(rtt != null && rtt in 1..150, "Expected 1-RTT HTTP latency excluding 250ms proxy setup, got $rtt ms")
+            fixture.await()
+        }
+    }
+
     private fun probe(timeout: Long = 5_000) = TunnelHealthProbe(timeoutMillis = timeout, tlsFactory = trustedContext.socketFactory)
 
     private class Fixture(handler: (Socket) -> Unit) : AutoCloseable {

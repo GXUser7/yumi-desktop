@@ -94,6 +94,12 @@ fun elapsedSince(epochMillis: Long?, nowMillis: Long = System.currentTimeMillis(
 /** Days remaining on a plan, or null when the provider publishes no expiry. */
 fun daysUntil(epochSeconds: Long?, nowMillis: Long = System.currentTimeMillis()): Long? {
     if (epochSeconds == null || epochSeconds <= 0) return null
-    val deltaMillis = epochSeconds * 1000 - nowMillis
-    return (deltaMillis / 86_400_000).coerceAtLeast(0)
+    val nowSeconds = nowMillis / 1000L
+    if (nowSeconds < 0L) {
+        val negOffset = -nowSeconds
+        val delta = if (epochSeconds > Long.MAX_VALUE - negOffset) Long.MAX_VALUE else epochSeconds + negOffset
+        return delta / 86_400L
+    }
+    val deltaSeconds = epochSeconds - nowSeconds
+    return (deltaSeconds / 86_400L).coerceAtLeast(0L)
 }

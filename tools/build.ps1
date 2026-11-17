@@ -31,6 +31,8 @@ try {
     }
     & $GoExe -C service build -trimpath -ldflags '-s -w' -o ../runtime/yumi-service.exe .
     if ($LASTEXITCODE -ne 0) { throw 'Service build failed.' }
+    $composeBinaries = Join-Path $projectRoot 'desktop/build/compose/binaries/main'
+    if (Test-Path -LiteralPath $composeBinaries) { Remove-Item -LiteralPath $composeBinaries -Recurse -Force }
     & ./gradlew.bat :desktop:createDistributable --console=plain
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed.' }
     if (-not (Test-Path runtime/wintun.dll)) { throw 'Run tools/bootstrap.ps1 to obtain the verified Wintun runtime.' }

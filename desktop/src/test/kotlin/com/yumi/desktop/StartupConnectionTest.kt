@@ -95,4 +95,96 @@ class StartupConnectionTest {
             assertTrue(JsonStore(File(fixture.directory, "desktop.json"), DesktopSettings.serializer(), DesktopSettings(), backgroundScope).value.connectOnLaunch)
         } finally { fixture.close() }
     }
+
+    @Test fun closeDisconnectsKillSwitchAndDisconnectingStatesWithTimeoutAndClearsActiveSnapshot() = runTest {
+        val directory = Files.createTempDirectory("yumi-close-killswitch-").toFile()
+        try {
+            SettingsRepository(directory, backgroundScope).update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+            val node = ProxyNode("", "Chosen", "192.0.2.10", 443, ProxySettings.Vless("11111111-2222-3333-4444-555555555555")).identified()
+            ProfileRepository(directory, backgroundScope).addNodes(listOf(node))
+            val disconnects = mutableListOf<String>()
+            val backend = object : TunnelBackend {
+                var status = ServiceStatus(state = "connected", nodeId = node.id, connectedAt = 10L, killSwitch = true, geoReady = true)
+                override suspend fun request(request: ServiceRequest): ServiceStatus {
+                    if (request.command == "disconnect") {
+                        disconnects += request.command
+                        status = ServiceStatus(state = "disconnected", killSwitch = false, geoReady = true)
+                    }
+                    return status
+                }
+            }
+            val model = DesktopModel(backend, directory, backgroundScope, measureLatency = { n, _ -> LatencyResult(n.id, 10, 1) }, checkTunnel = { true })
+            runCurrent()
+            assertNotNull(model.activeNode.value)
+            backend.status = ServiceStatus(state = "failed", killSwitch = true, geoReady = true)
+            advanceTimeBy(1001); runCurrent()
+            model.close()
+            assertEquals(listOf("disconnect"), disconnects)
+            val saved = JsonStore(File(directory, "active-connection.json"), ActiveConnection.serializer(), ActiveConnection(), backgroundScope).value
+            assertEquals(ActiveConnection(), saved)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun closeDoesNotHangWhenDisconnectTimesOut() = runTest {
+        val directory = Files.createTempDirectory("yumi-close-timeout-").toFile()
+        try {
+            SettingsRepository(directory, backgroundScope).update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+            val backend = object : TunnelBackend {
+                override suspend fun request(request: ServiceRequest): ServiceStatus {
+                    if (request.command == "disconnect") kotlinx.coroutines.awaitCancellation()
+                    return ServiceStatus(state = "disconnecting", killSwitch = true, geoReady = true)
+                }
+            }
+            val model = DesktopModel(backend, directory, backgroundScope)
+            runCurrent()
+            model.close()
+            assertEquals(ActiveConnection(), JsonStore(File(directory, "active-connection.json"), ActiveConnection.serializer(), ActiveConnection(), backgroundScope).value)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun importTextSupportsDeepLinkAndDnsUriAndSurfacesRefreshError() = runTest {
+        val directory = Files.createTempDirectory("yumi-import-test-").toFile()
+        try {
+            SettingsRepository(directory, backgroundScope).update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+            val model = DesktopModel(Backend(), directory, backgroundScope)
+            try {
+                runCurrent()
+                model.importText("https://dns.google/dns-query").join()
+                assertEquals("https://dns.google/dns-query", model.settings.value.remoteDns)
+                assertTrue(model.profiles.state.value.dnsProfiles.any { it.url == "https://dns.google/dns-query" })
+
+                val nodeTarget = "vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#DeepNode"
+                model.importText("happ://add/$nodeTarget").join()
+                assertTrue(model.profiles.nodes.any { it.name == "DeepNode" })
+
+                // Unreachable subscription URL via deep link must surface a refresh error message.
+                model.importText("mydrop://add/https://127.0.0.1:1/unreachable-sub").join()
+                assertNotNull(model.message.value)
+            } finally { model.close() }
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun startupAutoConnectBoundsInitialRefreshWaitToFourSeconds() = runTest {
+        val directory = Files.createTempDirectory("yumi-startup-refresh-").toFile()
+        try {
+            SettingsRepository(directory, backgroundScope).update {
+                it.copy(deviceId = "test", subscriptionAutoUpdate = true)
+            }
+            JsonStore(File(directory, "desktop.json"), DesktopSettings.serializer(), DesktopSettings(), backgroundScope).update {
+                it.copy(connectOnLaunch = true, bypassRussia = false)
+            }
+            val node = ProxyNode("", "Chosen", "192.0.2.10", 443, ProxySettings.Vless("11111111-2222-3333-4444-555555555555")).identified()
+            val profiles = ProfileRepository(directory, backgroundScope)
+            // Point to an unreachable loopback port; startupRefresh will fail or take time, and
+            // connectOnLaunch must proceed within the 4s cap rather than blocking forever.
+            profiles.addSubscription(Subscription("sub", "Due", "https://127.0.0.1:1/sub", enabled = true, lastUpdatedEpochMillis = 0L))
+            profiles.addNodes(listOf(node))
+            val backend = Backend()
+            val model = DesktopModel(backend, directory, backgroundScope)
+            try {
+                advanceTimeBy(4_500); runCurrent()
+                assertEquals(listOf(node.id), backend.connects.map { it.nodeId })
+            } finally { model.close() }
+        } finally { directory.deleteRecursively() }
+    }
 }

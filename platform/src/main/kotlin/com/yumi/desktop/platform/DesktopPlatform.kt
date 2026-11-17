@@ -4,6 +4,8 @@ import com.yumi.desktop.model.*
 import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
+import com.sun.jna.platform.win32.AccCtrl
+import com.sun.jna.platform.win32.Advapi32
 import com.sun.jna.platform.win32.Advapi32Util
 import com.sun.jna.platform.win32.Kernel32
 import com.sun.jna.platform.win32.Shell32
@@ -11,25 +13,41 @@ import com.sun.jna.platform.win32.ShellAPI
 import com.sun.jna.platform.win32.User32
 import com.sun.jna.platform.win32.WinBase
 import com.sun.jna.platform.win32.WinDef
+import com.sun.jna.platform.win32.WinError
 import com.sun.jna.platform.win32.WinNT
 import com.sun.jna.platform.win32.WinReg
 import com.sun.jna.platform.win32.WinUser
+import com.sun.jna.ptr.IntByReference
+import com.sun.jna.ptr.PointerByReference
+import com.sun.jna.win32.StdCallLibrary
+import com.sun.jna.win32.W32APIOptions
 import java.io.File
-import java.io.RandomAccessFile
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
+import java.nio.channels.ClosedByInterruptException
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.runInterruptible
-import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.MessageDigest
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -68,24 +86,152 @@ private fun readFrame(read: (ByteBuffer) -> Int): ByteArray {
 private fun decodeReply(reply: ByteArray): ServiceStatus =
     tunnelJson.decodeFromString<ServiceStatus>(reply.decodeToString()).also { require(it.version == 1) }
 
-class WindowsTunnelBackend : TunnelBackend {
-    override suspend fun request(request: ServiceRequest): ServiceStatus = withContext(Dispatchers.IO) {
-        if (!DesktopPlatform.isWindows) return@withContext ServiceStatus(state = "unavailable", error = "platform_not_supported")
-        try {
-            RandomAccessFile(DesktopPlatform.PIPE_NAME, "rw").use { pipe ->
-                val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
-                require(bytes.size in 1..MAX_FRAME)
-                pipe.writeInt(bytes.size); pipe.write(bytes)
-                val size = pipe.readInt(); require(size in 1..MAX_FRAME)
-                val reply = ByteArray(size); pipe.readFully(reply)
-                decodeReply(reply)
-            }
-        } catch (_: Exception) {
-            // Everything used to land here as one code, and the screen then advised installing a
-            // service that was already installed and running. The reason is asked for now, once,
-            // and only on the failing path.
-            ServiceStatus(state = "unavailable", error = DesktopPlatform.diagnoseService())
+class WindowsTunnelBackend internal constructor(
+    private val pipeName: String = DesktopPlatform.PIPE_NAME,
+    private val timeoutMillis: Long = 15_000L,
+    private val expectedOwnerSid: String = DesktopPlatform.LOCAL_SYSTEM_SID,
+) : TunnelBackend {
+    constructor() : this(DesktopPlatform.PIPE_NAME, 15_000L, DesktopPlatform.LOCAL_SYSTEM_SID)
+
+    override suspend fun request(request: ServiceRequest): ServiceStatus {
+        if (!DesktopPlatform.isWindows) {
+            return ServiceStatus(state = "unavailable", error = "platform_not_supported")
         }
+        val handleLock = Any()
+        var pipeHandle: WinNT.HANDLE? = null
+        val cancelled = AtomicBoolean(false)
+        val ioStarted = AtomicBoolean(false)
+        val ioFinished = AtomicBoolean(false)
+        val lastOpenError = AtomicInteger(0)
+
+        fun abortPipe() {
+            synchronized(handleLock) {
+                val handle = pipeHandle
+                if (handle != null && handle != WinBase.INVALID_HANDLE_VALUE) {
+                    Kernel32Extra.INSTANCE.CancelIoEx(handle, null)
+                }
+            }
+        }
+
+        val reply = withTimeoutOrNull(timeoutMillis) {
+            suspendCancellableCoroutine { cont ->
+                cont.invokeOnCancellation {
+                    cancelled.set(true)
+                    abortPipe()
+                    // Cover any narrow race between storing pipeHandle and entering ReadFile/WriteFile.
+                    if (ioStarted.get() && !ioFinished.get()) {
+                        thread(isDaemon = true, name = "yumi-pipe-cancel") {
+                            var attempts = 0
+                            while (!ioFinished.get() && attempts++ < 50) {
+                                abortPipe()
+                                try {
+                                    Thread.sleep(10)
+                                } catch (_: InterruptedException) {
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+                Dispatchers.IO.dispatch(EmptyCoroutineContext) {
+                    ioStarted.set(true)
+                    try {
+                        if (cancelled.get()) {
+                            throw CancellationException("Windows pipe request cancelled")
+                        }
+                        val handle = DesktopPlatform.openVerifiedPipe(pipeName, expectedOwnerSid, lastOpenError)
+                        synchronized(handleLock) {
+                            if (cancelled.get()) {
+                                Kernel32.INSTANCE.CloseHandle(handle)
+                                throw CancellationException("Windows pipe request cancelled")
+                            }
+                            pipeHandle = handle
+                        }
+                        val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
+                        require(bytes.size in 1..MAX_FRAME)
+                        val frame = ByteBuffer.allocate(4 + bytes.size).putInt(bytes.size).put(bytes).array()
+                        writeAll(handle, frame, cancelled)
+                        val head = readExact(handle, 4, cancelled)
+                        val size = ByteBuffer.wrap(head).int
+                        require(size in 1..MAX_FRAME)
+                        val body = readExact(handle, size, cancelled)
+                        val status = decodeReply(body)
+                        if (cont.isActive) cont.resume(status)
+                    } catch (cancelledError: CancellationException) {
+                        if (cont.isActive) cont.resumeWithException(cancelledError)
+                    } catch (_: SecurityException) {
+                        if (cont.isActive) cont.resume(ServiceStatus(state = "unavailable", error = "service_denied"))
+                    } catch (_: Exception) {
+                        if (cont.isActive) {
+                            val openErr = lastOpenError.get()
+                            val code = if (openErr != 0) {
+                                DesktopPlatform.classifyWindowsPipeOpenError(openErr)
+                            } else {
+                                DesktopPlatform.diagnoseWindowsPipe(pipeName, expectedOwnerSid)
+                            }
+                            cont.resume(ServiceStatus(state = "unavailable", error = code))
+                        }
+                    } catch (fatal: Throwable) {
+                        if (cont.isActive) cont.resumeWithException(fatal)
+                    } finally {
+                        ioFinished.set(true)
+                        val toClose = synchronized(handleLock) {
+                            val handle = pipeHandle
+                            pipeHandle = null
+                            handle
+                        }
+                        if (toClose != null && toClose != WinBase.INVALID_HANDLE_VALUE) {
+                            Kernel32.INSTANCE.CloseHandle(toClose)
+                        }
+                    }
+                }
+            }
+        }
+        return reply ?: ServiceStatus(state = "unavailable", error = "service_unavailable")
+    }
+
+    private fun writeAll(handle: WinNT.HANDLE, data: ByteArray, cancelled: AtomicBoolean) {
+        var offset = 0
+        val written = IntByReference()
+        while (offset < data.size) {
+            if (cancelled.get()) throw CancellationException("Windows pipe write cancelled")
+            val chunk = if (offset == 0) data else data.copyOfRange(offset, data.size)
+            val ok = Kernel32.INSTANCE.WriteFile(handle, chunk, chunk.size, written, null)
+            if (!ok) {
+                val err = Kernel32.INSTANCE.GetLastError()
+                if (cancelled.get() || err == WinError.ERROR_OPERATION_ABORTED) {
+                    throw CancellationException("Windows pipe write aborted ($err)")
+                }
+                throw java.io.IOException("WriteFile failed ($err)")
+            }
+            val n = written.value
+            if (n <= 0) throw java.io.IOException("WriteFile wrote 0 bytes")
+            offset += n
+        }
+    }
+
+    private fun readExact(handle: WinNT.HANDLE, length: Int, cancelled: AtomicBoolean): ByteArray {
+        val result = ByteArray(length)
+        var offset = 0
+        val bytesRead = IntByReference()
+        val scratch = ByteArray(minOf(length, 65_536))
+        while (offset < length) {
+            if (cancelled.get()) throw CancellationException("Windows pipe read cancelled")
+            val want = minOf(scratch.size, length - offset)
+            val ok = Kernel32.INSTANCE.ReadFile(handle, scratch, want, bytesRead, null)
+            if (!ok) {
+                val err = Kernel32.INSTANCE.GetLastError()
+                if (cancelled.get() || err == WinError.ERROR_OPERATION_ABORTED) {
+                    throw CancellationException("Windows pipe read aborted ($err)")
+                }
+                throw java.io.IOException("ReadFile failed ($err)")
+            }
+            val n = bytesRead.value
+            if (n <= 0) throw java.io.IOException("EOF on Windows pipe")
+            System.arraycopy(scratch, 0, result, offset, n)
+            offset += n
+        }
+        return result
     }
 }
 
@@ -93,28 +239,42 @@ class UnixTunnelBackend(
     private val socketPath: Path = Path.of(DesktopPlatform.SOCKET_PATH),
     private val timeoutMillis: Long = 15_000,
 ) : TunnelBackend {
-    override suspend fun request(request: ServiceRequest): ServiceStatus = withTimeoutOrNull(timeoutMillis) { runInterruptible(Dispatchers.IO) {
-        try {
-            val address = UnixDomainSocketAddress.of(socketPath)
-            if (!Files.exists(address.path)) {
-                return@runInterruptible ServiceStatus(state = "unavailable", error = "service_missing")
+    override suspend fun request(request: ServiceRequest): ServiceStatus = withTimeoutOrNull(timeoutMillis) {
+        val job = coroutineContext[Job]
+        runInterruptible(Dispatchers.IO) {
+            try {
+                val address = UnixDomainSocketAddress.of(socketPath)
+                if (!Files.exists(address.path)) {
+                    return@runInterruptible ServiceStatus(state = "unavailable", error = "service_missing")
+                }
+                if (!Files.isReadable(address.path) || !Files.isWritable(address.path)) {
+                    return@runInterruptible ServiceStatus(state = "unavailable", error = "service_denied")
+                }
+                SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
+                    channel.connect(address)
+                    val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
+                    require(bytes.size in 1..MAX_FRAME)
+                    val frame = frameOf(bytes)
+                    while (frame.hasRemaining()) channel.write(frame)
+                    val reply = readFrame { buffer -> channel.read(buffer) }
+                    decodeReply(reply)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (interrupted: ClosedByInterruptException) {
+                if (job?.isActive == false) throw CancellationException("Unix tunnel request cancelled", interrupted)
+                ServiceStatus(state = "unavailable", error = DesktopPlatform.diagnoseUnixSocket(socketPath))
+            } catch (error: Exception) {
+                // The socket either is not there or cannot be opened; inspect POSIX state without locale strings.
+                val statusError = if (error is java.nio.file.AccessDeniedException) {
+                    "service_denied"
+                } else {
+                    DesktopPlatform.diagnoseUnixSocket(socketPath)
+                }
+                ServiceStatus(state = "unavailable", error = statusError)
             }
-            SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
-                channel.connect(address)
-                val bytes = tunnelJson.encodeToString(request).toByteArray(Charsets.UTF_8)
-                require(bytes.size in 1..MAX_FRAME)
-                val frame = frameOf(bytes)
-                while (frame.hasRemaining()) channel.write(frame)
-                val reply = readFrame { buffer -> channel.read(buffer) }
-                decodeReply(reply)
-            }
-        } catch (error: Exception) {
-            // The socket either is not there (answered above), or the exchange failed for a reason
-            // the file system cannot name. The generic answer keeps the screen honest.
-            ServiceStatus(state = "unavailable", error = if (error is java.nio.file.AccessDeniedException ||
-                error.message.orEmpty().contains("Permission denied", ignoreCase = true)) "service_denied" else "service_unavailable")
         }
-    } } ?: ServiceStatus(state = "unavailable", error = "service_unavailable")
+    } ?: ServiceStatus(state = "unavailable", error = "service_unavailable")
 }
 
 data class LocalAddress(val label: String, val address: Inet4Address)
@@ -127,7 +287,7 @@ object DesktopPlatform {
     val isMac = System.getProperty("os.name") == "Mac OS X"
 
     fun dataDirectory(): File {
-        System.getProperty("yumi.dataDir")?.let { return File(it).also(File::mkdirs) }
+        System.getProperty("yumi.dataDir")?.let { return ensurePrivateDirectory(File(it)) }
         val home = System.getProperty("user.home")
         val base = when {
             isWindows -> System.getenv("LOCALAPPDATA") ?: File(home, "AppData/Local").path
@@ -135,7 +295,20 @@ object DesktopPlatform {
             isMac -> File(home, "Library/Application Support").path
             else -> System.getenv("XDG_DATA_HOME") ?: File(home, ".local/share").path
         }
-        return File(base, "YumiDesktop").also(File::mkdirs)
+        return ensurePrivateDirectory(File(base, "YumiDesktop"))
+    }
+
+    internal fun ensurePrivateDirectory(directory: File): File {
+        directory.mkdirs()
+        if (!isWindows) {
+            runCatching {
+                val path = directory.toPath()
+                if (Files.getFileStore(path).supportsFileAttributeView(PosixFileAttributeView::class.java)) {
+                    Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwx------"))
+                }
+            }
+        }
+        return directory
     }
 
     fun localAddresses(): List<LocalAddress> = runCatching {
@@ -181,13 +354,32 @@ object DesktopPlatform {
         }
         val launcher = launcher()
         file.parentFile.mkdirs()
-        file.writeText(
-            "[Desktop Entry]\n" +
-                "Type=Application\n" +
-                "Name=Yumi\n" +
-                "Exec=\"${launcher.absolutePath}\" --tray\n" +
-                "X-GNOME-Autostart-enabled=true\n",
-        )
+        file.writeText(linuxAutostartEntry(launcher.absolutePath))
+    }
+
+    internal fun linuxAutostartEntry(executablePath: String): String {
+        require('\n' !in executablePath && '\r' !in executablePath && '\u0000' !in executablePath) {
+            "Invalid control character in executable path"
+        }
+        return "[Desktop Entry]\n" +
+            "Type=Application\n" +
+            "Name=Yumi\n" +
+            "Exec=${escapeDesktopExecArg(executablePath)} --tray\n" +
+            "X-GNOME-Autostart-enabled=true\n"
+    }
+
+    internal fun escapeDesktopExecArg(value: String): String = buildString(value.length + 2) {
+        append('"')
+        for (ch in value) {
+            when (ch) {
+                '\\', '"', '$', '`' -> {
+                    append('\\')
+                    append(ch)
+                }
+                else -> append(ch)
+            }
+        }
+        append('"')
     }
 
     private fun setLaunchAtLoginMac(enabled: Boolean) {
@@ -200,16 +392,34 @@ object DesktopPlatform {
         file.parentFile.mkdirs()
         // LaunchAgent rather than the modern SMAppService: the JVM has no Objective-C bridge, and
         // a plist in the user's own domain needs no elevation and survives reboots all the same.
-        file.writeText(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
-                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
-                "<plist version=\"1.0\">\n<dict>\n" +
-                "    <key>Label</key><string>app.yumi.desktop</string>\n" +
-                "    <key>ProgramArguments</key>\n    <array>\n" +
-                "        <string>${launcher.absolutePath}</string>\n        <string>--tray</string>\n    </array>\n" +
-                "    <key>RunAtLoad</key><true/>\n" +
-                "</dict>\n</plist>\n",
-        )
+        file.writeText(macLaunchAgentPlist(launcher.absolutePath))
+    }
+
+    internal fun macLaunchAgentPlist(executablePath: String): String {
+        require('\n' !in executablePath && '\r' !in executablePath && '\u0000' !in executablePath) {
+            "Invalid control character in executable path"
+        }
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+            "<plist version=\"1.0\">\n<dict>\n" +
+            "    <key>Label</key><string>app.yumi.desktop</string>\n" +
+            "    <key>ProgramArguments</key>\n    <array>\n" +
+            "        <string>${escapeXml(executablePath)}</string>\n        <string>--tray</string>\n    </array>\n" +
+            "    <key>RunAtLoad</key><true/>\n" +
+            "</dict>\n</plist>\n"
+    }
+
+    internal fun escapeXml(value: String): String = buildString(value.length) {
+        for (ch in value) {
+            when (ch) {
+                '&' -> append("&amp;")
+                '<' -> append("&lt;")
+                '>' -> append("&gt;")
+                '"' -> append("&quot;")
+                '\'' -> append("&apos;")
+                else -> append(ch)
+            }
+        }
     }
 
     /**
@@ -247,8 +457,8 @@ object DesktopPlatform {
             Dwm.INSTANCE.DwmSetWindowAttribute(window, TEXT_COLOR, intArrayOf(text), 4)
             User32.INSTANCE.SetWindowPos(window, null, 0, 0, 0, 0, REDRAW_FRAME)
             User32.INSTANCE.RedrawWindow(window, null, null, WinDef.DWORD(0x0001L or 0x0100L or 0x0400L))
-            User32.INSTANCE.SendMessage(window, 0x0086, WinDef.WPARAM(0), WinDef.LPARAM(0))
-            User32.INSTANCE.SendMessage(window, 0x0086, WinDef.WPARAM(1), WinDef.LPARAM(0))
+            User32.INSTANCE.PostMessage(window, 0x0086, WinDef.WPARAM(0), WinDef.LPARAM(0))
+            User32.INSTANCE.PostMessage(window, 0x0086, WinDef.WPARAM(1), WinDef.LPARAM(0))
         }
     }
 
@@ -284,37 +494,86 @@ object DesktopPlatform {
      * numbers. On unix the socket file either exists or it does not, which is most of the answer
      * already; a file that is there while the connection fails is a busy or foreign socket.
      */
-    fun diagnoseService(): String {
-        if (!isWindows) {
-            val socket = Path.of(SOCKET_PATH)
-            return when {
-                !Files.exists(socket) -> "service_missing"
-                else -> "service_unavailable"
-            }
+    internal fun diagnoseUnixSocket(socket: Path): String = when {
+        !Files.exists(socket) -> "service_missing"
+        !Files.isReadable(socket) || !Files.isWritable(socket) -> "service_denied"
+        else -> "service_unavailable"
+    }
+
+    internal fun classifyWindowsPipeOpenError(lastError: Int): String = when (lastError) {
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND -> "service_missing"
+        ERROR_ACCESS_DENIED -> "service_denied"
+        else -> "service_unavailable"
+    }
+
+    internal fun readObjectOwnerSid(handle: WinNT.HANDLE): String? {
+        val ownerRef = PointerByReference()
+        val descriptorRef = PointerByReference()
+        val status = Advapi32.INSTANCE.GetSecurityInfo(
+            handle,
+            AccCtrl.SE_OBJECT_TYPE.SE_KERNEL_OBJECT,
+            WinNT.OWNER_SECURITY_INFORMATION,
+            ownerRef,
+            null,
+            null,
+            null,
+            descriptorRef,
+        )
+        return try {
+            if (status != WinError.ERROR_SUCCESS) return null
+            val ownerPtr = ownerRef.value ?: return null
+            runCatching { Advapi32Util.convertSidToStringSid(WinNT.PSID(ownerPtr)) }.getOrNull()
+        } finally {
+            descriptorRef.value?.let { Kernel32.INSTANCE.LocalFree(it) }
         }
-        val handle = runCatching {
-            Kernel32.INSTANCE.CreateFile(
-                PIPE_NAME,
-                WinNT.GENERIC_READ or WinNT.GENERIC_WRITE,
-                0,
-                null,
-                WinNT.OPEN_EXISTING,
-                0,
-                null,
-            )
-        }.getOrNull() ?: return "service_unavailable"
-        if (handle != WinBase.INVALID_HANDLE_VALUE) {
+    }
+
+    internal fun openVerifiedPipe(
+        pipeName: String,
+        expectedOwnerSid: String = LOCAL_SYSTEM_SID,
+        lastErrorOut: AtomicInteger? = null,
+    ): WinNT.HANDLE {
+        val handle = Kernel32.INSTANCE.CreateFile(
+            pipeName,
+            WinNT.GENERIC_READ or WinNT.GENERIC_WRITE,
+            0,
+            null,
+            WinNT.OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT or SECURITY_ANONYMOUS,
+            null,
+        )
+        if (handle == null || handle == WinBase.INVALID_HANDLE_VALUE) {
+            val err = Kernel32.INSTANCE.GetLastError()
+            lastErrorOut?.set(err)
+            throw java.io.IOException("CreateFile failed for pipe ($err)")
+        }
+        val ownerSid = readObjectOwnerSid(handle)
+        if (ownerSid != expectedOwnerSid) {
+            Kernel32.INSTANCE.CloseHandle(handle)
+            throw SecurityException("Untrusted pipe owner SID: ${ownerSid ?: "unknown"}")
+        }
+        return handle
+    }
+
+    internal fun diagnoseWindowsPipe(pipeName: String, expectedOwnerSid: String = LOCAL_SYSTEM_SID): String {
+        val lastError = AtomicInteger(0)
+        return try {
+            val handle = openVerifiedPipe(pipeName, expectedOwnerSid, lastError)
             Kernel32.INSTANCE.CloseHandle(handle)
             // It opens now and did not a moment ago: the service is there and something else went
             // wrong in the exchange. Nothing here can say what, and pretending otherwise would be
             // worse than the general answer.
-            return "service_unavailable"
+            "service_unavailable"
+        } catch (_: SecurityException) {
+            "service_denied"
+        } catch (_: Exception) {
+            classifyWindowsPipeOpenError(lastError.get())
         }
-        return when (Kernel32.INSTANCE.GetLastError()) {
-            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND -> "service_missing"
-            ERROR_ACCESS_DENIED -> "service_denied"
-            else -> "service_unavailable"
-        }
+    }
+
+    fun diagnoseService(): String {
+        if (!isWindows) return diagnoseUnixSocket(Path.of(SOCKET_PATH))
+        return diagnoseWindowsPipe(PIPE_NAME, LOCAL_SYSTEM_SID)
     }
 
     /** The tunnel service binary that shipped beside this application, if this is a real install. */
@@ -341,59 +600,160 @@ object DesktopPlatform {
         return launcher.parentFile.takeIf { File(it, "unins000.exe").isFile && serviceExecutable() != null }
     }
 
+    private val sha256Pattern = Regex("^[0-9a-fA-F]{64}$")
+
     /**
      * Installs a downloaded update, on every platform by handing the verified package to the
      * system's own installer with one elevation prompt.
      *
-     * On Windows the Inno installer waits for this process to exit and then relaunches the app.
-     * The unix package managers have no such handshake, so there the elevated shell waits for this
-     * process to exit — the files are only touched once this JVM is gone — installs, and leaves
-     * the relaunch to the user. The prompt appears while the app is still up, which is when
-     * someone is looking at it.
+     * On Windows the file is held open exclusively for reading while hashing and launching so
+     * another process cannot swap it in between (TOCTOU). On unix the package is copied into a
+     * root-owned `0700` staging directory, hashed there if [expectedSha256] is provided, and a
+     * detached root worker waits for this JVM to exit before installing.
      */
-    fun installUpdate(file: File): Boolean {
+    fun installUpdate(file: File, expectedSha256: String = "", relaunch: Boolean = true): Boolean {
         if (!file.isFile) return false
+        if (expectedSha256.isNotBlank() && !sha256Pattern.matches(expectedSha256)) return false
         return when {
-            isWindows -> installUpdateWindows(file)
-            file.name.endsWith(".deb") -> launchUpdate("dpkg -i ${quote(file)}")
-            file.name.endsWith(".rpm") -> launchUpdate("rpm -U ${quote(file)}")
-            file.name.endsWith(".pkg") -> launchUpdate("installer -pkg ${quote(file)} -target /")
+            isWindows -> installUpdateWindows(file, expectedSha256, relaunch)
+            file.name.endsWith(".deb") -> launchUpdate(file, expectedSha256) { pkg -> "dpkg -i $pkg" }
+            file.name.endsWith(".rpm") -> launchUpdate(file, expectedSha256) { pkg -> "rpm -U $pkg" }
+            file.name.endsWith(".pkg") -> launchUpdate(file, expectedSha256) { pkg -> "installer -pkg $pkg -target /" }
             else -> false
         }
     }
 
-    private fun installUpdateWindows(file: File): Boolean {
+    internal fun openLockedUpdateFile(file: File): WinNT.HANDLE? {
+        val handle = Kernel32.INSTANCE.CreateFile(
+            file.absolutePath,
+            WinNT.GENERIC_READ,
+            WinNT.FILE_SHARE_READ,
+            null,
+            WinNT.OPEN_EXISTING,
+            WinNT.FILE_ATTRIBUTE_NORMAL,
+            null,
+        )
+        return handle?.takeIf { it != WinBase.INVALID_HANDLE_VALUE }
+    }
+
+    internal fun sha256FromHandle(handle: WinNT.HANDLE): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        val bytesRead = IntByReference()
+        while (true) {
+            if (!Kernel32.INSTANCE.ReadFile(handle, buffer, buffer.size, bytesRead, null)) {
+                throw java.io.IOException("ReadFile failed (${Kernel32.INSTANCE.GetLastError()})")
+            }
+            val n = bytesRead.value
+            if (n <= 0) break
+            digest.update(buffer, 0, n)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    internal inline fun withLockedWindowsUpdateFile(
+        file: File,
+        expectedSha256: String,
+        action: () -> Boolean,
+    ): Boolean {
+        val handle = openLockedUpdateFile(file) ?: return false
+        return try {
+            if (expectedSha256.isNotBlank()) {
+                val actual = sha256FromHandle(handle)
+                if (!actual.equals(expectedSha256, ignoreCase = true)) return false
+            }
+            action()
+        } catch (_: Exception) {
+            false
+        } finally {
+            Kernel32.INSTANCE.CloseHandle(handle)
+        }
+    }
+
+    internal fun windowsUpdateParameters(directory: File, relaunch: Boolean, pid: Long = ProcessHandle.current().pid()): String {
+        val restartArg = if (relaunch) " /YUMIRESTART=1" else ""
+        val targetDir = directory.absolutePath.trimEnd('\\')
+        return "/SILENT /NORESTART /YUMIUPDATE=1$restartArg /YUMIPID=$pid /DIR=\"$targetDir\""
+    }
+
+    private fun installUpdateWindows(file: File, expectedSha256: String, relaunch: Boolean): Boolean {
         val directory = installedDirectory() ?: return false
-        return runCatching {
+        return withLockedWindowsUpdateFile(file, expectedSha256) {
             val request = ShellAPI.SHELLEXECUTEINFO()
             request.lpVerb = "open"
             request.lpFile = file.absolutePath
-            request.lpParameters = "/SILENT /NORESTART /YUMIUPDATE=1 /YUMIPID=${ProcessHandle.current().pid()} /DIR=\"${directory.absolutePath}\""
+            request.lpParameters = windowsUpdateParameters(directory, relaunch)
             request.nShow = WinUser.SW_SHOWNORMAL
             request.fMask = SEE_MASK_NOCLOSEPROCESS
-            if (!Shell32.INSTANCE.ShellExecuteEx(request)) return false
+            if (!Shell32.INSTANCE.ShellExecuteEx(request)) return@withLockedWindowsUpdateFile false
             request.hProcess?.let { Kernel32.INSTANCE.CloseHandle(it) }
             true
-        }.getOrDefault(false)
+        }
     }
 
     internal fun shellQuote(value: String) = "'" + value.replace("'", "'\\''") + "'"
     private fun quote(file: File) = shellQuote(file.absolutePath)
 
-    // Starts the elevated installer and comes back at once: the shell itself waits for this
-    // process to end, so the app can exit on its own schedule while the prompt is answered.
-    private fun launchUpdate(command: String): Boolean = runCatching {
-        val pid = ProcessHandle.current().pid()
-        val service = serviceExecutable() ?: return false
-        val owner = currentUserOwner() ?: return false
-        val script = "while kill -0 $pid 2>/dev/null; do sleep 1; done; $command && ${quote(service)} --install --owner $owner"
-        if (isMac) {
-            val appleScript = "do shell script " + "\"" + script.replace("\\", "\\\\").replace("\"", "\\\"") + "\" with administrator privileges"
-            ProcessBuilder("osascript", "-e", appleScript).start()
+    internal fun buildUnixUpdateScript(
+        file: File,
+        expectedSha256: String,
+        pid: Long,
+        owner: String,
+        currentServicePath: String,
+        macOs: Boolean,
+        installCommandForStagePath: (String) -> String,
+    ): String {
+        val ext = file.name.substringAfterLast('.', "").lowercase()
+        val pkgName = if (ext.isNotEmpty() && ext.all(Char::isLetterOrDigit)) "update.$ext" else "update.pkg"
+        val stagedExpr = "\"\$stage/$pkgName\""
+        val copyLine = "cp -- ${shellQuote(file.absolutePath)} $stagedExpr && chmod 600 $stagedExpr || { rm -rf \"\$stage\"; exit 1; }"
+        val hashLine = if (expectedSha256.isNotBlank()) {
+            val verifier = if (macOs) "shasum -a 256 -c -" else "sha256sum -c -"
+            "printf '%s  %s\\n' ${shellQuote(expectedSha256.lowercase())} $stagedExpr | $verifier >/dev/null 2>&1 || { rm -rf \"\$stage\"; exit 2; }"
         } else {
-            ProcessBuilder("pkexec", "sh", "-c", script).start()
+            ""
         }
-        true
+        val installServiceStep = if (macOs && file.name.endsWith(".pkg")) {
+            val installedSvc = shellQuote(MAC_POST_INSTALL_SERVICE)
+            val fallbackSvc = shellQuote(currentServicePath)
+            "svc=$installedSvc; [ -x \"\$svc\" ] || svc=$fallbackSvc; \"\$svc\" --install --owner $owner"
+        } else {
+            "${shellQuote(currentServicePath)} --install --owner $owner"
+        }
+        val installPkgStep = installCommandForStagePath(stagedExpr)
+        val worker = "( trap 'rm -rf \"\$stage\"' EXIT; trap '' HUP; while kill -0 $pid 2>/dev/null; do sleep 1; done; $installPkgStep && { $installServiceStep; } ) >/dev/null 2>&1 </dev/null & exit 0"
+        return buildList {
+            add("stage=$(mktemp -d /tmp/yumi-update.XXXXXX) || exit 1")
+            add("chmod 700 \"\$stage\" || { rm -rf \"\$stage\"; exit 1; }")
+            add(copyLine)
+            if (hashLine.isNotEmpty()) add(hashLine)
+            add(worker)
+        }.joinToString("; ")
+    }
+
+    // Stages the package as root synchronously while the prompt is open, then detaches the
+    // install worker so it waits for this JVM to exit before replacing installed files.
+    private fun launchUpdate(
+        file: File,
+        expectedSha256: String,
+        installCommandForStagePath: (String) -> String,
+    ): Boolean = runCatching {
+        val currentService = serviceExecutable()
+        val macPostInstall = File(MAC_POST_INSTALL_SERVICE).takeIf { isMac && file.name.endsWith(".pkg") && it.isFile }
+        val ownerExe = currentService ?: macPostInstall ?: return false
+        val owner = currentUserOwner(ownerExe) ?: return false
+        if (!owner.all(Char::isDigit)) return false
+        val serviceFallback = currentService?.absolutePath ?: MAC_POST_INSTALL_SERVICE
+        val script = buildUnixUpdateScript(
+            file = file,
+            expectedSha256 = expectedSha256,
+            pid = ProcessHandle.current().pid(),
+            owner = owner,
+            currentServicePath = serviceFallback,
+            macOs = isMac,
+            installCommandForStagePath = installCommandForStagePath,
+        )
+        elevatedRun(script) == ServiceRepair.Done
     }.getOrDefault(false)
 
     /*
@@ -433,18 +793,33 @@ object DesktopPlatform {
      * would be a second definition, and the entire bug this repairs was two answers to that
      * question disagreeing. Windows spells the answer as a SID, unix as a decimal uid.
      */
-    fun currentUserOwner(): String? {
-        val exe = serviceExecutable() ?: return null
-        return runCatching {
-            val process = ProcessBuilder(exe.absolutePath, "--print-owner").start()
-            if (!process.waitFor(5, TimeUnit.SECONDS)) { process.destroyForcibly(); return@runCatching null }
-            if (process.exitValue() != 0) return@runCatching null
-            val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
-            when {
-                isWindows -> text.takeIf { it.startsWith("S-") && it.length in 8..184 }
-                else -> text.takeIf { it.isNotEmpty() && it.all(Char::isDigit) && it.length <= 10 }
+    fun currentUserOwner(): String? = serviceExecutable()?.let(::currentUserOwner)
+
+    private fun currentUserOwner(exe: File): String? = runCatching {
+        val process = ProcessBuilder(exe.absolutePath, "--print-owner").start()
+        if (!process.waitFor(5, TimeUnit.SECONDS)) { process.destroyForcibly(); return@runCatching null }
+        if (process.exitValue() != 0) return@runCatching null
+        val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
+        when {
+            isWindows -> text.takeIf { it.startsWith("S-") && it.length in 8..184 }
+            else -> text.takeIf { it.isNotEmpty() && it.all(Char::isDigit) && it.length <= 10 }
+        }
+    }.getOrNull()
+
+    internal fun waitForWindowsProcessSuccess(handle: WinNT.HANDLE?, timeoutMillis: Int = 60_000): ServiceRepair {
+        val process = handle ?: return ServiceRepair.Unavailable
+        return try {
+            if (Kernel32.INSTANCE.WaitForSingleObject(process, timeoutMillis) != WinBase.WAIT_OBJECT_0) {
+                return ServiceRepair.Unavailable
             }
-        }.getOrNull()
+            val exitCode = IntByReference()
+            if (!Kernel32.INSTANCE.GetExitCodeProcess(process, exitCode)) {
+                return ServiceRepair.Unavailable
+            }
+            if (exitCode.value == 0) ServiceRepair.Done else ServiceRepair.Unavailable
+        } finally {
+            Kernel32.INSTANCE.CloseHandle(process)
+        }
     }
 
     /**
@@ -461,7 +836,7 @@ object DesktopPlatform {
      */
     fun repairService(): ServiceRepair {
         val exe = serviceExecutable() ?: return ServiceRepair.Unavailable
-        val owner = currentUserOwner() ?: return ServiceRepair.Unavailable
+        val owner = currentUserOwner(exe) ?: return ServiceRepair.Unavailable
         if (!isWindows) {
             return elevatedRun("${quote(exe)} --install --owner $owner")
         }
@@ -481,15 +856,13 @@ object DesktopPlatform {
                     ServiceRepair.Unavailable
                 }
             }
-            request.hProcess?.let {
-                Kernel32.INSTANCE.WaitForSingleObject(it, 60_000)
-                Kernel32.INSTANCE.CloseHandle(it)
-            }
-            ServiceRepair.Done
+            waitForWindowsProcessSuccess(request.hProcess, 60_000)
         }.getOrDefault(ServiceRepair.Unavailable)
     }
 
     internal const val PIPE_NAME = "\\\\.\\pipe\\YumiTunnel-v1"
+    internal const val LOCAL_SYSTEM_SID = "S-1-5-18"
+    private const val MAC_POST_INSTALL_SERVICE = "/Applications/Yumi.app/Contents/Resources/service/yumi-service"
     internal val SOCKET_PATH: String =
         if (System.getProperty("os.name") == "Mac OS X") "/var/run/yumi/tunnel.sock" else "/run/yumi/tunnel.sock"
 
@@ -497,9 +870,19 @@ object DesktopPlatform {
     private const val ERROR_PATH_NOT_FOUND = 3
     private const val ERROR_ACCESS_DENIED = 5
     private const val ERROR_CANCELLED = 1223
+    private const val SECURITY_SQOS_PRESENT = 0x00100000
+    private const val SECURITY_ANONYMOUS = 0x00000000
 
     /** SEE_MASK_NOCLOSEPROCESS: keeps the process handle alive so the wait above has something. */
     private const val SEE_MASK_NOCLOSEPROCESS = 0x00000040
+}
+
+private interface Kernel32Extra : StdCallLibrary {
+    fun CancelIoEx(hFile: WinNT.HANDLE, lpOverlapped: Pointer?): Boolean
+
+    companion object {
+        val INSTANCE: Kernel32Extra = Native.load("kernel32", Kernel32Extra::class.java, W32APIOptions.DEFAULT_OPTIONS)
+    }
 }
 
 private interface Dwm : Library {

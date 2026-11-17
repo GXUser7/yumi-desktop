@@ -83,4 +83,48 @@ class DeepLinkParserTest {
             (result as DeepLinkPayload.Unsupported).reason,
         )
     }
+
+    @Test
+    fun `app link extracts fragment into name, preserves encoded token parameters, and handles case-insensitive scheme`() {
+        val withFrag = DeepLinkParser.parse(
+            "HAPP://add/https://panel.example.com/sub?token=a%26b%3Dc#My%20Provider",
+        ) as DeepLinkPayload.AddSubscription
+        assertEquals("https://panel.example.com/sub?token=a%26b%3Dc", withFrag.url)
+        assertEquals("My Provider", withFrag.name)
+
+        val encodedHead = DeepLinkParser.parse(
+            "happ://add/https%3A%2F%2Fpanel.example.com%2Fsub%3Ftoken%3Dx#Named",
+        ) as DeepLinkPayload.AddSubscription
+        assertEquals("https://panel.example.com/sub?token=x", encodedHead.url)
+        assertEquals("Named", encodedHead.name)
+    }
+
+    @Test
+    fun `happ crypt and non-http schemes in subscription actions are rejected`() {
+        val crypt = DeepLinkParser.parse("happ://crypt3/abcdef") as DeepLinkPayload.Unsupported
+        assertEquals(UnsupportedReason.UnknownFormat, crypt.reason)
+
+        val badScheme = DeepLinkParser.parse("happ://add/httpfake://panel.example.com/sub")
+        assertTrue(badScheme is DeepLinkPayload.Unsupported)
+
+        val fileScheme = DeepLinkParser.parse("happ://add/file:///etc/passwd")
+        assertTrue(fileScheme is DeepLinkPayload.Unsupported)
+    }
+
+    @Test
+    fun `unencoded proxy and dns app links preserve fragment name`() {
+        val vless = DeepLinkParser.parse(
+            "happ://add/vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#DeepNode",
+        ) as DeepLinkPayload.AddNodes
+        assertEquals(1, vless.nodes.size)
+        assertEquals("DeepNode", vless.nodes.single().name)
+
+        val encodedFrag = DeepLinkParser.parse(
+            "happ://add/vless://11111111-2222-3333-4444-555555555555@192.0.2.50:443?security=tls#My%20Deep%20Node",
+        ) as DeepLinkPayload.AddNodes
+        assertEquals("My Deep Node", encodedFrag.nodes.single().name)
+
+        val dns = DeepLinkParser.parse("happ://add/tcp://1.1.1.1#MyTcpDns") as DeepLinkPayload.AddDns
+        assertEquals("MyTcpDns", dns.profiles.single().name)
+    }
 }

@@ -9,6 +9,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asSkiaBitmap
@@ -59,12 +60,13 @@ fun PixelPlanet(
     markerColor: Color,
     modifier: Modifier = Modifier,
 ) {
-    val tick by rememberPlanetTicks()
+    val planet = LocalPlanetState.current ?: remember { PlanetState() }
+    val tick by rememberPlanetTicks(planet)
 
-    val strip = remember(mask, seaColor, landColor, gapColor) {
-        Planet.strip(mask, seaColor, landColor, gapColor)
+    val strip = remember(planet, mask, seaColor, landColor, gapColor) {
+        planet.strip(mask, seaColor, landColor, gapColor)
     }
-    val camera = Planet.camera
+    val camera = planet.camera
     // The one smooth thing on a planet made of squares, and deliberately so. MaterialShapes are
     // normalised into a 0..1 box, so the path is built once and scaled in the draw transform.
     val marker = remember { MaterialShapes.Cookie4Sided.toComposePath() }
@@ -72,19 +74,19 @@ fun PixelPlanet(
     Canvas(modifier.fillMaxSize()) {
         // Reading `tick` here is what keeps the figure moving, and it has to be read *inside* the
         // draw: Compose repeats a draw when something it read has changed, and everything else
-        // this one touches lives in [Planet], outside the snapshot system. Declaring the tick and
-        // never reading it drew the planet once and left it there.
+        // this one touches lives in [PlanetState], outside the snapshot system. Declaring the tick
+        // and never reading it drew the planet once and left it there.
         //
         // Advanced here rather than in the frame callback, because only the draw knows how big
         // the figure is - and the springs are integrated in pixels. The step is taken once per
-        // frame however many times this runs; see [PlanetState.takeStep].
-        camera.advance(Planet.stepAt(tick), size.width, size.height, connected, warming, latitude, longitude)
+        // frame however many times this runs; see [PlanetState.stepAt].
+        camera.advance(planet.stepAt(tick), size.width, size.height, connected, warming, latitude, longitude)
         // Painted under the strip so that scrolling past the top of the map reads as more ocean
         // rather than as a hole. Above the eighty-first parallel it very nearly is.
         drawRect(color = seaColor)
         drawStrip(camera, strip)
         if (connected && latitude != null && longitude != null) {
-            drawMarker(Planet.markerDegrees, camera, marker, markerColor)
+            drawMarker(planet.markerDegrees, camera, marker, markerColor)
         }
     }
 }
@@ -339,22 +341,12 @@ private val MarkerShadow = Color.Black.copy(alpha = 0.45f)
 private const val MARKER_DEGREES_PER_SECOND = 8f
 
 /**
- * The planet, kept for the life of the process rather than for the life of the page.
- *
- * Where the window sits on the strip, how far it has zoomed in and what angle the marker has
- * turned to are all animation that has already been running. They used to live in `remember`,
- * which ties them to the composition — and the composition ends the moment the user opens another
- * page in the rail. Coming back built a fresh camera at zero, so the map snapped to the
- * antimeridian and the flight to the exit country started over, every single time. A figure that
- * rewinds itself whenever nobody is looking is a screensaver, not a planet.
- *
- * One instance, because there is one planet: it lives in the connection page's figure and nowhere
- * else. Two on screen at once would share a camera and advance it twice a frame, which is why this
- * is private to this file rather than something a caller is handed.
+ * Scopes a [PlanetState] to a window/composition rather than a process-global singleton, so
+ * switching tabs keeps the camera steady while separate windows and tests stay isolated.
  */
-private val Planet = PlanetState()
+internal val LocalPlanetState = staticCompositionLocalOf<PlanetState?> { null }
 
-private class PlanetState {
+internal class PlanetState {
     val camera = MapCamera()
 
     /** Where the cookie has turned to, in degrees and kept inside one revolution. */
@@ -424,15 +416,15 @@ private class PlanetState {
 /** Three frames at sixty hertz: enough to ride out a stutter, short enough not to fast-forward. */
 private const val MAX_STEP_SECONDS = 0.05
 
-/** Ticks [Planet] once per frame, and counts the frames so that the figure redraws with them. */
+/** Ticks [planet] once per frame, and counts the frames so that the figure redraws with them. */
 @Composable
-private fun rememberPlanetTicks(): State<Long> {
+private fun rememberPlanetTicks(planet: PlanetState): State<Long> {
     val active = LocalAnimationsActive.current
-    return produceState(0L, active) {
+    return produceState(0L, active, planet) {
         if (!active) return@produceState
         while (true) {
             withInfiniteAnimationFrameNanos { frame ->
-                Planet.tick(frame)
+                planet.tick(frame)
                 value += 1
             }
         }

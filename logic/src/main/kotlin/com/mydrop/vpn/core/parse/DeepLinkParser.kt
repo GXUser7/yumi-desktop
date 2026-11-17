@@ -81,15 +81,24 @@ object DeepLinkParser {
             .joinToString("&")
 
     private fun parseAppLink(text: String, scheme: String): DeepLinkPayload {
-        val rest = text.removePrefix("$scheme://")
+        val rest = text.substringAfter("://")
+        if (scheme == "happ" && rest.startsWith("crypt", ignoreCase = true)) {
+            return DeepLinkPayload.Unsupported(text, UnsupportedReason.UnknownFormat)
+        }
         val action = rest.substringBefore('/', missingDelimiterValue = "").lowercase()
-        val payloadWithQuery = rest.substringAfter('/', missingDelimiterValue = "")
-        if (payloadWithQuery.isEmpty()) {
+        val payloadWithFragment = rest.substringAfter('/', missingDelimiterValue = "")
+        if (payloadWithFragment.isEmpty()) {
             return DeepLinkPayload.Unsupported(text, UnsupportedReason.NoPayload)
         }
 
+        val rawFragment = payloadWithFragment.substringAfter('#', "")
+        val fragment = rawFragment
+            .takeIf { it.isNotEmpty() }
+            ?.let(::urlDecode)
+        val payloadWithQuery = payloadWithFragment.substringBefore('#')
         val query = payloadWithQuery.substringAfter('?', "")
-        val name = parseQuery(query)["name"]?.takeIf(String::isNotEmpty)
+        val queryName = parseQuery(query)["name"]?.takeIf(String::isNotEmpty)
+        val name = queryName ?: fragment
         val head = payloadWithQuery.substringBefore('?')
 
         // Cutting at the `?` is right for an encoded payload and wrong for a plain one, and the
@@ -103,15 +112,39 @@ object DeepLinkParser {
         // Which one it is, is decidable: a payload that decodes to something with a scheme in it is
         // encoded, and anything else is written plainly.
         val encoded = base64DecodeOrNull(head)?.takeIf { it.contains("://") }
-        val decoded = encoded ?: urlDecode(
-            if (query.isEmpty()) head else "$head?" + stripName(query),
-        )
+        val decoded = if (encoded != null) {
+            encoded
+        } else {
+            val decodedHead = if ("://" !in head) urlDecode(head) else head
+            val remainingQuery = stripName(query)
+            when {
+                remainingQuery.isEmpty() -> decodedHead
+                '?' in decodedHead -> "$decodedHead&$remainingQuery"
+                else -> "$decodedHead?$remainingQuery"
+            }
+        }
+
+        val isHttpUrl = decoded.startsWith("https://", ignoreCase = true) ||
+            decoded.startsWith("http://", ignoreCase = true)
 
         return when {
-            action in subscriptionActions && decoded.startsWith("http") ->
+            action in subscriptionActions && isHttpUrl ->
                 DeepLinkPayload.AddSubscription(decoded, name)
 
-            decoded.contains("://") -> parseProxyPayload(decoded, name)
+            decoded.contains("://") -> {
+                val proxyTarget = if (
+                    !isHttpUrl &&
+                    encoded == null &&
+                    queryName == null &&
+                    rawFragment.isNotEmpty() &&
+                    '#' !in decoded
+                ) {
+                    "$decoded#$rawFragment"
+                } else {
+                    decoded
+                }
+                parseProxyPayload(proxyTarget, name)
+            }
 
             action.isEmpty() -> DeepLinkPayload.Unsupported(text, UnsupportedReason.UnknownFormat)
 
@@ -131,7 +164,18 @@ object DeepLinkParser {
     private fun parseProxyPayload(text: String, name: String? = null): DeepLinkPayload {
         // A share blob may hold many links at once (QR codes of whole bundles do this).
         val nodes = ProxyUriParser.parseAll(text)
-        if (nodes.isNotEmpty()) return DeepLinkPayload.AddNodes(nodes)
+        if (nodes.isNotEmpty()) {
+            val resolved = if (
+                name != null &&
+                nodes.size == 1 &&
+                nodes.single().name == "${nodes.single().server}:${nodes.single().port}"
+            ) {
+                listOf(nodes.single().copy(name = name))
+            } else {
+                nodes
+            }
+            return DeepLinkPayload.AddNodes(resolved)
+        }
 
         // Servers first: a page of mixed text usually carries both, and a resolver is the thing
         // the user can still add by hand if this misses it.
@@ -143,8 +187,11 @@ object DeepLinkParser {
         if (decoded != null) {
             val decodedNodes = ProxyUriParser.parseAll(decoded)
             if (decodedNodes.isNotEmpty()) return DeepLinkPayload.AddNodes(decodedNodes)
-            if (decoded.startsWith("http")) {
-                return DeepLinkPayload.AddSubscription(decoded.trim(), name)
+            val trimmedDecoded = decoded.trim()
+            if (trimmedDecoded.startsWith("https://", ignoreCase = true) ||
+                trimmedDecoded.startsWith("http://", ignoreCase = true)
+            ) {
+                return DeepLinkPayload.AddSubscription(trimmedDecoded, name)
             }
         }
 

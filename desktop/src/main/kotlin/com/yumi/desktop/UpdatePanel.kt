@@ -10,13 +10,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.yumi.desktop.model.DesktopSettings
+import com.yumi.desktop.platform.DesktopPlatform
 import com.yumi.desktop.update.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.awt.Desktop
 import java.net.URI
 
 @Composable
 fun UpdatePanel(m: DesktopModel, settings: DesktopSettings, onInstall: () -> Unit, updater: DesktopUpdater = m.updates) {
     val state by updater.state.collectAsState()
+    val ioScope = rememberCoroutineScope()
     val release = when (val current = state) {
         is DesktopUpdateState.Available -> current.release
         is DesktopUpdateState.Downloading -> current.release
@@ -57,13 +61,32 @@ fun UpdatePanel(m: DesktopModel, settings: DesktopSettings, onInstall: () -> Uni
                 is DesktopUpdateState.Ready -> AccentButton(m.text("Перезапустить и обновить", "Restart and update"), icon = Icons.Rounded.SystemUpdateAlt, onClick = onInstall)
                 is DesktopUpdateState.Downloading -> QuietButton(m.text("Отмена", "Cancel")) { updater.cancelDownload() }
                 is DesktopUpdateState.Available -> AccentButton(m.text("Скачать обновление", "Download update"), icon = Icons.Rounded.SystemUpdateAlt) {
-                    if (updater.installed) updater.download() else release?.let { Desktop.getDesktop().browse(URI(it.pageUrl)) }
+                    if (updater.installed) updater.download() else release?.let { ioScope.launch(Dispatchers.IO) { openExternalUrl(it.pageUrl) } }
                 }
-                else -> QuietButton(m.text("Проверить обновления", "Check for updates"), icon = Icons.Rounded.Refresh, enabled = state !is DesktopUpdateState.Checking) {
-                    if (release != null && updater.installed) updater.download() else updater.check()
+                else -> {
+                    if (state is DesktopUpdateState.Failed && release != null && updater.installed) {
+                        AccentButton(m.text("Повторить", "Retry"), icon = Icons.Rounded.Refresh) { updater.download() }
+                    }
+                    QuietButton(m.text("Проверить обновления", "Check for updates"), icon = Icons.Rounded.Refresh, enabled = state !is DesktopUpdateState.Checking) {
+                        updater.check()
+                    }
                 }
             }
-            if (release != null) TextButton(onClick = { Desktop.getDesktop().browse(URI(release.pageUrl)) }) { Text(m.text("Что нового", "What's new")) }
+            if (release != null) TextButton(onClick = { ioScope.launch(Dispatchers.IO) { openExternalUrl(release.pageUrl) } }) { Text(m.text("Что нового", "What's new")) }
         }
+    }
+}
+
+private fun openExternalUrl(url: String) {
+    val uri = runCatching { URI(url) }.getOrNull() ?: return
+    if (uri.scheme?.lowercase() !in setOf("http", "https")) return
+    val browsed = runCatching {
+        if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+            Desktop.getDesktop().browse(uri)
+            true
+        } else false
+    }.getOrDefault(false)
+    if (!browsed && !DesktopPlatform.isWindows && !DesktopPlatform.isMac) {
+        runCatching { ProcessBuilder("xdg-open", uri.toString()).start() }
     }
 }

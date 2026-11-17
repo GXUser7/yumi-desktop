@@ -11,9 +11,20 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.*
+import java.security.KeyFactory
 import java.security.MessageDigest
+import java.security.Signature
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
 
-data class DesktopRelease(val version: String, val notes: String, val installerUrl: String, val checksumUrl: String, val size: Long) {
+data class DesktopRelease(
+    val version: String,
+    val notes: String,
+    val installerUrl: String,
+    val checksumUrl: String,
+    val size: Long,
+    val signatureUrl: String? = null,
+) {
     val fileName get() = assetName(version)
     val pageUrl get() = "https://github.com/GXUser7/yumi-desktop/releases/tag/v$version"
 }
@@ -38,6 +49,7 @@ data class VerifiedUpdate(val release: DesktopRelease, val file: File, val sha25
 interface UpdateSource {
     suspend fun latest(): DesktopRelease?
     suspend fun download(release: DesktopRelease, progress: (Long, Long) -> Unit): VerifiedUpdate
+    fun purge() {}
 }
 
 class UpdateIntegrityException : IOException("Installer integrity check failed")
@@ -79,18 +91,36 @@ class HttpsUpdateTransport(private val currentVersion: String) : UpdateTransport
     }
 }
 
-class GitHubUpdates(private val directory: File, private val transport: UpdateTransport) : UpdateSource {
-    override suspend fun latest(): DesktopRelease? = parseReleases(transport.open(FEED).use { it.readLimited(2_000_000).decodeToString() })
+class GitHubUpdates(
+    private val directory: File,
+    private val transport: UpdateTransport,
+    private val publicKeyBase64: String = configuredPublicKey(),
+) : UpdateSource {
+    override suspend fun latest(): DesktopRelease? =
+        parseReleases(transport.open(FEED).use { it.readLimited(2_000_000).decodeToString() }, publicKeyBase64)
+
+    override fun purge() = purgeStale(keepName = null)
 
     override suspend fun download(release: DesktopRelease, progress: (Long, Long) -> Unit): VerifiedUpdate {
         require(release.size in 1..MAX_INSTALLER_SIZE)
-        val checksum = transport.open(release.checksumUrl).use { it.readLimited(4096).decodeToString().trim() }
+        val checksumBytes = transport.open(release.checksumUrl).use { it.readLimited(4096) }
+        if (publicKeyBase64.isNotBlank()) {
+            val signatureUrl = release.signatureUrl ?: throw UpdateIntegrityException()
+            val signatureBytes = transport.open(signatureUrl).use { it.readNBytes(65) }
+            if (!verifyEd25519(publicKeyBase64, checksumBytes, signatureBytes)) throw UpdateIntegrityException()
+        }
+        val checksum = checksumBytes.decodeToString().trim()
         val expected = Regex("^([0-9a-fA-F]{64})\\s+\\*?${Regex.escape(release.fileName)}$")
             .matchEntire(checksum)?.groupValues?.get(1)?.lowercase() ?: throw UpdateIntegrityException()
         directory.mkdirs()
         val target = File(directory, release.fileName)
         val verified = VerifiedUpdate(release, target, expected)
-        if (verified.verify()) { progress(release.size, release.size); return verified }
+        if (verified.verify()) {
+            purgeStale(keepName = target.name)
+            progress(release.size, release.size)
+            return verified
+        }
+        purgeStale(keepName = null)
         val partial = File(directory, release.fileName + ".part")
         try {
             var count = 0L
@@ -113,19 +143,47 @@ class GitHubUpdates(private val directory: File, private val transport: UpdateTr
             currentCoroutineContext().ensureActive()
             if (count != release.size || digest.digest().hex() != expected) throw UpdateIntegrityException()
             Files.move(partial.toPath(), target.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+            purgeStale(keepName = target.name)
             return verified
         } finally {
             partial.delete()
         }
     }
 
+    private fun purgeStale(keepName: String?) {
+        directory.listFiles()?.forEach { entry ->
+            if (entry.name.startsWith("Yumi-Desktop-") && entry.name != keepName) {
+                entry.deleteRecursively()
+            }
+        }
+    }
+
     companion object {
         const val FEED = "https://api.github.com/repos/GXUser7/yumi-desktop/releases?per_page=30"
         const val RELEASES = "https://github.com/GXUser7/yumi-desktop/releases"
+        const val EMBEDDED_UPDATE_PUBLIC_KEY = ""
         private const val MAX_INSTALLER_SIZE = 1_500_000_000L
+        private val ED25519_SPKI_PREFIX = byteArrayOf(0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
+
+        fun configuredPublicKey(): String = System.getProperty("yumi.updatePublicKey", EMBEDDED_UPDATE_PUBLIC_KEY).trim()
+
+        internal fun verifyEd25519(keyBase64: String, data: ByteArray, signature: ByteArray): Boolean {
+            if (signature.size != 64) return false
+            return runCatching {
+                val raw = Base64.getDecoder().decode(keyBase64.trim())
+                val spki = if (raw.size == 32) ED25519_SPKI_PREFIX + raw else raw
+                val key = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(spki))
+                Signature.getInstance("Ed25519").run {
+                    initVerify(key)
+                    update(data)
+                    verify(signature)
+                }
+            }.getOrDefault(false)
+        }
 
         /** Accept numeric stable releases and legacy beta tags; drafts and unrelated assets never qualify. */
-        fun parseReleases(body: String): DesktopRelease? {
+        fun parseReleases(body: String, publicKeyBase64: String = configuredPublicKey()): DesktopRelease? {
+            val requireSignature = publicKeyBase64.isNotBlank()
             val candidates = Json.parseToJsonElement(body).jsonArray.mapNotNull { item ->
                 val release = item.jsonObject
                 if (release["draft"]?.jsonPrimitive?.booleanOrNull != false) return@mapNotNull null
@@ -141,10 +199,18 @@ class GitHubUpdates(private val directory: File, private val transport: UpdateTr
                     val raw = asset["browser_download_url"]?.jsonPrimitive?.contentOrNull ?: return null
                     return raw.takeIf { it == "https://github.com/GXUser7/yumi-desktop/releases/download/$tag/$file" }
                 }
+                val signatureUrl = asset("$name.sha256.sig")?.let { url(it, "$name.sha256.sig") }
+                if (requireSignature && signatureUrl == null) return@mapNotNull null
                 val size = installer["size"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
                 if (size !in 1..MAX_INSTALLER_SIZE) return@mapNotNull null
-                DesktopRelease(version, release["body"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                    url(installer, name) ?: return@mapNotNull null, url(checksum, "$name.sha256") ?: return@mapNotNull null, size)
+                DesktopRelease(
+                    version = version,
+                    notes = release["body"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                    installerUrl = url(installer, name) ?: return@mapNotNull null,
+                    checksumUrl = url(checksum, "$name.sha256") ?: return@mapNotNull null,
+                    size = size,
+                    signatureUrl = signatureUrl,
+                )
             }
             return candidates.maxWithOrNull { a, b -> when {
                 Version.isNewer(a.version, b.version) -> 1

@@ -57,6 +57,7 @@ class CoreGenerations(
         }
     }
 
+    @Synchronized
     fun observe(message: String, nowMillis: Long): Line {
         val uptimeSeconds = uptimeSecondsOf(message) ?: return Line.NotCore
         val startedAt = nowMillis - uptimeSeconds * 1000L
@@ -90,6 +91,7 @@ class CoreGenerations(
     }
 
     /** Cores that have written something inside the live window. */
+    @Synchronized
     fun liveCores(nowMillis: Long): Int =
         generations.count { nowMillis - it.lastSeenMillis <= liveWindowMillis }
 
@@ -99,6 +101,7 @@ class CoreGenerations(
      * Rate-limited, because the condition it reports lasts for minutes and the lines that reveal it
      * arrive hundreds of times a second.
      */
+    @Synchronized
     fun dueReport(nowMillis: Long): Report? {
         val live = generations.filter { nowMillis - it.lastSeenMillis <= liveWindowMillis }
         if (live.size < 2) return null
@@ -109,6 +112,7 @@ class CoreGenerations(
     }
 
     /** Forgotten when the tunnel is torn down for real: the next session counts from scratch. */
+    @Synchronized
     fun reset() {
         generations.clear()
         lastReportAtMillis = 0L

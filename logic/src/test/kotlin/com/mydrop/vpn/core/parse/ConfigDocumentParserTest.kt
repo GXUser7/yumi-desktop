@@ -244,4 +244,51 @@ class ConfigDocumentParserTest {
         assertTrue("expected a group", group != null)
         return group!!
     }
+
+    @Test
+    fun `re2j cost regex resists catastrophic backtracking and runs fast`() {
+        val evilTag = "a".repeat(32) + "c"
+        val doc = """
+            {
+              "outbounds": [
+                {"tag": "$evilTag", "protocol": "vless", "settings": {"vnext": [{"address": "a.example", "port": 443, "users": [{"id": "u"}]}]}},
+                {"tag": "fast-node", "protocol": "vless", "settings": {"vnext": [{"address": "b.example", "port": 443, "users": [{"id": "u"}]}]}}
+              ],
+              "routing": {
+                "balancers": [{
+                  "tag": "auto",
+                  "selector": [""],
+                  "strategy": {"type": "leastLoad", "settings": {
+                    "costs": [{"match": "(a+)+b", "regexp": true, "value": 100}]
+                  }}
+                }]
+              }
+            }
+        """.trimIndent()
+        val started = System.nanoTime()
+        val nodes = ConfigDocumentParser.parse(doc, "sub")
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000
+        assertEquals(1, nodes.size)
+        assertTrue("RE2 regex evaluation took ${elapsedMillis}ms", elapsedMillis < 500)
+    }
+
+    @Test
+    fun `xrayTls branches strictly on security and rejects reality missing publicKey`() {
+        val tlsWithStrayReality = """
+            {"outbounds":[{"protocol":"vless","tag":"tls-only",
+              "settings":{"vnext":[{"address":"[2001:db8::1]","port":443,"users":[{"id":"u"}]}]},
+              "streamSettings":{"security":"TLS","tlsSettings":{"serverName":"sni.example.com."},
+                "realitySettings":{"publicKey":"IGNORED"}}}]}
+        """.trimIndent()
+        val tlsNode = ConfigDocumentParser.parse(tlsWithStrayReality, "sub").single()
+        assertEquals("2001:db8::1", tlsNode.server)
+        assertNull(tlsNode.tls?.reality)
+
+        val realityNoKey = """
+            {"outbounds":[{"protocol":"vless","tag":"bad-reality",
+              "settings":{"vnext":[{"address":"example.com.","port":443,"users":[{"id":"u"}]}]},
+              "streamSettings":{"security":"reality","realitySettings":{"serverName":"decoy.com"}}}]}
+        """.trimIndent()
+        assertTrue(ConfigDocumentParser.parse(realityNoKey, "sub").isEmpty())
+    }
 }

@@ -29,8 +29,14 @@ class DesktopUpdater(
     val state = mutable.asStateFlow()
     private val operation = Mutex()
     @Volatile private var job: Job? = null
+    @Volatile private var autoDownloading = false
 
     init {
+        scope.launch {
+            settings.map { it.autoUpdate }.distinctUntilChanged().drop(1).collect { enabled ->
+                if (!enabled && autoDownloading) job?.cancel()
+            }
+        }
         if (automatic) scope.launch {
             settings.map { it.autoUpdate }.distinctUntilChanged().collectLatest { enabled ->
                 if (enabled) {
@@ -43,25 +49,46 @@ class DesktopUpdater(
 
     fun check(manual: Boolean = true): Job = scope.launch(dispatcher) {
         if (!operation.tryLock()) return@launch
-        if (mutable.value is DesktopUpdateState.Ready) { operation.unlock(); return@launch }
         job = currentCoroutineContext()[Job]
+        autoDownloading = !manual
         val previous = mutable.value
+        val ready = previous as? DesktopUpdateState.Ready
         try {
-            mutable.value = DesktopUpdateState.Checking
+            if (ready == null) mutable.value = DesktopUpdateState.Checking
             val latest = source.latest()
-            if (latest == null || !Version.isNewer(latest.version, currentVersion)) {
+            if (ready != null) {
+                if (latest != null && Version.isNewer(latest.version, ready.update.release.version)) {
+                    mutable.value = DesktopUpdateState.Available(latest)
+                    if (installed && settings.value.autoUpdate) {
+                        autoDownloading = true
+                        downloadRelease(latest)
+                    }
+                }
+            } else if (latest == null || !Version.isNewer(latest.version, currentVersion)) {
+                source.purge()
                 mutable.value = DesktopUpdateState.Current(System.currentTimeMillis())
             } else {
                 mutable.value = DesktopUpdateState.Available(latest)
-                if (installed && settings.value.autoUpdate) downloadRelease(latest)
+                if (installed && settings.value.autoUpdate) {
+                    autoDownloading = true
+                    downloadRelease(latest)
+                }
             }
         } catch (cancelled: CancellationException) {
             if (mutable.value is DesktopUpdateState.Checking) mutable.value = previous
             throw cancelled
         } catch (error: Exception) {
             val release = (mutable.value as? DesktopUpdateState.Downloading)?.release
-            mutable.value = if (manual) DesktopUpdateState.Failed(release, error is UpdateIntegrityException) else release?.let(DesktopUpdateState::Available) ?: previous
-        } finally { job = null; operation.unlock() }
+            if (ready != null && release == null) {
+                mutable.value = ready
+            } else {
+                mutable.value = if (manual) DesktopUpdateState.Failed(release, error is UpdateIntegrityException) else release?.let(DesktopUpdateState::Available) ?: previous
+            }
+        } finally {
+            autoDownloading = false
+            job = null
+            operation.unlock()
+        }
     }
 
     fun download(): Job = scope.launch(dispatcher) {

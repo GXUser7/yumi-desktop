@@ -53,6 +53,7 @@ pwsh -NoProfile -File tools/collect-licenses.ps1 -GoExe "$(command -v $GO)"
 
 # ── Packages ─────────────────────────────────────────────────────────────────────────────────
 echo "== Packages"
+rm -rf desktop/build/compose/binaries/main
 # jpackage writes its complaint to a log on this machine; show it before dying.
 $GRADLE :desktop:packageDistributionForCurrentOS --console=plain || {
     cat desktop/build/compose/logs/*/jpackage*err.txt 2>/dev/null
@@ -72,6 +73,14 @@ else
 fi
 cd dist
 for f in *; do
-    [ -f "$f.sha256" ] || sha256sum "$f" > "$f.sha256"
+    [ -f "$f" ] || continue
+    case "$f" in
+        *.sha256|*.sig) continue ;;
+    esac
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" > "$f.sha256"
+    else
+        shasum -a 256 "$f" > "$f.sha256"
+    fi
     cat "$f.sha256"
 done

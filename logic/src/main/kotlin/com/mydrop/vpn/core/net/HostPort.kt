@@ -79,26 +79,44 @@ private fun isIpv4(value: String): Boolean {
 
 private fun isIpv6(value: String): Boolean {
     if (!value.contains(':')) return false
+    if (value.contains(":::")) return false
+    if (value.startsWith(':') && !value.startsWith("::")) return false
+    if (value.endsWith(':') && !value.endsWith("::")) return false
 
-    // A trailing IPv4 part is legal: ::ffff:192.0.2.1
+    val doubleColons = value.windowed(2).count { it == "::" }
+    if (doubleColons > 1) return false
+
+    // A trailing IPv4 part is legal: ::192.0.2.1 or ::ffff:192.0.2.1
     val lastColon = value.lastIndexOf(':')
     val tail = value.substring(lastColon + 1)
-    val head = if (tail.contains('.')) {
+    val hasV4 = tail.contains('.')
+    val prefix = if (hasV4) {
         if (!isIpv4(tail)) return false
-        value.substring(0, lastColon)
+        if (lastColon > 0 && value[lastColon - 1] == ':') {
+            value.substring(0, lastColon + 1)
+        } else {
+            value.substring(0, lastColon)
+        }
     } else {
         value
     }
 
-    val doubleColons = Regex("::").findAll(head).count()
-    if (doubleColons > 1) return false
-    if (head.contains(":::")) return false
+    val expected = if (hasV4) 6 else 8
+    fun validGroup(group: String): Boolean =
+        group.length in 1..4 && group.all { it.isHexDigit() }
 
-    val groups = head.split(':').filter { it.isNotEmpty() }
-    if (groups.any { group -> group.length > 4 || !group.all { it.isHexDigit() } }) return false
-
-    val expected = if (tail.contains('.')) 6 else 8
-    return if (doubleColons == 1) groups.size < expected else groups.size == expected
+    return if ("::" in prefix) {
+        val left = prefix.substringBefore("::")
+        val right = prefix.substringAfter("::")
+        val leftGroups = if (left.isEmpty()) emptyList() else left.split(':')
+        val rightGroups = if (right.isEmpty()) emptyList() else right.split(':')
+        leftGroups.all(::validGroup) &&
+            rightGroups.all(::validGroup) &&
+            leftGroups.size + rightGroups.size < expected
+    } else {
+        val groups = prefix.split(':')
+        groups.size == expected && groups.all(::validGroup)
+    }
 }
 
 private fun Char.isHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'

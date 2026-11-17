@@ -16,12 +16,14 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -29,6 +31,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -135,31 +138,56 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
      * the close blocks until the far end drains it, for ten seconds and more. That stall used to
      * sit inside the measured window and between the last byte and the results on screen.
      */
-    private class Wire(private val raw: Socket, val tls: SSLSocket) : Closeable {
+    private class Wire(val raw: Socket) : Closeable {
+        @Volatile var tls: SSLSocket? = null
         override fun close() {
             runCatching { raw.close() }
         }
     }
 
     /** Median round trip and the spread around it, over one already-open connection. */
-    private suspend fun measureLatency(probe: ProbeEndpoint?): Pair<Int, Int> =
-        connect(probe).use { wire ->
-            val socket = wire.tls
-            val samples = mutableListOf<Long>()
-            repeat(LATENCY_SAMPLES) {
-                ensureActive()
-                val started = System.nanoTime()
-                socket.outputStream.write(request("GET", "/__down?bytes=0", keepAlive = true))
-                socket.outputStream.flush()
-                val head = readHead(socket.inputStream)
-                checkStatus(head)
-                drain(socket.inputStream, contentLength(head) ?: 0)
-                samples += System.nanoTime() - started
+    private suspend fun measureLatency(probe: ProbeEndpoint?): Pair<Int, Int> {
+        val wire = Wire(Socket())
+        val cancelled = AtomicBoolean(false)
+        return suspendCancellableCoroutine { cont ->
+            cont.invokeOnCancellation {
+                cancelled.set(true)
+                wire.close()
             }
-            val median = samples.sorted()[samples.size / 2] / 1_000_000
-            val jitter = samples.zipWithNext { a, b -> abs(a - b) }.average() / 1_000_000
-            median.toInt() to jitter.roundToInt()
+            Dispatchers.IO.asExecutor().execute {
+                if (cancelled.get() || !cont.isActive) {
+                    wire.close()
+                    return@execute
+                }
+                try {
+                    val result = wire.use {
+                        connectInto(wire, probe)
+                        val socket = requireNotNull(wire.tls)
+                        val samples = mutableListOf<Long>()
+                        repeat(LATENCY_SAMPLES) {
+                            if (cancelled.get()) {
+                                throw CancellationException(strings.get(R.string.error_speed_cancelled))
+                            }
+                            val started = System.nanoTime()
+                            socket.outputStream.write(request("GET", "/__down?bytes=0", keepAlive = true))
+                            socket.outputStream.flush()
+                            val head = readHead(socket.inputStream)
+                            checkStatus(head)
+                            drain(socket.inputStream, contentLength(head) ?: 0)
+                            samples += System.nanoTime() - started
+                        }
+                        val median = samples.sorted()[samples.size / 2] / 1_000_000
+                        val jitter = samples.zipWithNext { a, b -> abs(a - b) }.average() / 1_000_000
+                        median.toInt() to jitter.roundToInt()
+                    }
+                    if (cont.isActive) cont.resume(result)
+                } catch (error: Throwable) {
+                    wire.close()
+                    if (cont.isActive) cont.resumeWithException(error)
+                }
+            }
         }
+    }
 
     /**
      * One transfer phase: [STREAMS] connections moving bytes into a shared counter while this
@@ -188,19 +216,25 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
 
         val workers = List(STREAMS) {
             launch(Dispatchers.IO) {
+                val wire = Wire(Socket())
+                wires += wire
+                if (finishing.get() || !isActive) {
+                    wire.close()
+                    return@launch
+                }
                 try {
-                    val wire = connect(probe)
-                    wires += wire
                     // Sized to take roughly [TARGET_REQUEST_NANOS] on this link: too small and the
                     // round trip waiting for each answer becomes the measurement, too large and a
                     // slow stream never finishes one inside the budget.
                     wire.use {
+                        connectInto(wire, probe)
+                        val tls = requireNotNull(wire.tls)
                         while (isActive && System.nanoTime() - started < BUDGET_NANOS) {
                             // A body that had to be cut short leaves the connection unusable for
                             // the next request, so the stream ends with it.
                             val complete =
-                                if (upload) uploadOnce(wire.tls, moved, started)
-                                else downloadOnce(wire.tls, moved, started)
+                                if (upload) uploadOnce(tls, moved, started)
+                                else downloadOnce(tls, moved, started)
                             if (!complete) break
                         }
                     }
@@ -224,27 +258,33 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
         var countedAt = 0L
         var warmedUp = false
 
-        while (System.nanoTime() - started < BUDGET_NANOS && workers.any { it.isActive }) {
-            delay(SAMPLE_MILLIS)
-            val now = System.nanoTime()
-            val total = moved.get()
+        try {
+            while (System.nanoTime() - started < BUDGET_NANOS && workers.any { it.isActive }) {
+                delay(SAMPLE_MILLIS)
+                val now = System.nanoTime()
+                val total = moved.get()
 
-            window += now to total
-            while (window.size > 1 && now - window.first().first > SMOOTHING_NANOS) {
-                window.removeFirst()
+                window += now to total
+                while (window.size > 1 && now - window.first().first > SMOOTHING_NANOS) {
+                    window.removeFirst()
+                }
+                val (windowStart, windowBytes) = window.first()
+
+                onSample(
+                    rate(total - windowBytes, now - windowStart),
+                    ((now - started).toFloat() / BUDGET_NANOS).coerceIn(0f, 1f),
+                )
+
+                if (!warmedUp && now - started > WARMUP_MILLIS * 1_000_000L) {
+                    warmedUp = true
+                    countedFrom = now
+                    countedAt = total
+                }
             }
-            val (windowStart, windowBytes) = window.first()
-
-            onSample(
-                rate(total - windowBytes, now - windowStart),
-                ((now - started).toFloat() / BUDGET_NANOS).coerceIn(0f, 1f),
-            )
-
-            if (!warmedUp && now - started > WARMUP_MILLIS * 1_000_000L) {
-                warmedUp = true
-                countedFrom = now
-                countedAt = total
-            }
+        } finally {
+            finishing.set(true)
+            wires.forEach { runCatching { it.close() } }
+            workers.forEach { it.cancel() }
         }
 
         // The window closes here, with the budget — before any of the tearing down. Reading the
@@ -258,9 +298,6 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
         // Closing is what unblocks a worker sitting in a blocking read or write; cancel alone
         // would leave it waiting out the socket timeout. The join is bounded because a stream that
         // will not let go is not a reason to keep the results off the screen.
-        finishing.set(true)
-        wires.forEach { runCatching { it.close() } }
-        workers.forEach { it.cancel() }
         val teardown = System.nanoTime()
         withTimeoutOrNull(TEARDOWN_TIMEOUT_MILLIS) { workers.joinAll() }
 
@@ -343,8 +380,8 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
      * then on the socket is an ordinary tunnel for TLS to sit on. Only the target host is named in
      * cleartext, exactly as with any HTTPS proxy.
      */
-    private fun connect(probe: ProbeEndpoint?): Wire {
-        val raw = Socket()
+    private fun connectInto(wire: Wire, probe: ProbeEndpoint?) {
+        val raw = wire.raw
         raw.soTimeout = READ_TIMEOUT_MILLIS
         try {
             if (probe == null) {
@@ -361,9 +398,10 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
                         ).toByteArray(),
                 )
                 raw.outputStream.flush()
-                val status = readHead(raw.inputStream).lineSequence().firstOrNull().orEmpty()
-                check(" 200" in status) {
-                    strings.get(R.string.error_speed_core_refused, status.trim())
+                val status = readHead(raw.inputStream).lineSequence().firstOrNull().orEmpty().trim()
+                val code = status.split(' ').getOrNull(1)?.toIntOrNull()
+                check(code == 200) {
+                    strings.get(R.string.error_speed_core_refused, status.ifEmpty { strings.get(R.string.error_speed_nothing) })
                 }
             }
 
@@ -376,9 +414,12 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
 
             val tls = (SSL.createSocket(raw, HOST, PORT, true) as SSLSocket).apply {
                 soTimeout = READ_TIMEOUT_MILLIS
+                sslParameters = sslParameters.apply {
+                    endpointIdentificationAlgorithm = "HTTPS"
+                }
                 startHandshake()
             }
-            return Wire(raw, tls)
+            wire.tls = tls
         } catch (error: Throwable) {
             runCatching { raw.close() }
             throw error
@@ -405,12 +446,17 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
      * Byte at a time on purpose: a buffered reader would swallow the start of the body, and in the
      * download phase that body is the thing being measured.
      */
-    private fun readHead(stream: InputStream): String {
+    internal fun readHead(stream: InputStream): String {
         val head = StringBuilder()
         var newlines = 0
+        var readBytes = 0
         while (newlines < 2) {
             val byte = stream.read()
             if (byte < 0) break
+            readBytes++
+            if (readBytes > MAX_HEAD_BYTES) {
+                throw IllegalStateException("Response headers exceeded $MAX_HEAD_BYTES bytes")
+            }
             val symbol = byte.toChar()
             head.append(symbol)
             when (symbol) {
@@ -452,17 +498,13 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
         }
     }
 
-    private suspend fun ensureActive() {
-        if (!currentCoroutineContext().isActive) throw CancellationException(strings.get(R.string.error_speed_cancelled))
-    }
-
     private fun rate(bytes: Long, nanos: Long): Long =
         if (nanos <= 0) 0 else (bytes * 1_000_000_000.0 / nanos).toLong()
 
     private fun Long.megabits(): String =
         String.format(Locale.US, "%.1f", this * 8 / 1_000_000.0)
 
-    private companion object {
+    internal companion object {
         /**
          * Cloudflare's speed endpoints: `__down` returns exactly the number of bytes asked for and
          * `__up` swallows whatever is posted. They are anycast, so the nearest edge answers and the
@@ -479,8 +521,10 @@ class SpeedTester(private val logs: LogRepository, private val strings: Strings)
          */
         const val DOWNLOAD_BYTES = 99_000_000L
 
-        /** One long body per stream, cut short when the budget runs out. */
-        const val UPLOAD_BYTES = 100_000_000L
+        /** One request body per round, sized so status is validated well inside the 8s budget. */
+        const val UPLOAD_BYTES = 4_000_000L
+
+        const val MAX_HEAD_BYTES = 16 * 1024
 
         /**
          * Bounds how far the writes can run ahead of the wire. Small enough that the reading is

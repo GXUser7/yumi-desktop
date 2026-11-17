@@ -1,5 +1,6 @@
 package com.mydrop.vpn.core.parse
 
+import java.net.IDN
 import java.util.Base64
 import com.mydrop.vpn.core.net.splitHostPort
 
@@ -65,7 +66,8 @@ internal fun splitUri(raw: String): ParsedUri? {
     }
 
     val (host, port) = splitHostAndPort(rest) ?: return null
-    return ParsedUri(scheme, userInfo, host, port, query, fragment)
+    val normalizedHost = normalizeServerHost(host) ?: return null
+    return ParsedUri(scheme, userInfo, normalizedHost, port, query, fragment)
 }
 
 /**
@@ -148,7 +150,7 @@ internal fun urlDecode(value: String): String {
  * or not, and often wrapped across lines. Returns null only when the bytes are genuinely not
  * base64 — callers use that to fall back to plain-text parsing.
  */
-internal fun base64DecodeOrNull(value: String): String? {
+internal fun decodeBase64Bytes(value: String): ByteArray? {
     val cleaned = value.filterNot { it == '\n' || it == '\r' || it == ' ' || it == '\t' }
     if (cleaned.isEmpty()) return null
     val normalized = cleaned.replace('-', '+').replace('_', '/')
@@ -158,7 +160,25 @@ internal fun base64DecodeOrNull(value: String): String? {
         1 -> return null
         else -> normalized
     }
-    return runCatching { String(Base64.getDecoder().decode(padded), Charsets.UTF_8) }.getOrNull()
+    return runCatching { Base64.getDecoder().decode(padded) }.getOrNull()
+}
+
+internal fun base64DecodeOrNull(value: String): String? =
+    decodeBase64Bytes(value)?.let { String(it, Charsets.UTF_8) }
+
+/** Normalizes a proxy server host: strips IPv6 brackets, trims trailing dots, and ASCII-punycodes IDNs. */
+internal fun normalizeServerHost(raw: String?): String? {
+    val trimmed = raw?.trim()?.trimEnd('.')?.trim() ?: return null
+    if (trimmed.isEmpty()) return null
+    val unwrapped = if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        trimmed.substring(1, trimmed.length - 1)
+    } else {
+        trimmed
+    }
+    val cleaned = unwrapped.trim().trimEnd('.')
+    if (cleaned.isEmpty() || '[' in cleaned || ']' in cleaned) return null
+    if (cleaned.any { it.isISOControl() || it.isWhitespace() }) return null
+    return runCatching { IDN.toASCII(cleaned) }.getOrNull()?.takeIf { it.isNotBlank() }
 }
 
 /**

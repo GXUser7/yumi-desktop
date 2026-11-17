@@ -8,6 +8,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.v2.runComposeUiTest
+import com.mydrop.vpn.core.model.identified
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import java.nio.file.Files
@@ -95,4 +96,27 @@ class CompactLayoutTest {
         } finally { runBlocking { model.close() }; directory.deleteRecursively() }
     }
 
+    @Test fun compactConnectPageReactsWhenFirstServerIsAdded() {
+        val directory = Files.createTempDirectory("yumi-compact-empty-").toFile()
+        val model = DesktopModel(DemoBackend(), directory)
+        model.settings.update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+        try {
+            runComposeUiTest {
+                setContent {
+                    CompositionLocalProvider(LocalAnimationsActive provides false, LocalBackdropDispatcher provides Dispatchers.Unconfined) {
+                        Box(Modifier.requiredSize(680.dp, 600.dp)) { YumiApp(model) }
+                    }
+                }
+                onNodeWithText("Перенести с телефона").assertIsDisplayed()
+                runOnIdle {
+                    val node = com.mydrop.vpn.core.model.ProxyNode(
+                        "", "First", "192.0.2.1", 443,
+                        com.mydrop.vpn.core.model.ProxySettings.Vless("11111111-2222-3333-4444-555555555555"),
+                    ).identified()
+                    model.profiles.addNodes(listOf(node))
+                }
+                onNodeWithText("Перенести с телефона").assertDoesNotExist()
+            }
+        } finally { runBlocking { model.close() }; directory.deleteRecursively() }
+    }
 }

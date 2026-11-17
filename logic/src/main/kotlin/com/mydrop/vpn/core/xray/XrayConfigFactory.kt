@@ -13,6 +13,8 @@ import com.mydrop.vpn.core.model.TransportOptions
 import com.mydrop.vpn.core.net.isNumericAddress
 import java.net.InetAddress
 import com.mydrop.vpn.core.net.splitHostPort
+import com.mydrop.vpn.core.parse.decodeBase64Bytes
+import com.mydrop.vpn.core.parse.normalizeRealityKey
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArrayBuilder
 import kotlinx.serialization.json.JsonObject
@@ -143,6 +145,26 @@ object XrayConfigFactory {
             ?.plugin
             ?.takeIf { it.isNotBlank() }
             ?.let { return "Shadowsocks + $it" }
+
+        when (val s = node.settings) {
+            is ProxySettings.Socks -> {
+                val ver = s.version.trim()
+                if (ver == "4" || ver.equals("4a", ignoreCase = true)) return "SOCKS4"
+            }
+            is ProxySettings.WireGuard -> {
+                if (!isValidWireGuardKey(s.privateKey)) return "WireGuard privateKey"
+            }
+            is ProxySettings.Vless -> {
+                if (s.flow !in KNOWN_VLESS_FLOWS) return "VLESS flow (${s.flow})"
+            }
+            else -> Unit
+        }
+
+        val reality = node.tls?.takeIf { it.enabled }?.reality
+        if (reality != null) {
+            if (decodeBase64Bytes(reality.publicKey)?.size != 32) return "REALITY publicKey"
+            if (normalizeRealityShortId(reality.shortId) == null) return "REALITY shortId"
+        }
 
         return when (node.transport) {
             // Both removed from the core outright, with an explicit "removed feature" error
@@ -336,7 +358,7 @@ object XrayConfigFactory {
             }
         }
 
-        put("dns", buildDns(settings))
+        put("dns", buildDns(settings, geoAvailable))
 
         putJsonArray("inbounds") {
             add(buildTunInbound(settings))
@@ -415,18 +437,16 @@ object XrayConfigFactory {
      */
     private fun buildProbeInbound(probe: ProbeEndpoint): JsonObject = buildJsonObject {
         put("tag", PROBE_TAG)
-        put("protocol", "socks")
+        put("protocol", "http")
         put("listen", "127.0.0.1")
         put("port", probe.port)
         putJsonObject("settings") {
-            put("auth", "password")
             putJsonArray("accounts") {
                 addJsonObject {
                     put("user", probe.username)
                     put("pass", probe.password)
                 }
             }
-            put("udp", true)
         }
     }
 
@@ -808,12 +828,37 @@ object XrayConfigFactory {
     private fun buildReality(tls: TlsOptions, node: ProxyNode): JsonObject = buildJsonObject {
         val reality = requireNotNull(tls.reality)
         put("serverName", tls.serverName?.takeIf { it.isNotBlank() } ?: node.server)
-        put("publicKey", reality.publicKey)
-        if (reality.shortId.isNotBlank()) put("shortId", reality.shortId)
-        if (reality.spiderX.isNotBlank()) put("spiderX", reality.spiderX)
+        put("publicKey", normalizeRealityKey(reality.publicKey))
+        val shortId = normalizeRealityShortId(reality.shortId).orEmpty()
+        if (shortId.isNotEmpty()) put("shortId", shortId)
+        val spiderX = reality.spiderX.trim()
+        if (spiderX.isNotEmpty()) {
+            put("spiderX", if (spiderX.startsWith('/')) spiderX else "/$spiderX")
+        }
         // REALITY without a fingerprint presents Go's own ClientHello, which is precisely the
         // signature the whole exercise exists to avoid.
         put("fingerprint", safeFingerprint(tls.fingerprint))
+    }
+
+    private val KNOWN_VLESS_FLOWS = setOf("", "xtls-rprx-vision")
+
+    private fun isValidWireGuardKey(raw: String): Boolean {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return false
+        if (trimmed.length == 64 && trimmed.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            return true
+        }
+        return decodeBase64Bytes(trimmed)?.size == 32
+    }
+
+    private fun normalizeRealityShortId(raw: String): String? {
+        val cleaned = raw.trim()
+            .filter { it != ':' && it != '-' && !it.isWhitespace() }
+            .lowercase()
+        if (cleaned.isEmpty()) return ""
+        if (cleaned.length > 16 || cleaned.length % 2 != 0) return null
+        if (!cleaned.all { it in '0'..'9' || it in 'a'..'f' }) return null
+        return cleaned
     }
 
     /**
@@ -872,7 +917,7 @@ object XrayConfigFactory {
             // Dispatched through the routing rules, which is what lets [dnsRules] send it through
             // the proxy.
             "" -> trimmed
-            "udp" -> trimmed.removePrefix("udp://").takeIf { it.isNotBlank() }
+            "udp" -> trimmed.substringAfter("://").takeIf { it.isNotBlank() }
             "https", "h2c", "tcp" -> trimmed
             "https+local", "h2c+local", "tcp+local", "quic+local" -> trimmed
             // No DoT anywhere in the core, and `quic://` exists only as `quic+local://`. Returning
@@ -882,16 +927,37 @@ object XrayConfigFactory {
         }
     }
 
-    private fun buildDns(settings: AppSettings): JsonObject = buildJsonObject {
+    private fun buildDns(settings: AppSettings, geoAvailable: Boolean): JsonObject = buildJsonObject {
         val remote = xrayResolver(settings.remoteDns)
         val direct = xrayResolver(settings.directDns)
+        val directHost = direct?.let(::hostOf)
 
         putJsonArray("servers") {
             when (settings.routingMode) {
                 RoutingMode.Direct -> direct?.let { add(it) }
-                else -> {
+                RoutingMode.Rules -> {
+                    remote?.let { add(it) }
+                    if (direct != null) {
+                        if (geoAvailable) {
+                            addJsonObject {
+                                put("address", direct)
+                                putJsonArray("domains") { add("geosite:category-ru") }
+                            }
+                        } else {
+                            add(direct)
+                        }
+                    }
+                    if (remote == null && direct != null && geoAvailable) add(FALLBACK_DNS)
+                }
+                RoutingMode.Global -> {
                     remote?.let { add(it) }
                     direct?.let { add(it) }
+                }
+            }
+            if (direct != null && directHost != null && !isNumericAddress(directHost)) {
+                addJsonObject {
+                    put("address", "1.1.1.1")
+                    putJsonArray("domains") { add("full:$directHost") }
                 }
             }
             // A document with no resolver at all leaves the core on its own built-in localhost
@@ -1175,6 +1241,14 @@ object XrayConfigFactory {
                     }
                 }
 
+                if (!settings.enableIpv6) {
+                    addJsonObject {
+                        put("type", "field")
+                        putJsonArray("ip") { add("::/0") }
+                        put("outboundTag", BLOCK_TAG)
+                    }
+                }
+
                 if (settings.bypassLan) {
                     addJsonObject {
                         put("type", "field")
@@ -1281,16 +1355,6 @@ object XrayConfigFactory {
                 put("outboundTag", DIRECT_TAG)
             }
             return
-        }
-
-        val remoteHost = xrayResolver(settings.remoteDns)?.let(::hostOf)
-        if (remoteHost != null && !isNumericAddress(remoteHost)) {
-            addJsonObject {
-                put("type", "field")
-                putJsonArray("inboundTag") { add(DNS_IN_TAG) }
-                putJsonArray("domain") { add("full:$remoteHost") }
-                put("outboundTag", DIRECT_TAG)
-            }
         }
 
         addJsonObject {

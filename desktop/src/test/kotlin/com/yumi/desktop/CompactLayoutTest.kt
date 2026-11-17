@@ -8,6 +8,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.v2.runComposeUiTest
+import com.mydrop.vpn.core.model.AppLanguage
 import com.mydrop.vpn.core.model.identified
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -99,7 +100,7 @@ class CompactLayoutTest {
     @Test fun compactConnectPageReactsWhenFirstServerIsAdded() {
         val directory = Files.createTempDirectory("yumi-compact-empty-").toFile()
         val model = DesktopModel(DemoBackend(), directory)
-        model.settings.update { it.copy(deviceId = "test", subscriptionAutoUpdate = false) }
+        model.settings.update { it.copy(deviceId = "test", subscriptionAutoUpdate = false, language = AppLanguage.Russian) }
         try {
             runComposeUiTest {
                 setContent {

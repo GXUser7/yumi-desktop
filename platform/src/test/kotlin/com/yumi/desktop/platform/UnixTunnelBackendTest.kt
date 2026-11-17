@@ -1,6 +1,7 @@
 package com.yumi.desktop.platform
 
 import com.yumi.desktop.model.ServiceRequest
+import com.yumi.desktop.model.ServiceStatus
 import kotlinx.coroutines.*
 import org.junit.Assume.assumeFalse
 import org.junit.Before
@@ -13,6 +14,7 @@ import java.nio.channels.Channels
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -53,13 +55,46 @@ class UnixTunnelBackendTest {
             assertEquals("unavailable", backend.request(ServiceRequest(command = "status")).state)
         } }
     }
-    @Test fun cancellingTheCallerInterruptsAnInFlightSocketRead() {
+    @Test fun cancellingTheCallerInterruptsAndRethrowsCancellationException() {
         val accepted = CountDownLatch(1)
-        fixture({ channel -> accepted.countDown(); val b=ByteBuffer.allocate(1024); while(channel.read(b)>=0)b.clear() }) { backend -> runBlocking {
-            val job = launch(Dispatchers.Default) { backend.request(ServiceRequest(command = "status")) }
+        fixture({ channel -> accepted.countDown(); val b = ByteBuffer.allocate(1024); while (channel.read(b) >= 0) b.clear() }) { backend -> runBlocking {
+            var outcome: ServiceStatus? = null
+            var caught: Throwable? = null
+            val job = launch(Dispatchers.Default) {
+                try {
+                    outcome = backend.request(ServiceRequest(command = "status"))
+                } catch (t: Throwable) {
+                    caught = t
+                    throw t
+                }
+            }
             assertTrue(accepted.await(2, TimeUnit.SECONDS))
             withTimeout(2000) { job.cancelAndJoin() }
             assertTrue(job.isCancelled)
+            assertNull("Cancelled request must not return a status", outcome)
+            assertTrue("Expected CancellationException, got $caught", caught is CancellationException)
         } }
+    }
+    @Test fun unreadableOrUnwritableSocketReportsServiceDeniedWithoutLocaleStrings() {
+        val directory = Files.createTempDirectory("yumi-unix-perm-")
+        val socket = directory.resolve("denied.sock")
+        try {
+            ServerSocketChannel.open(StandardProtocolFamily.UNIX).use { server ->
+                server.bind(UnixDomainSocketAddress.of(socket))
+                Files.setPosixFilePermissions(socket, PosixFilePermissions.fromString("---------"))
+                // Skip if running as root (UID 0 bypasses POSIX DAC checks).
+                org.junit.Assume.assumeFalse(Files.isReadable(socket) && Files.isWritable(socket))
+                assertEquals("service_denied", DesktopPlatform.diagnoseUnixSocket(socket))
+                runBlocking {
+                    val status = UnixTunnelBackend(socket, 1000).request(ServiceRequest(command = "status"))
+                    assertEquals("unavailable", status.state)
+                    assertEquals("service_denied", status.error)
+                }
+            }
+        } finally {
+            runCatching { Files.setPosixFilePermissions(socket, PosixFilePermissions.fromString("rwx------")) }
+            Files.deleteIfExists(socket)
+            Files.deleteIfExists(directory)
+        }
     }
 }

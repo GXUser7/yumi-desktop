@@ -210,21 +210,33 @@ class DesktopPlatformSecurityTest {
         diagThread.join(2_000)
 
         // 2. Trusted owner roundtrip with fragmented UTF-8 reply.
+        fun readPipeExact(pipe: com.sun.jna.platform.win32.WinNT.HANDLE, count: Int): ByteArray {
+            val out = ByteArray(count)
+            var off = 0
+            val read = IntByReference()
+            val scratch = ByteArray(minOf(count, 4096))
+            while (off < count) {
+                assertTrue(Kernel32.INSTANCE.ReadFile(pipe, scratch, minOf(scratch.size, count - off), read, null))
+                assertTrue(read.value > 0)
+                System.arraycopy(scratch, 0, out, off, read.value)
+                off += read.value
+            }
+            return out
+        }
+
         var currentSid = ""
         val (okPipe, okThread) = startPipeServer { pipe, ownerSid ->
             currentSid = ownerSid
-            val lenBuf = ByteArray(4)
-            val read = IntByReference()
-            assertTrue(Kernel32.INSTANCE.ReadFile(pipe, lenBuf, 4, read, null))
-            val reqLen = ByteBuffer.wrap(lenBuf).int
-            val reqBuf = ByteArray(reqLen)
-            assertTrue(Kernel32.INSTANCE.ReadFile(pipe, reqBuf, reqLen, read, null))
+            val reqLen = ByteBuffer.wrap(readPipeExact(pipe, 4)).int
+            readPipeExact(pipe, reqLen)
             val body = """{"version":1,"state":"connected","detail":"служба","future":true}""".toByteArray()
             val frame = ByteBuffer.allocate(4 + body.size).putInt(body.size).put(body).array()
             val written = IntByReference()
             for (b in frame) {
-                Kernel32.INSTANCE.WriteFile(pipe, byteArrayOf(b), 1, written, null)
+                assertTrue(Kernel32.INSTANCE.WriteFile(pipe, byteArrayOf(b), 1, written, null))
             }
+            // Wait until the client drains every byte before DisconnectNamedPipe discards buffered data.
+            Kernel32.INSTANCE.FlushFileBuffers(pipe)
         }
         // Discover current user's SID from an ephemeral pipe before calling with expectedOwnerSid = currentSid.
         val probePipe = Kernel32.INSTANCE.CreateNamedPipe(

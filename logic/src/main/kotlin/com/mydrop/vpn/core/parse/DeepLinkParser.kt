@@ -91,7 +91,8 @@ object DeepLinkParser {
             return DeepLinkPayload.Unsupported(text, UnsupportedReason.NoPayload)
         }
 
-        val fragment = payloadWithFragment.substringAfter('#', "")
+        val rawFragment = payloadWithFragment.substringAfter('#', "")
+        val fragment = rawFragment
             .takeIf { it.isNotEmpty() }
             ?.let(::urlDecode)
         val payloadWithQuery = payloadWithFragment.substringBefore('#')
@@ -130,7 +131,20 @@ object DeepLinkParser {
             action in subscriptionActions && isHttpUrl ->
                 DeepLinkPayload.AddSubscription(decoded, name)
 
-            decoded.contains("://") -> parseProxyPayload(decoded, name)
+            decoded.contains("://") -> {
+                val proxyTarget = if (
+                    !isHttpUrl &&
+                    encoded == null &&
+                    queryName == null &&
+                    rawFragment.isNotEmpty() &&
+                    '#' !in decoded
+                ) {
+                    "$decoded#$rawFragment"
+                } else {
+                    decoded
+                }
+                parseProxyPayload(proxyTarget, name)
+            }
 
             action.isEmpty() -> DeepLinkPayload.Unsupported(text, UnsupportedReason.UnknownFormat)
 
@@ -150,7 +164,18 @@ object DeepLinkParser {
     private fun parseProxyPayload(text: String, name: String? = null): DeepLinkPayload {
         // A share blob may hold many links at once (QR codes of whole bundles do this).
         val nodes = ProxyUriParser.parseAll(text)
-        if (nodes.isNotEmpty()) return DeepLinkPayload.AddNodes(nodes)
+        if (nodes.isNotEmpty()) {
+            val resolved = if (
+                name != null &&
+                nodes.size == 1 &&
+                nodes.single().name == "${nodes.single().server}:${nodes.single().port}"
+            ) {
+                listOf(nodes.single().copy(name = name))
+            } else {
+                nodes
+            }
+            return DeepLinkPayload.AddNodes(resolved)
+        }
 
         // Servers first: a page of mixed text usually carries both, and a resolver is the thing
         // the user can still add by hand if this misses it.

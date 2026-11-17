@@ -62,7 +62,9 @@ class DemoBackend : TunnelBackend {
 
 /** A subscription's worth of made-up servers, written where the model will read them. */
 fun seedDemo(directory: File, nodeCount: Int = 6) {
-    directory.listFiles()?.forEach { it.deleteRecursively() }
+    directory.listFiles()
+        ?.filter { it.name != "instance.lock" && it.name != "activate" }
+        ?.forEach { it.deleteRecursively() }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     try {
         val settings = SettingsRepository(directory, scope)
@@ -95,7 +97,7 @@ fun seedDemo(directory: File, nodeCount: Int = 6) {
                 server = host,
                 port = 443,
                 settings = settingsFor,
-                tls = TlsOptions(serverName = "www.example.com", reality = if (protocol == Protocol.VLESS) RealityOptions(publicKey = "demo", shortId = "0a") else null),
+                tls = TlsOptions(serverName = "www.example.com", reality = if (protocol == Protocol.VLESS) RealityOptions(publicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", shortId = "0a") else null),
                 subscriptionId = subscription.id,
             ).identified()
         }

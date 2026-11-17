@@ -53,6 +53,8 @@ import com.mydrop.vpn.core.format.ValueAndUnit
 import com.mydrop.vpn.core.format.daysUntil
 import com.mydrop.vpn.core.format.formatDuration
 import com.mydrop.vpn.core.model.*
+import com.mydrop.vpn.core.net.isNumericAddress
+import com.mydrop.vpn.data.ProfileState
 import com.mydrop.vpn.pairing.*
 import com.mydrop.vpn.shared.R
 import com.mydrop.vpn.ui.components.*
@@ -99,33 +101,36 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     var add by remember { mutableStateOf(false) }
     var pairing by remember { mutableStateOf(false) }
     val openPairing = { pairing = true; model.startPairing() }
+    val planet = remember { PlanetState() }
 
     YumiTheme(settings, desktop.palette) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            ExpressiveBackdrop(animated = desktop.liveBackdrop) {
-                BoxWithConstraints(Modifier.fillMaxSize()) {
-                    val compact = maxHeight < 700.dp || maxWidth < 846.dp
-                    val dense = compact && maxHeight < 600.dp
-                    val targetInset = if (compact) 12.dp else Inset
-                    val inset by animateDpAsState(targetInset, tween(220), label = "window-inset")
-                    val compactTop = minOf(CompactContentTop,
-                        (maxHeight - targetInset * 2 - 8.dp - if (dense) 356.dp else 396.dp).coerceAtLeast(160.dp))
-                    Row(Modifier.fillMaxSize().padding(inset).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(inset)) {
-                        CompositionLocalProvider(LocalCompactLayout provides compact, LocalDenseLayout provides dense, LocalCompactContentTop provides compactTop) {
-                            Dock(model, page, compact) { page = it }
-                            Box(Modifier.weight(1f).fillMaxHeight().testTag("page-content")) {
-                                AnimatedContent(
-                                    targetState = page,
-                                    transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) },
-                                    label = "page",
-                                ) { shown ->
-                                    when (shown) {
-                                        Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
-                                        Page.Servers -> ServersPage(model)
-                                        Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
-                                        Page.Routing -> RoutingPage(model)
-                                        Page.Speed -> SpeedPage(model)
-                                        Page.Settings -> SettingsPage(model, onInstallUpdate)
+            CompositionLocalProvider(LocalPlanetState provides planet) {
+                ExpressiveBackdrop(animated = desktop.liveBackdrop) {
+                    BoxWithConstraints(Modifier.fillMaxSize()) {
+                        val compact = maxHeight < 700.dp || maxWidth < 846.dp
+                        val dense = compact && maxHeight < 600.dp
+                        val targetInset = if (compact) 12.dp else Inset
+                        val inset by animateDpAsState(targetInset, tween(220), label = "window-inset")
+                        val compactTop = minOf(CompactContentTop,
+                            (maxHeight - targetInset * 2 - 8.dp - if (dense) 356.dp else 396.dp).coerceAtLeast(160.dp))
+                        Row(Modifier.fillMaxSize().padding(inset).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(inset)) {
+                            CompositionLocalProvider(LocalCompactLayout provides compact, LocalDenseLayout provides dense, LocalCompactContentTop provides compactTop) {
+                                Dock(model, page, compact) { page = it }
+                                Box(Modifier.weight(1f).fillMaxHeight().testTag("page-content")) {
+                                    AnimatedContent(
+                                        targetState = page,
+                                        transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) },
+                                        label = "page",
+                                    ) { shown ->
+                                        when (shown) {
+                                            Page.Connect -> ConnectPage(model, onServers = { page = Page.Servers }, onPair = openPairing)
+                                            Page.Servers -> ServersPage(model)
+                                            Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
+                                            Page.Routing -> RoutingPage(model)
+                                            Page.Speed -> SpeedPage(model)
+                                            Page.Settings -> SettingsPage(model, onInstallUpdate)
+                                        }
                                     }
                                 }
                             }
@@ -134,7 +139,7 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
                 }
             }
             if (add) ImportDialog(model, onClose = { add = false })
-            if (pairing) PairingDialog(model, onClose = { pairing = false; model.pairing.stop() })
+            if (pairing) PairingDialog(model, onClose = { pairing = false; model.stopPairing() })
             notice?.let {
                 AlertDialog(
                     onDismissRequest = { model.message.value = null },
@@ -394,7 +399,7 @@ private val ReadingWidth = 860.dp
             translationY = (1f - entry.value) * 8.dp.toPx()
         } else Modifier)) {
             if (narrow) {
-                CompactConnectPage(m, status, traffic, node, latency, onServers, onPair)
+                CompactConnectPage(m, status, traffic, profiles, node, latency, onServers, onPair)
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Column(Modifier.weight(2f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -433,7 +438,7 @@ private val ReadingWidth = 860.dp
 
 /** A small window keeps the same hierarchy without squeezing two poster columns together. */
 @Composable private fun CompactConnectPage(
-    m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, node: ProxyNode?, latency: LatencyResult?,
+    m: DesktopModel, status: ServiceStatus, traffic: TrafficStats, profiles: ProfileState, node: ProxyNode?, latency: LatencyResult?,
     onServers: () -> Unit, onPair: () -> Unit,
 ) {
     val groupHeight by animateDpAsState(LocalCompactContentTop.current - 12.dp, tween(220), label = "compact-connection-height")
@@ -456,7 +461,7 @@ private val ReadingWidth = 860.dp
         } else if (status.state in listOf("failed", "unavailable")) {
             ConnectionProblem(m, status)
         } else if (status.state !in listOf("connected", "connecting", "disconnecting") &&
-            m.profiles.state.value.nodes.isEmpty() && m.profiles.state.value.subscriptions.isEmpty()) {
+            profiles.nodes.isEmpty() && profiles.subscriptions.isEmpty()) {
             QuietButton(m.text("Перенести с телефона", "Transfer from phone"), Modifier.fillMaxWidth(), Icons.Rounded.QrCodeScanner, onClick = onPair)
         } else {
             val semantic = LocalSemanticColors.current
@@ -512,8 +517,8 @@ private val ReadingWidth = 860.dp
     val ink = when {
         latency?.failed == true -> MaterialTheme.colorScheme.error
         value == null -> MaterialTheme.colorScheme.onSurfaceVariant
-        value < 80 -> semantic.latencyFast
-        value < 180 -> semantic.latencyMedium
+        value < 150 -> semantic.latencyFast
+        value < 400 -> semantic.latencyMedium
         else -> semantic.latencySlow
     }
     val interaction = remember { MutableInteractionSource() }
@@ -1511,16 +1516,7 @@ private val ReadingWidth = 860.dp
             )
             AccentButton(m.text("Сохранить соединение", "Save connection settings")) {
                 val value = mtu.toIntOrNull()
-                val resolver = runCatching {
-                    val raw = dns.trim()
-                    if ("://" in raw) {
-                        val uri = java.net.URI(raw)
-                        require(uri.scheme in listOf("https", "tcp", "udp") && !uri.host.isNullOrBlank() && uri.userInfo == null)
-                    } else {
-                        RuleValidation.domain(raw).let {}
-                    }
-                    raw
-                }.recoverCatching { RuleValidation.network(dns.trim()).also { require('/' !in it) } }.getOrNull()
+                val resolver = validateRemoteDns(dns)
                 if (value == null || value !in 1280..9000 || resolver == null) invalid = true
                 else m.changeSettings({ it.copy(remoteDns = resolver, mtu = value) }, true)
             }
@@ -1625,7 +1621,7 @@ private fun intervalLabel(m: DesktopModel, minutes: Int): String = when {
     val state by m.pairing.state.collectAsState()
     val addresses by m.localAddresses.collectAsState()
     val selected by m.selectedAddress.collectAsState()
-    DisposableEffect(Unit) { onDispose { m.pairing.stop() } }
+    DisposableEffect(Unit) { onDispose { m.stopPairing() } }
     AlertDialog(
         onDismissRequest = onClose,
         shape = DialogShape,
@@ -1706,4 +1702,48 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
 
 private val WorldLandMask: ByteArray by lazy {
     checkNotNull(DesktopModel::class.java.getResourceAsStream("/world_land.bin")).use { it.readBytes() }
+}
+
+internal fun validateRemoteDns(rawInput: String): String? {
+    val raw = rawInput.trim()
+    if (raw.isEmpty()) return null
+    if ("://" in raw) {
+        return runCatching {
+            val uri = java.net.URI(raw)
+            val scheme = uri.scheme?.lowercase()
+            val host = uri.host
+            require(
+                scheme in setOf("https", "tcp", "udp") &&
+                    !host.isNullOrBlank() &&
+                    uri.userInfo == null &&
+                    uri.rawFragment == null &&
+                    (uri.port == -1 || uri.port in 1..65535),
+            )
+            val unwrapped = host.removeSurrounding("[", "]")
+            val normalizedHost = if (isNumericAddress(unwrapped)) {
+                val canonical = RuleValidation.network(unwrapped).also { require('/' !in it) }
+                if (':' in canonical) "[$canonical]" else canonical
+            } else {
+                require(!host.startsWith("*."))
+                RuleValidation.domain(host).also {
+                    require(it != "localhost" && it != "fakedns")
+                }
+            }
+            val portPart = if (uri.port != -1) ":${uri.port}" else ""
+            val pathPart = uri.rawPath.orEmpty()
+            val queryPart = uri.rawQuery?.let { "?$it" }.orEmpty()
+            require(scheme == "https" || (pathPart.isEmpty() && queryPart.isEmpty()))
+            "$scheme://$normalizedHost$portPart$pathPart$queryPart"
+        }.getOrNull()
+    }
+    if (!raw.startsWith("*.")) {
+        runCatching {
+            val domain = RuleValidation.domain(raw)
+            require(domain != "localhost" && domain != "fakedns")
+            return domain
+        }
+    }
+    return runCatching {
+        RuleValidation.network(raw).also { require('/' !in it) }
+    }.getOrNull()
 }

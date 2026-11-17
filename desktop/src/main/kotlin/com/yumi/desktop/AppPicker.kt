@@ -36,6 +36,8 @@ import com.yumi.desktop.platform.DesktopApp
 import com.yumi.desktop.platform.DesktopPlatform
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.awt.KeyboardFocusManager
+import java.awt.Window
 import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
 
@@ -158,7 +160,10 @@ fun AppPickerDialog(m: DesktopModel, selected: List<String>, onDone: (List<Strin
                             // file manager shows is a name the rule can carry.
                             chooser.fileSelectionMode = JFileChooser.FILES_AND_DIRECTORIES
                         }
-                        if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
+                        val owner = KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow
+                            ?: Window.getWindows().firstOrNull { it.isActive }
+                            ?: Window.getWindows().firstOrNull { it.isShowing }
+                        if (chooser.showOpenDialog(owner) == JFileChooser.APPROVE_OPTION) {
                             runCatching { RuleValidation.application(chooser.selectedFile.name) }.getOrNull()?.let { name ->
                                 if (name.lowercase() !in chosenKeys) chosen = chosen + name
                             }
@@ -229,11 +234,36 @@ fun AppIcon(icon: ImageBitmap?, fallback: androidx.compose.ui.graphics.vector.Im
     }
 }
 
-/** The icon Explorer shows for [path], loaded off the UI thread and remembered. */
+private object AppIconCache {
+    private const val MAX_ENTRIES = 256
+    private val missing = Any()
+    private val entries = object : LinkedHashMap<String, Any>(MAX_ENTRIES, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Any>): Boolean = size > MAX_ENTRIES
+    }
+
+    fun get(path: String): Pair<Boolean, ImageBitmap?> = synchronized(this) {
+        when (val cached = entries[path]) {
+            null -> false to null
+            missing -> true to null
+            else -> true to (cached as ImageBitmap)
+        }
+    }
+
+    fun put(path: String, bitmap: ImageBitmap?) = synchronized(this) {
+        entries[path] = bitmap ?: missing
+    }
+}
+
+/** The icon Explorer shows for [path], loaded off the UI thread and cached in an LRU map. */
 @Composable
 fun rememberAppIcon(path: String?): ImageBitmap? {
-    val icon by produceState<ImageBitmap?>(null, path) {
-        value = withContext(Dispatchers.IO) { AppCatalog.icon(path, 32)?.toComposeImageBitmap() }
+    val cached = remember(path) { if (path.isNullOrBlank()) true to null else AppIconCache.get(path) }
+    val icon by produceState(cached.second, path) {
+        if (!path.isNullOrBlank() && !cached.first) {
+            val loaded = withContext(Dispatchers.IO) { AppCatalog.icon(path, 32)?.toComposeImageBitmap() }
+            AppIconCache.put(path, loaded)
+            value = loaded
+        }
     }
     return icon
 }

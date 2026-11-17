@@ -20,6 +20,7 @@ import java.awt.Rectangle
 import java.awt.Robot
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.file.Files
 import javax.imageio.ImageIO
 
 fun main(args: Array<String>) {
@@ -28,12 +29,23 @@ fun main(args: Array<String>) {
     val preview = "--ui-preview" in args
     val demo = "--ui-demo" in args || benchmark || preview
     val smoke = "--ui-smoke" in args || demo
-    if(smoke) System.setProperty("yumi.dataDir",File(if(demo) ".local/ui-demo" else ".local/ui-smoke").absolutePath)
+    if (smoke) {
+        val name = if (demo) "ui-demo" else "ui-smoke"
+        val localDir = File(".local", name).absoluteFile
+        val smokeDir = if (isWritableDirectory(localDir)) localDir
+        else File(System.getProperty("java.io.tmpdir"), "yumi-$name")
+        System.setProperty("yumi.dataDir", smokeDir.absolutePath)
+    }
     val directory = DesktopPlatform.dataDirectory()
-    if(demo) seedDemo(directory, if (benchmark) 600 else 6)
-    val lockFile = RandomAccessFile(File(directory,"instance.lock"),"rw")
+    val lockFile = RandomAccessFile(File(directory, "instance.lock"), "rw")
     val lock = lockFile.channel.tryLock()
-    if(lock==null){File(directory,"activate").writeText(System.nanoTime().toString());lockFile.close();return}
+    if (lock == null) {
+        File(directory, "activate").writeText(System.nanoTime().toString())
+        lockFile.close()
+        return
+    }
+    runCatching { Files.deleteIfExists(File(directory, "activate").toPath()) }
+    if (demo) seedDemo(directory, if (benchmark) 600 else 6)
     val backend = when {
         demo -> DemoBackend()
         smoke -> object:TunnelBackend {
@@ -43,14 +55,16 @@ fun main(args: Array<String>) {
     }
     val model=DesktopModel(backend,directory)
     application {
-        var visible by remember{mutableStateOf("--tray" !in args)}
+        val traySupported = remember { java.awt.SystemTray.isSupported() }
+        var trayFailed by remember { mutableStateOf(false) }
+        var visible by remember { mutableStateOf("--tray" !in args || !traySupported) }
         var smokePage by remember{mutableStateOf(Page.Connect)}
         val frameProbe = remember { if (benchmark) UiFrameProbe(launchedAt) else null }
         val scope=rememberCoroutineScope()
         val settings by model.settings.settings.collectAsState()
         val status by model.status.collectAsState()
         var closing by remember { mutableStateOf(false) }
-        suspend fun launchReadyUpdate(): Boolean {
+        suspend fun launchReadyUpdate(@Suppress("UNUSED_PARAMETER") relaunch: Boolean): Boolean {
             val ready = model.updates.readyToInstall() ?: return false
             return withContext(Dispatchers.IO) { DesktopPlatform.installUpdate(ready.file) }
         }
@@ -59,9 +73,14 @@ fun main(args: Array<String>) {
                 closing = true
                 scope.launch {
                     try {
-                        if (!smoke && model.desktop.value.autoUpdate && model.updates.installed) runCatching { launchReadyUpdate() }
+                        val shouldUpdate = !smoke && model.desktop.value.autoUpdate && model.updates.installed
                         model.close()
-                    } finally { lock.release(); lockFile.close(); exitApplication() }
+                        if (shouldUpdate) runCatching { launchReadyUpdate(relaunch = false) }
+                    } finally {
+                        runCatching { lock.release() }
+                        runCatching { lockFile.close() }
+                        exitApplication()
+                    }
                 }
             }
             Unit
@@ -70,8 +89,13 @@ fun main(args: Array<String>) {
             if (!closing) {
                 closing = true
                 scope.launch {
-                    if (launchReadyUpdate()) {
-                        try { model.close() } finally { lock.release(); lockFile.close(); exitApplication() }
+                    val launched = runCatching { launchReadyUpdate(relaunch = true) }.getOrDefault(false)
+                    if (launched) {
+                        try { model.close() } finally {
+                            runCatching { lock.release() }
+                            runCatching { lockFile.close() }
+                            exitApplication()
+                        }
                     } else closing = false
                 }
             }
@@ -80,7 +104,6 @@ fun main(args: Array<String>) {
         // The app's own mark, the one the phone wears, as the window icon, the tray icon and —
         // through the .ico beside it in the build script — the icon on the executable itself.
         val icon=remember(::yumiMark)
-        val traySupported = java.awt.SystemTray.isSupported()
         val captureSize = args.firstOrNull { it.startsWith("--ui-size=") }?.substringAfter('=')?.split('x')
         val captureWidth = captureSize?.getOrNull(0)?.toIntOrNull()?.coerceIn(680, 2560) ?: 1280
         val captureHeight = captureSize?.getOrNull(1)?.toIntOrNull()?.coerceIn(600, 1600) ?: 880
@@ -92,20 +115,35 @@ fun main(args: Array<String>) {
             activation++
             Unit
         }
-        if(traySupported && !smoke) YumiTray(icon=icon,onOpen=open) {
+        if (traySupported && !smoke && !trayFailed) YumiTray(
+            icon = icon,
+            onOpen = open,
+            onTrayFailed = { trayFailed = true; visible = true },
+        ) {
             val profiles by model.profiles.state.collectAsState()
+            val activeNode by model.activeNode.collectAsState()
             val pinging by model.pinging.collectAsState()
             val switching by model.switching.collectAsState()
             val language = settings.language
             val strings = remember(language) { Strings { language } }
+            val activeNodeId = (activeNode?.id ?: status.nodeId).takeIf { status.state in listOf("connected", "connecting", "disconnecting") }
             Item(strings.text("Открыть Yumi","Open Yumi"),onClick=open)
             Item(if(status.state in listOf("connected","connecting"))strings.text("Отключить","Disconnect") else strings.text("Подключиться","Connect"),
                 enabled=status.state!="unavailable",onClick={model.toggleConnection()})
             Separator()
-            TrayServers(profiles, strings, pinging, switching || status.state == "connecting", { model.selectNode(it) }, model::pingAll)
+            TrayServers(
+                profiles = profiles,
+                strings = strings,
+                pinging = pinging,
+                switching = switching || status.state == "connecting",
+                activeNodeId = activeNodeId,
+                onSelect = { model.selectNode(it) },
+                onOpen = open,
+                onPing = model::pingAll,
+            )
             Separator();Item(strings.text("Выйти","Exit"),onClick=close)
         }
-        Window(onCloseRequest={if(traySupported&&!smoke)visible=false else close()},visible=visible,title="Yumi Desktop",state=windowState,icon=icon) {
+        Window(onCloseRequest={if(traySupported&&!smoke&&!trayFailed)visible=false else close()},visible=visible,title="Yumi Desktop",state=windowState,icon=icon) {
             LaunchedEffect(Unit){window.minimumSize=Dimension(680,600);if(smoke){window.isAlwaysOnTop=true;window.toFront()}}
             LaunchedEffect(activation) { if (activation > 0) restoreApplicationWindow(window) }
             // The title bar is drawn by Windows, not by us, so the only way it stops being the one
@@ -113,7 +151,9 @@ fun main(args: Array<String>) {
             // the palette and the theme, so it follows both.
             val desktop by model.desktop.state.collectAsState()
             val dark = isDark(settings)
-            val chrome = desktop.palette.scheme(dark)
+            val chrome = desktop.palette.scheme(dark).let {
+                if (dark && settings.amoled) it.toAmoled(desktop.palette.hue, desktop.palette.chroma) else it
+            }
             LaunchedEffect(dark, chrome.background, chrome.onSurfaceVariant) {
                 DesktopPlatform.applyWindowChrome(window.windowHandle, dark, chrome.background.toArgb(), chrome.onSurfaceVariant.toArgb())
             }
@@ -139,9 +179,13 @@ fun main(args: Array<String>) {
                 val detach = checkNotNull(frameProbe).attach(window)
                 onDispose(detach)
             }
-            LaunchedEffect(Unit) {
-                val activation=File(directory,"activate");var stamp=activation.lastModified()
-                while(isActive){delay(500);val next=activation.lastModified();if(next!=stamp){stamp=next;open()}}
+            LaunchedEffect(directory) {
+                val activation = File(directory, "activate").toPath()
+                while (isActive) {
+                    delay(500)
+                    val triggered = withContext(Dispatchers.IO) { runCatching { Files.deleteIfExists(activation) }.getOrDefault(false) }
+                    if (triggered) open()
+                }
             }
             if(benchmark) LaunchedEffect(Unit) {
                 benchmarkUi(model, checkNotNull(frameProbe), { smokePage = it }, { visible = it })
@@ -211,3 +255,11 @@ fun main(args: Array<String>) {
  */
 @Suppress("DEPRECATION")
 private fun yumiMark(): Painter = useResource("icon/yumi.svg") { loadSvgPainter(it, Density(1f)) }
+
+private fun isWritableDirectory(dir: File): Boolean = runCatching {
+    if (!dir.exists() && !dir.mkdirs()) return@runCatching false
+    if (!dir.isDirectory) return@runCatching false
+    val probe = Files.createTempFile(dir.toPath(), ".write-probe-", null)
+    Files.deleteIfExists(probe)
+    true
+}.getOrDefault(false)

@@ -14,6 +14,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 enum class ConnectionHealth { Unchecked, Checking, Reachable, Unreachable }
 
@@ -22,7 +23,7 @@ class DesktopModel(
     val directory: File = DesktopPlatform.dataDirectory(),
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val measureLatency: suspend (ProxyNode, PingMode) -> LatencyResult = if (backend is DemoBackend) backend::measureLatency else LatencyTester()::measure,
-    private val checkTunnel: suspend (ProbeEndpoint) -> Boolean = TunnelHealthProbe()::reachable,
+    private val checkTunnel: suspend (ProbeEndpoint) -> Boolean = DefaultCheckTunnel,
     private val serviceInstaller: (suspend () -> ServiceRepair)? =
         if (backend is UnixTunnelBackend && DesktopPlatform.serviceExecutable() != null) ({ DesktopPlatform.repairService() }) else null,
 ) {
@@ -54,6 +55,7 @@ class DesktopModel(
     /** Session history belongs to the connection, including while choosing a server or in the tray. */
     val trafficHistory = MutableStateFlow<List<TrafficStats>>(emptyList())
     private var trafficEpoch: Long? = null
+    private val busyCount = AtomicInteger(0)
     val busy = MutableStateFlow(false)
     val pinging = MutableStateFlow(false)
     val speed = MutableStateFlow(SpeedTestState())
@@ -67,19 +69,25 @@ class DesktopModel(
     }
     private val commands = Mutex()
     private val subscriptions = Mutex()
+    private val speedLock = Any()
     private data class PingRequest(val sequence: Long = 0, val nodes: List<ProxyNode> = emptyList())
     private val pingRequests = MutableStateFlow(PingRequest())
     private var connectionProbe: Job? = null
     private var tunnelMonitor: Job? = null
-    private var speedJob: Job? = null
-    private var startupConnectPending = desktop.value.connectOnLaunch
-    private var settingsReconnectPending = false
+    @Volatile private var speedJob: Job? = null
+    @Volatile private var pairingStartJob: Job? = null
+    private val statusJob: Job
+    private val refreshJob: Job
+    private val pingJob: Job
+    private val startupRefresh: Job?
+    @Volatile private var startupConnectPending = desktop.value.connectOnLaunch
+    @Volatile private var settingsReconnectPending = false
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
         DeviceIdentity(settings.value.deviceId, System.getProperty("os.name"), System.getProperty("os.version"), "Yumi Desktop")
     }, probeEndpoint = { status.value.probe() })
 
     init {
-        scope.launch {
+        pingJob = scope.launch {
             pingRequests.filter { it.sequence > 0 }.collectLatest { request ->
                 pinging.value = true
                 try { measureServers(request.nodes) }
@@ -97,31 +105,41 @@ class DesktopModel(
         // Applications used to be kept as full paths; the rules are process names now.
         val names = desktop.value.applications.mapNotNull { runCatching { RuleValidation.application(it) }.getOrNull() }.distinct()
         if (names != desktop.value.applications) desktop.update { it.copy(applications = names) }
-        scope.launch {
+        // Once on launch, before any waiting, so startup auto-connect uses an up-to-date server list.
+        startupRefresh = if (settings.value.subscriptionAutoUpdate) {
+            scope.launch { refreshDue(startup = true) }
+        } else null
+        statusJob = scope.launch {
             while (isActive) {
-                commands.withLock {
-                    updateStatus(backend.request(ServiceRequest(command = "status")))
-                    if (settingsReconnectPending && status.value.state == "connected") {
-                        settingsReconnectPending = false
-                        cancelSpeed()
-                        reconnectActive()
-                    } else if (status.value.state in listOf("disconnected", "failed")) {
-                        settingsReconnectPending = false
+                try {
+                    commands.withLock {
+                        updateStatus(backend.request(ServiceRequest(command = "status")))
+                        if (settingsReconnectPending && status.value.state == "connected") {
+                            settingsReconnectPending = false
+                            cancelSpeed()
+                            reconnectActive()
+                        } else if (status.value.state in listOf("disconnected", "failed")) {
+                            settingsReconnectPending = false
+                        }
                     }
-                    connectOnStartup()
+                    if (startupConnectPending && status.value.state == "disconnected") {
+                        if (startupRefresh?.isActive == true) withTimeoutOrNull(4_000) { startupRefresh.join() }
+                        commands.withLock { connectOnStartup() }
+                    } else {
+                        commands.withLock { connectOnStartup() }
+                    }
+                    sampleTraffic()
+                    afterStatus()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Keep polling even if a transient IPC/config error occurred during status or reconnect.
                 }
-                sampleTraffic()
-                afterStatus()
                 delay(1000)
             }
         }
-        scope.launch {
-            // Once on launch, before any waiting. The window is opened to use the tunnel, and the
-            // server list has been sitting untouched since it was last closed — an interval of six
-            // hours meant the first connection of the day went through a list that may no longer
-            // exist. The two-minute floor below is what keeps a restart loop from turning that
-            // into a fetch per launch.
-            if (settings.value.subscriptionAutoUpdate) refreshDue(startup = true)
+        refreshJob = scope.launch {
+            startupRefresh?.join()
             // A minute at a time rather than one long sleep for the whole interval: sleeping the
             // interval meant that changing it in settings did nothing until the sleep already in
             // flight had run out, which on the six-hour setting is most of a day.
@@ -242,12 +260,17 @@ class DesktopModel(
             next.probe()?.let { probe ->
                 tunnelMonitor = scope.launch {
                     while (isActive) {
-                        val started = System.nanoTime()
-                        val reachable = try { checkTunnel(probe) }
-                        catch (cancelled: CancellationException) { throw cancelled }
-                        catch (_: Exception) { false }
+                        val rtt = try {
+                            if (checkTunnel === DefaultCheckTunnel) {
+                                DefaultProbe.probe(probe)
+                            } else {
+                                val started = System.nanoTime()
+                                if (checkTunnel(probe)) ((System.nanoTime() - started) / 1_000_000).toInt().coerceAtLeast(1) else null
+                            }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
                         ensureActive()
-                        publishHealth(next, reachable, ((System.nanoTime() - started) / 1_000_000).toInt().coerceAtLeast(1))
+                        publishHealth(next, rtt != null, rtt ?: 0)
                         delay(CONNECTION_CHECK_MILLIS)
                     }
                 }
@@ -304,6 +327,7 @@ class DesktopModel(
     private suspend fun connectNode(node: ProxyNode?) {
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
         settingsReconnectPending = false
+        val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
         // Preserve geo/service metadata while the connect command is in flight. Dropping it
         // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
         val hotSwap = status.value.state == "connected"
@@ -311,15 +335,21 @@ class DesktopModel(
             switching.value = true
         } else updateStatus(status.value.copy(state = "connecting", nodeId = node.id, error = null, detail = null))
         try {
-            val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
             requestedNode = node
-            updateStatus(backend.request(request))
+            val reply = backend.request(request)
+            updateStatus(reply)
+            if (reply.error == "hot_swap_failed") {
+                if (reply.nodeId != node.id) requestedNode = null
+                val summary = text("Не удалось сменить сервер. Предыдущее соединение сохранено.", "Could not switch servers. The previous connection is still active.")
+                val detail = reply.detail?.trim()?.takeIf { it.isNotEmpty() }
+                message.value = if (detail != null) "$summary\n\n$detail" else summary
+            }
         } finally { switching.value = false }
     }
     fun selectNode(id: String) = action {
         commands.withLock {
             if (profiles.nodes.none { it.id == id }) return@withLock
-            val reconnect = status.value.state == "connected"
+            val reconnect = status.value.state in listOf("connected", "connecting")
             profiles.selectNode(id)
             if (reconnect) { cancelSpeed(); connectSelected() }
         }
@@ -358,31 +388,79 @@ class DesktopModel(
             settingsReconnectPending = true
         }
     }
-    fun importText(raw: String) = action {
-        val value = raw.trim()
-        if (value.startsWith("https://", true) || value.startsWith("http://", true)) {
-            val transfer = SubscriptionTransfer(name = text("Подписка", "Subscription"), url = value)
-            requireNotNull(transfer.validate())
-            refresh(profiles.upsertSubscriptionSource(transfer.name, value, null, emptyMap()))
-        } else {
-            val parsed = SubscriptionParser.parse(value, "manual")
-            require(parsed is SubscriptionBody.Nodes)
-            val supported = parsed.nodes.mapNotNull(XrayConfigFactory::carriable)
-            require(supported.isNotEmpty())
-            profiles.addNodes(supported.map { it.copy(subscriptionId = null) })
+    private suspend inline fun <T> withBusy(block: () -> T): T {
+        if (busyCount.incrementAndGet() > 0) busy.value = true
+        try { return block() }
+        finally { if (busyCount.decrementAndGet() == 0) busy.value = false }
+    }
+
+    private suspend fun importDns(dnsProfiles: List<DnsProfile>) {
+        val first = dnsProfiles.firstOrNull() ?: error("No DNS profile")
+        profiles.addDnsProfiles(dnsProfiles)
+        commands.withLock {
+            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
+            settings.update { it.copy(remoteDns = first.url) }
+            if (previous != ConnectRequestFactory.options(settings.value, desktop.value) &&
+                status.value.state in listOf("connected", "connecting")
+            ) {
+                applyConnectionSettings()
+            }
         }
     }
-    suspend fun refresh(subscription: Subscription) = subscriptions.withLock {
-        busy.value = true
-        try {
+
+    fun importText(raw: String) = action {
+        val value = raw.trim()
+        require(value.isNotEmpty())
+        when (val deepLink = DeepLinkParser.parse(value)) {
+            is DeepLinkPayload.AddSubscription -> {
+                val transfer = SubscriptionTransfer(
+                    name = deepLink.name ?: text("Подписка", "Subscription"),
+                    url = deepLink.url,
+                )
+                val validated = requireNotNull(transfer.validate())
+                val subscription = profiles.upsertSubscriptionSource(validated.name, validated.url, null, emptyMap())
+                refresh(subscription, notifyOnFailure = true)
+            }
+            is DeepLinkPayload.AddNodes -> {
+                val supported = deepLink.nodes.mapNotNull(XrayConfigFactory::carriable)
+                require(supported.isNotEmpty())
+                profiles.addNodes(supported.map { it.copy(subscriptionId = null) })
+            }
+            is DeepLinkPayload.AddDns -> importDns(deepLink.profiles)
+            is DeepLinkPayload.Unsupported -> {
+                val parsed = SubscriptionParser.parse(value, "manual")
+                if (parsed is SubscriptionBody.Nodes) {
+                    val supported = parsed.nodes.mapNotNull(XrayConfigFactory::carriable)
+                    require(supported.isNotEmpty())
+                    profiles.addNodes(supported.map { it.copy(subscriptionId = null) })
+                } else {
+                    val dns = DnsUriParser.parseAll(value)
+                    if (dns.isNotEmpty()) importDns(dns)
+                    else error("Unsupported import payload")
+                }
+            }
+        }
+    }
+
+    suspend fun refresh(subscription: Subscription, notifyOnFailure: Boolean = false) = subscriptions.withLock {
+        withBusy {
             when (val result = subscriptionService.fetch(subscription)) {
                 is SubscriptionUpdate.Success -> if (profiles.state.value.subscriptions.any { it.id == subscription.id }) profiles.applySubscriptionUpdate(
                     subscription.id, result.nodes, result.subscription.userInfo, result.subscription.remoteTitle, result.subscription.webPageUrl)
-                is SubscriptionUpdate.Failure -> profiles.recordSubscriptionError(subscription.id, text("Не удалось обновить подписку", "Subscription refresh failed"))
+                is SubscriptionUpdate.Failure -> {
+                    val errorText = result.message.ifBlank { text("Не удалось обновить подписку", "Subscription refresh failed") }
+                    profiles.recordSubscriptionError(subscription.id, errorText)
+                    if (notifyOnFailure) message.value = errorText
+                }
             }
-        } finally { busy.value = false }
+        }
     }
-    fun refreshAll() = action { profiles.state.value.subscriptions.filter { it.enabled }.forEach { refresh(it) } }
+
+    fun refreshAll() = action {
+        withBusy {
+            profiles.state.value.subscriptions.filter { it.enabled }.forEach { refresh(it) }
+        }
+    }
 
     /**
      * Registers the tunnel service to whoever is running this window.
@@ -438,10 +516,16 @@ class DesktopModel(
     fun removeSubscription(id: String) = action {
         commands.withLock {
             val active = activeNode.value
-            if (active?.subscriptionId == id && status.value.state in listOf("connecting", "connected")) {
+            val saved = connection.value.node
+            if ((active?.subscriptionId == id || saved?.subscriptionId == id) &&
+                (status.value.state in listOf("connecting", "connected", "disconnecting") || status.value.killSwitch)
+            ) {
                 cancelSpeed(); updateStatus(backend.request(ServiceRequest(command = "disconnect")))
             }
             profiles.removeSubscription(id)
+            if (connection.value.node?.subscriptionId == id) {
+                connection.update { ActiveConnection() }
+            }
         }
     }
     /** collectLatest cancels and joins the previous sweep before starting this one. */
@@ -465,7 +549,7 @@ class DesktopModel(
                 profiles.recordLatencies(batch.filter { it.nodeId in ids })
             }
         }
-        val writer = launch { while (isActive) { delay(200); flush() } }
+        val writer = launch { while (isActive) { delay(250); flush() } }
         val mode = settings.value.pingMode
         // A bounded worker pool also avoids creating thousands of waiting coroutines.
         val remaining = java.util.concurrent.ConcurrentLinkedQueue(nodes)
@@ -489,9 +573,19 @@ class DesktopModel(
         }
     }
     fun startPairing() {
-        localAddresses.value = DesktopPlatform.localAddresses()
-        if (selectedAddress.value !in localAddresses.value) selectedAddress.value = localAddresses.value.firstOrNull()
-        pairing.start("Yumi Desktop")
+        pairingStartJob?.cancel()
+        pairingStartJob = action {
+            val found = withContext(Dispatchers.IO) { DesktopPlatform.localAddresses() }
+            localAddresses.value = found
+            if (selectedAddress.value !in found) selectedAddress.value = found.firstOrNull()
+            currentCoroutineContext().ensureActive()
+            pairing.start("Yumi Desktop")
+        }
+    }
+    fun stopPairing() {
+        pairingStartJob?.cancel()
+        pairingStartJob = null
+        pairing.stop()
     }
     /**
      * Runs one measurement, keeping the trace the screen draws.
@@ -503,40 +597,80 @@ class DesktopModel(
      * only the average it settled on.
      */
     fun startSpeed() {
-        cancelSpeed()
-        val current = status.value
-        if (current.state == "connecting" || current.state == "disconnecting") return
-        val probe = current.probe()
-        speedJob = action {
-            var live = emptyList<Long>()
-            var download = emptyList<Long>()
-            var upload = emptyList<Long>()
-            var phase = SpeedPhase.Idle
-            SpeedTester(logs, strings).measure(probe, activeNode.value?.name).collect { next ->
-                if (next.phase != phase) {
-                    when (phase) {
-                        SpeedPhase.Download -> download = live
-                        SpeedPhase.Upload -> upload = live
-                        else -> Unit
+        synchronized(speedLock) {
+            speedJob?.cancel()
+            speed.value = SpeedTestState()
+            val current = status.value
+            if (current.state in listOf("connecting", "disconnecting")) {
+                speedJob = null
+                return
+            }
+            val probe = current.probe()
+            speedJob = action {
+                val myJob = currentCoroutineContext()[Job]
+                var live = emptyList<Long>()
+                var download = emptyList<Long>()
+                var upload = emptyList<Long>()
+                var phase = SpeedPhase.Idle
+                SpeedTester(logs, strings).measure(probe, activeNode.value?.name).collect { next ->
+                    currentCoroutineContext().ensureActive()
+                    if (speedJob !== myJob || status.value.state in listOf("connecting", "disconnecting")) return@collect
+                    if (next.phase != phase) {
+                        when (phase) {
+                            SpeedPhase.Download -> download = live
+                            SpeedPhase.Upload -> upload = live
+                            else -> Unit
+                        }
+                        live = emptyList()
+                        phase = next.phase
                     }
-                    live = emptyList()
-                    phase = next.phase
+                    if (next.liveBytesPerSecond > 0) live = (live + next.liveBytesPerSecond).takeLast(240)
+                    synchronized(speedLock) {
+                        if (speedJob === myJob) {
+                            speed.value = next.copy(series = live, downloadSeries = download, uploadSeries = upload)
+                        }
+                    }
                 }
-                if (next.liveBytesPerSecond > 0) live = (live + next.liveBytesPerSecond).takeLast(240)
-                speed.value = next.copy(series = live, downloadSeries = download, uploadSeries = upload)
             }
         }
     }
-    fun cancelSpeed() { speedJob?.cancel(); speedJob = null; speed.value = SpeedTestState() }
+    fun cancelSpeed() {
+        synchronized(speedLock) {
+            speedJob?.cancel()
+            speedJob = null
+            speed.value = SpeedTestState()
+        }
+    }
     suspend fun close() {
-        pairing.stop(); cancelSpeed()
-        commands.withLock { if (status.value.state in listOf("connected","connecting")) backend.request(ServiceRequest(command = "disconnect")) }
-        scope.cancel()
+        pairingStartJob?.cancel()
+        runCatching { pairing.stop() }
+        cancelSpeed()
+        statusJob.cancel()
+        refreshJob.cancel()
+        pingJob.cancel()
+        connectionProbe?.cancel()
+        tunnelMonitor?.cancel()
+        try {
+            withTimeoutOrNull(5_000) {
+                commands.withLock {
+                    if (status.value.state in listOf("connected", "connecting", "disconnecting") || status.value.killSwitch) {
+                        updateStatus(backend.request(ServiceRequest(command = "disconnect")))
+                    }
+                }
+            }
+        } finally {
+            runCatching { connection.update { ActiveConnection() } }
+            activeNode.value = null
+            requestedNode = null
+            scope.cancel()
+        }
     }
 
     private companion object {
         const val CONNECTION_CHECK_MILLIS = 15_000L
         /** How stale a list has to be for opening the window to be a reason to refresh it. */
         const val STARTUP_FLOOR_MILLIS = 2 * 60_000L
+        val DefaultProbe = TunnelHealthProbe()
+        val DefaultCheckTunnel: suspend (ProbeEndpoint) -> Boolean = { DefaultProbe.reachable(it) }
     }
 }

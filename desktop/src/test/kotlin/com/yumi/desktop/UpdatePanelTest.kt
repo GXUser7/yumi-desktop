@@ -25,10 +25,18 @@ class UpdatePanelTest {
         model.desktop.update { it.copy(autoUpdate = false) }
         val release = DesktopRelease("1.1.0", "", "", "", 100)
         val finish = CompletableDeferred<Unit>()
+        var failDownload = false
+        var checks = 0
+        var downloads = 0
         val updater = DesktopUpdater(model.scope, object : UpdateSource {
-            override suspend fun latest() = release
+            override suspend fun latest(): DesktopRelease {
+                checks++
+                return release
+            }
             override suspend fun download(release: DesktopRelease, progress: (Long, Long) -> Unit): VerifiedUpdate {
+                downloads++
                 progress(50, 100)
+                if (failDownload) error("network error")
                 finish.await()
                 return VerifiedUpdate(release, File(directory, "test-installer"), "not-executed")
             }
@@ -43,8 +51,19 @@ class UpdatePanelTest {
                 }
                 onNodeWithText("Проверить обновления").performClick()
                 waitUntil { updater.state.value is DesktopUpdateState.Available }
+                failDownload = true
                 onNodeWithText("Скачать обновление").performClick()
-                waitUntil { updater.state.value is DesktopUpdateState.Downloading }
+                waitUntil { updater.state.value is DesktopUpdateState.Failed }
+                // Check for updates must always re-check instead of silently reusing failed download.
+                val checksBefore = checks
+                onNodeWithText("Проверить обновления").performClick()
+                waitUntil { checks == checksBefore + 1 && updater.state.value is DesktopUpdateState.Available }
+                onNodeWithText("Скачать обновление").performClick()
+                waitUntil { updater.state.value is DesktopUpdateState.Failed }
+                failDownload = false
+                val downloadsBefore = downloads
+                onNodeWithText("Повторить").performClick()
+                waitUntil { downloads == downloadsBefore + 1 && updater.state.value is DesktopUpdateState.Downloading }
                 onNodeWithText("Скачивается 1.1.0 · 50 %").assertExists()
                 onNodeWithText("Отмена").performClick()
                 waitUntil { updater.state.value is DesktopUpdateState.Available }

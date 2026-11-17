@@ -280,6 +280,8 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
     val lighting = remember { arrayOf(Offset(-0.55f, -0.75f)) }
     var dimensions by remember { mutableStateOf(IntSize.Zero) }
     val dispatcher = LocalBackdropDispatcher.current
+    val currentDimensions by rememberUpdatedState(dimensions)
+    val currentDensity by rememberUpdatedState(density)
     val currentPalette by rememberUpdatedState(palette)
     val currentRunning by rememberUpdatedState(running)
     val currentActive by rememberUpdatedState(active)
@@ -288,20 +290,29 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
     DisposableEffect(state) {
         onDispose { state.scene?.close(); state.scene = null }
     }
-    LaunchedEffect(dimensions, density) {
-        if (dimensions.width <= 0 || dimensions.height <= 0) return@LaunchedEffect
-        var ownedRenderer: SceneRenderer? = null
+    LaunchedEffect(Unit) {
+        val renderer = SceneRenderer()
         var pending: SceneFrame? = null
+        var preparedSize = IntSize.Zero
+        var preparedDensity: Density? = null
         try {
-            withContext(dispatcher) { ownedRenderer = SceneRenderer(dimensions, density) }
-            val renderer = checkNotNull(ownedRenderer)
             var last = 0L
             var lastX = window.x
             var lastY = window.y
             var wasKnown = window.known
             while (isActive) {
+                var targetSize = currentDimensions
+                var targetDensity = currentDensity
+                if (targetSize.width <= 0 || targetSize.height <= 0) {
+                    snapshotFlow { currentDimensions }.first { it.width > 0 && it.height > 0 }
+                    targetSize = currentDimensions
+                    targetDensity = currentDensity
+                    last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
+                }
                 if (!currentActive && state.scene != null) {
                     snapshotFlow { currentActive }.first { it }
+                    targetSize = currentDimensions
+                    targetDensity = currentDensity
                     last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
                 }
                 val animateFrame = currentRunning
@@ -312,19 +323,31 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                     val x = window.x
                     val y = window.y
                     val moved = animateFrame && window.known && wasKnown
-                    motion.step(dt, if (moved) (x - lastX) * density.density else 0f,
-                        if (moved) (y - lastY) * density.density else 0f, shapes, min(dimensions.width, dimensions.height) * 0.3f)
+                    val frameSize = currentDimensions
+                    val frameDensity = currentDensity
+                    motion.step(dt, if (moved) (x - lastX) * frameDensity.density else 0f,
+                        if (moved) (y - lastY) * frameDensity.density else 0f, shapes, min(frameSize.width, frameSize.height) * 0.3f)
                     lastX = x; lastY = y; wasKnown = window.known
                     val target = Offset(-0.55f + state.pointer.x * 0.35f, -0.75f + state.pointer.y * 0.3f)
                     lighting[0] += (target - lighting[0]) * (1f - kotlin.math.exp(-2.5f * dt))
                     now
                 }
+                targetSize = currentDimensions
+                targetDensity = currentDensity
+                if (targetSize.width <= 0 || targetSize.height <= 0) continue
                 val time = timeline[0]
                 val light = lighting[0].normalised()
                 val pointer = state.pointer
                 val pose = motion.pose()
                 val renderedPalette = currentPalette
-                withContext(dispatcher) { pending = renderer.render(renderedPalette, time, light, pointer, pose) }
+                withContext(dispatcher) {
+                    if (preparedSize != targetSize || preparedDensity != targetDensity) {
+                        renderer.prepare(targetSize, targetDensity)
+                        preparedSize = targetSize
+                        preparedDensity = targetDensity
+                    }
+                    pending = renderer.render(renderedPalette, time, light, pointer, pose)
+                }
                 val previous = state.scene
                 state.scene = checkNotNull(pending)
                 pending = null
@@ -332,8 +355,16 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                 state.recorded()
                 previous?.close()
                 if (!currentRunning) {
-                    snapshotFlow { Triple(currentActive, currentRunning, currentPalette) }
-                        .first { (shown, moving, colors) -> shown && (moving || colors != renderedPalette) }
+                    snapshotFlow {
+                        listOf(currentActive, currentRunning, currentPalette, currentDimensions, currentDensity)
+                    }.first {
+                        currentActive && (
+                            currentRunning ||
+                                currentPalette != renderedPalette ||
+                                currentDimensions != targetSize ||
+                                currentDensity != targetDensity
+                            )
+                    }
                     last = 0L; lastX = window.x; lastY = window.y; wasKnown = window.known
                     continue
                 }
@@ -343,7 +374,7 @@ fun ExpressiveBackdrop(animated: Boolean, content: @Composable () -> Unit) {
                 if (remaining > 0) delay(remaining)
             }
         } finally {
-            withContext(NonCancellable + dispatcher) { pending?.close(); ownedRenderer?.close() }
+            withContext(NonCancellable + dispatcher) { pending?.close(); renderer.close() }
         }
     }
 
@@ -374,8 +405,7 @@ internal class SceneFrame(val image: Image, val frost: Image) : AutoCloseable {
     override fun close() { image.close(); frost.close() }
 }
 
-private class SceneRenderer(dimensions: IntSize, private val density: Density) : AutoCloseable {
-    private val full = Size(dimensions.width.toFloat(), dimensions.height.toFloat())
+private class SceneRenderer : AutoCloseable {
     private val shapes = sceneShapes()
     private val farIndices = shapes.indices.filter { shapes[it].depth < 0.6f }
     private val nearIndices = shapes.indices.filter { shapes[it].depth >= 0.6f }
@@ -383,8 +413,15 @@ private class SceneRenderer(dimensions: IntSize, private val density: Density) :
     private val near = FrostBuffer(org.jetbrains.skia.FilterTileMode.DECAL)
     private val scene = SceneBuffer()
     private val frost = FrostBuffer(retainedFrames = 2)
-    val shrink = shrinkFor(FrostBlur.value * density.density)
-    init {
+    private var full = Size.Zero
+    private var density = Density(1f)
+    var shrink = 8f
+        private set
+
+    fun prepare(dimensions: IntSize, density: Density) {
+        this.density = density
+        full = Size(dimensions.width.toFloat(), dimensions.height.toFloat())
+        shrink = shrinkFor(FrostBlur.value * density.density)
         far.prepare(scaled(full, 4f), 8f * density.density / 4f)
         near.prepare(scaled(full, 2f), 3f * density.density / 2f)
         scene.prepare(scaled(full, 2f))

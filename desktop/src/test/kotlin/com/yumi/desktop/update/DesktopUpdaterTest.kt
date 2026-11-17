@@ -10,7 +10,7 @@ import kotlin.test.*
 @OptIn(ExperimentalCoroutinesApi::class)
 class DesktopUpdaterTest {
     private val release = DesktopRelease("0.3.0", "", "", "", 1)
-    private class Source(val release: DesktopRelease) : UpdateSource {
+    private class Source(var release: DesktopRelease) : UpdateSource {
         var checks = 0
         var downloads = 0
         var failure = false
@@ -22,7 +22,7 @@ class DesktopUpdaterTest {
         }
     }
 
-    @Test fun backgroundChecksAndDownloadsOnceThenPreservesReadyState() = runTest {
+    @Test fun backgroundChecksAndDownloadsOnceThenPreservesReadyStateUnlessNewerReleaseArrives() = runTest {
         val source = Source(release)
         val settings = MutableStateFlow(DesktopSettings())
         val updater = DesktopUpdater(backgroundScope, source, settings, "0.2.2", true, true, StandardTestDispatcher(testScheduler))
@@ -32,7 +32,28 @@ class DesktopUpdaterTest {
         source.failure = true
         updater.check().join()
         assertIs<DesktopUpdateState.Ready>(updater.state.value)
-        assertEquals(1, source.checks)
+        assertEquals(2, source.checks)
+        assertEquals(1, source.downloads)
+        source.failure = false
+        updater.check().join()
+        assertEquals(3, source.checks)
+        assertEquals(1, source.downloads)
+        source.release = DesktopRelease("0.4.0", "", "", "", 1)
+        updater.check().join()
+        val ready = assertIs<DesktopUpdateState.Ready>(updater.state.value)
+        assertEquals("0.4.0", ready.update.release.version)
+        assertEquals(2, source.downloads)
+    }
+
+    @Test fun disablingAutoUpdateCancelsInFlightBackgroundDownload() = runTest {
+        val source = Source(release).apply { hold = CompletableDeferred() }
+        val settings = MutableStateFlow(DesktopSettings(autoUpdate = true))
+        val updater = DesktopUpdater(backgroundScope, source, settings, "0.2.2", true, true, StandardTestDispatcher(testScheduler))
+        advanceTimeBy(15_001); runCurrent()
+        assertIs<DesktopUpdateState.Downloading>(updater.state.value)
+        settings.value = settings.value.copy(autoUpdate = false)
+        runCurrent()
+        assertIs<DesktopUpdateState.Available>(updater.state.value)
     }
 
     @Test fun automaticUpdatesCanBeDisabledButManualChecksStillWork() = runTest {

@@ -35,6 +35,10 @@ fun TrafficSparkline(
     uploadColor: Color,
     modifier: Modifier = Modifier,
 ) {
+    val downloadPath = remember { Path() }
+    val fillPath = remember { Path() }
+    val uploadPath = remember { Path() }
+
     Canvas(modifier) {
         if (downloadHistory.size < 2) return@Canvas
 
@@ -44,22 +48,19 @@ fun TrafficSparkline(
             1L,
         ).toFloat()
 
-        fun pointsOf(series: List<Long>): List<Offset> {
-            val stepX = size.width / (series.size - 1).coerceAtLeast(1)
-            return series.mapIndexed { index, value ->
-                Offset(index * stepX, size.height - (value / peak) * size.height * 0.92f)
-            }
-        }
+        val downStepX = size.width / (downloadHistory.size - 1).coerceAtLeast(1)
+        val (firstX, lastX) = buildSmoothPath(
+            path = downloadPath,
+            count = downloadHistory.size,
+            xAt = { it * downStepX },
+            yAt = { size.height - (downloadHistory[it] / peak) * size.height * 0.92f },
+        )
 
-        val downloadPoints = pointsOf(downloadHistory)
-        val downloadPath = smoothPath(downloadPoints)
-
-        val fillPath = Path().apply {
-            addPath(downloadPath)
-            lineTo(downloadPoints.last().x, size.height)
-            lineTo(downloadPoints.first().x, size.height)
-            close()
-        }
+        fillPath.reset()
+        fillPath.addPath(downloadPath)
+        fillPath.lineTo(lastX, size.height)
+        fillPath.lineTo(firstX, size.height)
+        fillPath.close()
         drawPath(
             path = fillPath,
             brush = Brush.verticalGradient(
@@ -69,8 +70,15 @@ fun TrafficSparkline(
         drawPath(downloadPath, color = downloadColor, style = Stroke(width = 2.dp.toPx()))
 
         if (uploadHistory.size >= 2) {
+            val upStepX = size.width / (uploadHistory.size - 1).coerceAtLeast(1)
+            buildSmoothPath(
+                path = uploadPath,
+                count = uploadHistory.size,
+                xAt = { it * upStepX },
+                yAt = { size.height - (uploadHistory[it] / peak) * size.height * 0.92f },
+            )
             drawPath(
-                path = smoothPath(pointsOf(uploadHistory)),
+                path = uploadPath,
                 color = uploadColor,
                 style = Stroke(width = 1.5f.dp.toPx()),
             )
@@ -98,6 +106,9 @@ fun SpeedTrace(
      */
     live: Boolean = true,
 ) {
+    val linePath = remember { Path() }
+    val fillPath = remember { Path() }
+
     Canvas(modifier) {
         val baseline = size.height
 
@@ -115,41 +126,57 @@ fun SpeedTrace(
         val span = if (live) WINDOW else samples.size
         val step = size.width / (span - 1).coerceAtLeast(1).toFloat()
 
-        val points = samples.mapIndexed { index, value ->
-            Offset(index * step, baseline - (value / peak) * size.height * 0.88f)
-        }
+        val (firstX, lastX) = buildSmoothPath(
+            path = linePath,
+            count = samples.size,
+            xAt = { it * step },
+            yAt = { baseline - (samples[it] / peak) * size.height * 0.88f },
+        )
 
-        val line = smoothPath(points)
-        val fill = Path().apply {
-            addPath(line)
-            lineTo(points.last().x, baseline)
-            lineTo(points.first().x, baseline)
-            close()
-        }
+        fillPath.reset()
+        fillPath.addPath(linePath)
+        fillPath.lineTo(lastX, baseline)
+        fillPath.lineTo(firstX, baseline)
+        fillPath.close()
         drawPath(
-            path = fill,
+            path = fillPath,
             brush = Brush.verticalGradient(
                 listOf(accent.copy(alpha = 0.30f), accent.copy(alpha = 0f)),
             ),
         )
-        drawPath(line, color = accent, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round))
+        drawPath(linePath, color = accent, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round))
 
         // The head of the trace, so the eye finds the present moment without hunting for it.
-        if (live) drawCircle(color = accent, radius = 3.dp.toPx(), center = points.last())
+        if (live) {
+            val headY = baseline - (samples.last() / peak) * size.height * 0.88f
+            drawCircle(color = accent, radius = 3.dp.toPx(), center = Offset(lastX, headY))
+        }
     }
 }
 
 /** Samples on screen at once: at 150 ms each this is the nine seconds a phase lasts. */
 private const val WINDOW = 60
 
-private fun smoothPath(points: List<Offset>): Path = Path().apply {
-    moveTo(points.first().x, points.first().y)
-    for (index in 1 until points.size) {
-        val previous = points[index - 1]
-        val current = points[index]
-        val midX = (previous.x + current.x) / 2f
-        cubicTo(midX, previous.y, midX, current.y, current.x, current.y)
+private inline fun buildSmoothPath(
+    path: Path,
+    count: Int,
+    xAt: (Int) -> Float,
+    yAt: (Int) -> Float,
+): Pair<Float, Float> {
+    path.reset()
+    val firstX = xAt(0)
+    var prevX = firstX
+    var prevY = yAt(0)
+    path.moveTo(prevX, prevY)
+    for (index in 1 until count) {
+        val currentX = xAt(index)
+        val currentY = yAt(index)
+        val midX = (prevX + currentX) / 2f
+        path.cubicTo(midX, prevY, midX, currentY, currentX, currentY)
+        prevX = currentX
+        prevY = currentY
     }
+    return firstX to prevX
 }
 
 /** Fixed-length rolling window of the most recent samples. */

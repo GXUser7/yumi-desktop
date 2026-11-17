@@ -25,25 +25,43 @@ import java.awt.event.MouseEvent
 internal fun YumiTray(
     icon: Painter,
     onOpen: () -> Unit,
+    onTrayFailed: () -> Unit = {},
     menu: @Composable @MenuComposable MenuScope.() -> Unit,
 ) {
     val currentOnOpen by rememberUpdatedState(onOpen)
+    val currentOnTrayFailed by rememberUpdatedState(onTrayFailed)
     val currentMenu by rememberUpdatedState(menu)
-    val systemTray = remember { SystemTray.getSystemTray() }
+    val systemTray = remember { runCatching { SystemTray.getSystemTray() }.getOrNull() }
+    if (systemTray == null) {
+        LaunchedEffect(Unit) { currentOnTrayFailed() }
+        return
+    }
     val image = remember(icon) {
-        val size = systemTray.trayIconSize
-        icon.toAwtImage(Density(1f), LayoutDirection.Ltr, Size(size.width.toFloat(), size.height.toFloat()))
+        runCatching {
+            val size = systemTray.trayIconSize
+            icon.toAwtImage(Density(1f), LayoutDirection.Ltr, Size(size.width.toFloat(), size.height.toFloat()))
+        }.getOrNull()
+    }
+    if (image == null) {
+        LaunchedEffect(Unit) { currentOnTrayFailed() }
+        return
     }
     val tray = remember {
-        TrayIcon(image, "Yumi").apply {
-            isImageAutoSize = true
-            addActionListener { currentOnOpen() }
-            addMouseListener(object : MouseAdapter() {
-                override fun mouseClicked(event: MouseEvent) {
-                    if (event.button == MouseEvent.BUTTON1 && event.clickCount == 1) currentOnOpen()
-                }
-            })
-        }
+        runCatching {
+            TrayIcon(image, "Yumi").apply {
+                isImageAutoSize = true
+                addActionListener { currentOnOpen() }
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseClicked(event: MouseEvent) {
+                        if (event.button == MouseEvent.BUTTON1 && event.clickCount == 1) currentOnOpen()
+                    }
+                })
+            }
+        }.getOrNull()
+    }
+    if (tray == null) {
+        LaunchedEffect(Unit) { currentOnTrayFailed() }
+        return
     }
     val parent = rememberCompositionContext()
     SideEffect { if (tray.image != image) tray.image = image }
@@ -51,14 +69,18 @@ internal fun YumiTray(
         val popup = PopupMenu()
         tray.popupMenu = popup
         val composition = popup.setContent(parent) { currentMenu() }
-        try { systemTray.add(tray) }
-        catch (failure: Exception) {
+        var added = false
+        try {
+            systemTray.add(tray)
+            added = true
+        } catch (_: Exception) {
             composition.dispose()
             tray.popupMenu = null
-            throw failure
+            currentOnTrayFailed()
+            return@DisposableEffect onDispose {}
         }
         onDispose {
-            systemTray.remove(tray)
+            if (added) runCatching { systemTray.remove(tray) }
             composition.dispose()
             tray.popupMenu = null
         }
@@ -73,6 +95,8 @@ internal fun restoreApplicationWindow(window: Frame) {
     window.requestFocus()
 }
 
+private const val MAX_TRAY_SERVERS = 40
+
 @Composable
 @MenuComposable
 internal fun MenuScope.TrayServers(
@@ -82,23 +106,54 @@ internal fun MenuScope.TrayServers(
     switching: Boolean,
     onSelect: (String) -> Unit,
     onPing: () -> Unit,
+) = TrayServers(
+    profiles = profiles,
+    strings = strings,
+    pinging = pinging,
+    switching = switching,
+    activeNodeId = null,
+    onSelect = onSelect,
+    onOpen = null,
+    onPing = onPing,
+)
+
+@Composable
+@MenuComposable
+internal fun MenuScope.TrayServers(
+    profiles: ProfileState,
+    strings: Strings,
+    pinging: Boolean,
+    switching: Boolean,
+    activeNodeId: String?,
+    onSelect: (String) -> Unit,
+    onOpen: (() -> Unit)? = null,
+    onPing: () -> Unit,
 ) {
     val nodes = profiles.visibleNodes
+    val currentId = activeNodeId ?: profiles.selectedNodeId
+    val displayed = if (nodes.size <= MAX_TRAY_SERVERS) nodes else {
+        val head = nodes.take(MAX_TRAY_SERVERS)
+        val active = currentId?.let { id -> nodes.firstOrNull { it.id == id } }
+        if (active != null && head.none { it.id == active.id }) nodes.take(MAX_TRAY_SERVERS - 1) + active else head
+    }
     Menu(strings.text("Серверы", "Servers")) {
-        if (nodes.isEmpty()) {
+        if (displayed.isEmpty()) {
             Item(strings.text("Нет серверов", "No servers"), enabled = false, onClick = {})
         } else {
             // Native AWT menus have no radio items. Keep the current selection fixed.
-            for (node in nodes) key(node.id) {
+            for (node in displayed) key(node.id) {
                 val latency = profiles.latencies[node.id]
                 val ping = when {
                     latency == null -> "—"
                     latency.failed -> strings.get(R.string.servers_latency_failed)
                     else -> strings.get(R.string.servers_latency_value, latency.millis)
                 }
-                val selected = node.id == profiles.selectedNodeId
+                val selected = node.id == currentId
                 CheckboxItem(text = "${node.name} · $ping", checked = selected,
                     enabled = !selected && !switching, onCheckedChange = { if (it) onSelect(node.id) })
+            }
+            if (nodes.size > displayed.size) {
+                Item(strings.text("Открыть Yumi…", "Open Yumi…"), onClick = { onOpen?.invoke() })
             }
             Separator()
             Item(strings.text(

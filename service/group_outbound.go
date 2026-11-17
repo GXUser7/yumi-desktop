@@ -33,15 +33,16 @@ type OutboundGroup struct {
 // HTTP request THROUGH each outbound, not by its open TCP port, matching mobile GroupSelector.
 // Flows keep the handler they started with when the chosen group member changes.
 type groupOutbound struct {
-	members   []xoutbound.Handler
-	spec      OutboundGroup
-	selected  atomic.Int32
-	latency   atomic.Int32
-	cancel    context.CancelFunc
-	done      chan struct{}
-	close     sync.Once
-	refreshMu sync.Mutex
-	probeURL  string
+	members     []xoutbound.Handler
+	spec        OutboundGroup
+	selected    atomic.Int32
+	latency     atomic.Int32
+	cancel      context.CancelFunc
+	done        chan struct{}
+	close       sync.Once
+	refreshMu   sync.Mutex
+	probeURL    string
+	initialWait time.Duration
 }
 
 func pickGroupMember(spec OutboundGroup, delays map[int]int) int {
@@ -111,9 +112,24 @@ func (g *groupOutbound) Start() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	g.cancel, g.done = cancel, make(chan struct{})
-	g.refresh(ctx)
+	initialDone := make(chan struct{})
+	go func() {
+		defer close(initialDone)
+		g.refresh(ctx)
+	}()
+	wait := 4 * time.Second
+	if g.initialWait > 0 {
+		wait = g.initialWait
+	}
+	timer := time.NewTimer(wait)
+	select {
+	case <-initialDone:
+		timer.Stop()
+	case <-timer.C:
+	}
 	go func() {
 		defer close(g.done)
+		<-initialDone
 		tick := time.NewTicker(15 * time.Second)
 		defer tick.Stop()
 		looked := time.Now()

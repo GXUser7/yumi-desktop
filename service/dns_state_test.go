@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -175,5 +176,62 @@ func TestDNSCannotApplyWithoutADurableBackup(t *testing.T) {
 	got, _ := os.ReadFile(m.resolvPath)
 	if !reflect.DeepEqual(got, original) {
 		t.Fatal("changed DNS before backup")
+	}
+}
+
+func TestParseMacDNSServersAcceptsScopedIPv6(t *testing.T) {
+	servers, err := parseMacDNSServers("192.0.2.1\nfe80::1%en0\n2001:db8::53")
+	if err != nil {
+		t.Fatalf("rejected valid scoped IPv6 DNS: %v", err)
+	}
+	want := []string{"192.0.2.1", "fe80::1%en0", "2001:db8::53"}
+	if !reflect.DeepEqual(servers, want) {
+		t.Fatalf("got %v want %v", servers, want)
+	}
+}
+
+func TestApplyFileAndRestorePreserveActiveAndDanglingSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "systemd-stub.conf")
+	if err := os.WriteFile(target, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolv := filepath.Join(dir, "resolv.conf")
+	if err := os.Symlink(target, resolv); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unprivileged on Windows: %v", err)
+		}
+		t.Fatal(err)
+	}
+	m := dnsManager{directory: dir, resolvPath: resolv, interfaceExists: func(string) bool { return true }}
+
+	// Active symlink: applyFile replaces the link itself without touching the target,
+	// and restore recreates the exact symlink target.
+	if err := m.applyFile(); err != nil {
+		t.Fatalf("applyFile on active symlink failed: %v", err)
+	}
+	if targetData, _ := os.ReadFile(target); string(targetData) != "nameserver 127.0.0.53\n" {
+		t.Fatalf("symlink target was modified: %q", targetData)
+	}
+	if info, err := os.Lstat(resolv); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("expected regular resolv.conf during VPN, got %v %v", info, err)
+	}
+	if err := m.restore(); err != nil {
+		t.Fatalf("restore active symlink failed: %v", err)
+	}
+	if gotTarget, err := os.Readlink(resolv); err != nil || gotTarget != target {
+		t.Fatalf("symlink not restored: %q %v", gotTarget, err)
+	}
+
+	// Dangling symlink: applyFile succeeds and restore restores the exact dangling link.
+	_ = os.Remove(target)
+	if err := m.applyFile(); err != nil {
+		t.Fatalf("applyFile on dangling symlink failed: %v", err)
+	}
+	if err := m.restore(); err != nil {
+		t.Fatalf("restore dangling symlink failed: %v", err)
+	}
+	if gotTarget, err := os.Readlink(resolv); err != nil || gotTarget != target {
+		t.Fatalf("dangling symlink not restored: %q %v", gotTarget, err)
 	}
 }

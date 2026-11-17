@@ -46,6 +46,16 @@ func readSysState() (*sysState, error) {
 		if legacy == "" {
 			return nil, nil
 		}
+		info, lerr := os.Lstat(legacy)
+		if errors.Is(lerr, fs.ErrNotExist) {
+			return nil, nil
+		}
+		if lerr != nil {
+			return nil, lerr
+		}
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("legacy sysstate is not a regular file")
+		}
 		data, err = os.ReadFile(legacy)
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil

@@ -10,6 +10,8 @@ import (
     "net/netip"
     "net/url"
     "regexp"
+    "slices"
+    "strconv"
     "strings"
 )
 
@@ -56,6 +58,7 @@ type Request struct {
     // rather than inside Options so a hot switch to a server in another country keeps the
     // worker: only this field changes, and the timezone follows it live. See validCountry.
     ServerCountry string `json:"serverCountry"`
+    dnsHosts      map[string]string
 }
 type Status struct {
     Version int `json:"version"`
@@ -145,11 +148,19 @@ func validateOptions(o Options) error {
     for _, n := range o.Networks {
         if _, err := netip.ParsePrefix(n); err != nil { if _, err = netip.ParseAddr(n); err != nil { return errors.New("invalid_network") } }
     }
+    dnsHost := o.DNS
     if strings.Contains(o.DNS, "://") {
         u, err := url.Parse(o.DNS)
         if err != nil || u.User != nil || !validHost(u.Hostname()) || (u.Scheme != "https" && u.Scheme != "tcp" && u.Scheme != "udp") { return errors.New("invalid_dns") }
+        dnsHost = u.Hostname()
     } else if !validHost(o.DNS) { return errors.New("invalid_dns") }
+    if isForbiddenDNSHost(dnsHost) { return errors.New("invalid_dns") }
     return nil
+}
+
+func isForbiddenDNSHost(h string) bool {
+    lower := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
+    return lower == "localhost" || strings.HasSuffix(lower, ".localhost") || lower == "fakedns"
 }
 
 // Yumi's own adapter is never a way out. The prefix form covers the per-connection names older
@@ -167,6 +178,13 @@ func validHost(h string) bool {
         if len(label) == 0 || len(label) > 63 || !regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$`).MatchString(label) { return false }
     }
     return true
+}
+
+func validPort(p string) bool {
+    if p == "" { return false }
+    for _, r := range p { if r < '0' || r > '9' { return false } }
+    n, err := strconv.Atoi(p)
+    return err == nil && n >= 1 && n <= 65535
 }
 
 // Only fields emitted by the desktop's node converter may cross the privilege boundary.
@@ -202,6 +220,12 @@ func validateTree(value any, depth int) error {
                 continue
             }
             if k == "address" { if host, ok := item.(string); ok && !validHost(host) { return errors.New("invalid_host") } }
+            if k == "endpoint" {
+                ep, ok := item.(string)
+                if !ok { return errors.New("invalid_host") }
+                host, port, err := net.SplitHostPort(ep)
+                if err != nil || !validHost(host) || !validPort(port) { return errors.New("invalid_host") }
+            }
             if err := validateTree(item,depth+1); err != nil { return err }
         }
     case []any:
@@ -331,6 +355,11 @@ func buildConfig(r Request, port int, user, password string, geo bool, outbound 
     if len(o.Domains)>0 { domains:=[]string{}; for _,d := range o.Domains { domains=append(domains,"domain:"+d) }; rules=append(rules,obj{"type":"field","domain":domains,"outboundTag":target}) }
     if len(o.Networks)>0 { rules=append(rules,obj{"type":"field","ip":o.Networks,"outboundTag":target}) }
     apps := applicationVariants(o.Applications)
+    if o.SplitMode == "ExceptSelected" && !o.KillSwitch {
+        for _, self := range applicationVariants([]string{"Yumi.exe", "yumi-service.exe"}) {
+            if !slices.Contains(apps, self) { apps = append(apps, self) }
+        }
+    }
     appRule := func() { if len(apps)>0 { rules=append(rules,obj{"type":"field","process":apps,"outboundTag":target}) } }
     if o.SplitMode == "ExceptSelected" {
         // Applications sent around the tunnel go around it for everything, YouTube included, so
@@ -368,6 +397,8 @@ func buildConfig(r Request, port int, user, password string, geo bool, outbound 
         gateway=append(gateway,tunGatewayV6)
         routes=append(routes,"::/1","8000::/1")
     }
+    dnsConfig := obj{"servers":[]string{dns},"queryStrategy":strategy,"tag":"dns-in"}
+    if len(r.dnsHosts) > 0 { dnsConfig["hosts"] = r.dnsHosts }
     return obj{
         "log":obj{"loglevel":"none"},
         "stats":obj{},
@@ -375,7 +406,7 @@ func buildConfig(r Request, port int, user, password string, geo bool, outbound 
             "levels":obj{"0":obj{"connIdle":connIdleSeconds,"uplinkOnly":halfClosedSeconds,"downlinkOnly":halfClosedSeconds}},
             "system":obj{"statsOutboundUplink":true,"statsOutboundDownlink":true},
         },
-        "dns":obj{"servers":[]string{dns},"queryStrategy":strategy,"tag":"dns-in"},
+        "dns":dnsConfig,
         "inbounds":[]obj{
             {"tag":"tun-in","protocol":"tun","settings":obj{"name":tunAdapterName(),"desc":"Yumi VPN","mtu":o.MTU,
                 "gateway":gateway, "dns":[]string{tunDNSV4},
@@ -383,7 +414,7 @@ func buildConfig(r Request, port int, user, password string, geo bool, outbound 
                 "sniffing":obj{"enabled":true,"destOverride":[]string{"http","tls","quic"},"routeOnly":true}},
             {"tag":"probe-in","protocol":"http","listen":"127.0.0.1","port":port,"settings":obj{"accounts":[]obj{{"user":user,"pass":password}}}},
         },
-        "outbounds":[]obj{proxy,{"tag":"direct","protocol":"freedom","settings":obj{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"},{"tag":"dns-out","protocol":"dns"}},
+        "outbounds":[]obj{proxy,{"tag":"direct","protocol":"freedom","settings":obj{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"},{"tag":"dns-out","protocol":"dns","settings":obj{"nonIPQuery":"skip"}}},
         "routing":obj{"domainStrategy":"IPIfNonMatch","rules":rules},
     }
 }

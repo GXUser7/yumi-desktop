@@ -1,0 +1,20 @@
+//go:build darwin
+
+package main
+
+import (
+	"net"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+func bindBootstrapSocket(fd uintptr, network string, iface *net.Interface) error {
+	if iface == nil || iface.Index <= 0 {
+		return nil
+	}
+	if strings.HasSuffix(network, "6") {
+		return unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, iface.Index)
+	}
+	return unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, iface.Index)
+}

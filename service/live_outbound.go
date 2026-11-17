@@ -131,7 +131,7 @@ func (l *liveOutbound) replace(next xoutbound.Handler, direct bool) error {
 			delete(l.leases, old)
 			closing = append(closing, old)
 		}
-		if old.retired && !old.direct {
+		if old.retired && (!old.direct || !direct) {
 			for cancel := range old.sessions {
 				cancelling = append(cancelling, *cancel)
 			}

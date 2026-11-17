@@ -74,8 +74,8 @@ func TestLiveSwitchCancelsOldVPNFlowsAndRetiresTheirHandlers(t *testing.T) {
 	await(t, second.ended)
 }
 
-func TestDisconnectCancelsVPNButKeepsDirectSessionsAcrossReconnect(t *testing.T) {
-	first, direct, next, lastDirect := heldHandler(), heldHandler(), heldHandler(), heldHandler()
+func TestDisconnectCancelsVPNAndReconnectCancelsDirectForwardSessions(t *testing.T) {
+	first, direct, direct2, next := heldHandler(), heldHandler(), heldHandler(), heldHandler()
 	live := newLiveOutbound(first)
 	defer live.Close()
 	_, finishVPN := startHeld(t, live, first)
@@ -86,25 +86,33 @@ func TestDisconnectCancelsVPNButKeepsDirectSessionsAcrossReconnect(t *testing.T)
 	await(t, first.ended)
 	bypass, finishBypass := startHeld(t, live, direct)
 	defer finishBypass()
-	if err := live.replace(next, false); err != nil {
+	if err := live.replace(direct2, true); err != nil {
 		t.Fatal(err)
 	}
-	_, finishNext := startHeld(t, live, next)
-	defer finishNext()
-	if err := live.replace(lastDirect, true); err != nil {
-		t.Fatal(err)
-	}
-	await(t, next.ended)
 	select {
 	case <-bypass.Done():
-		t.Fatal("direct session was interrupted by VPN switching")
+		t.Fatal("direct-forward session was interrupted by another direct-forward lease")
 	default:
 	}
 	if direct.closes.Load() != 0 {
 		t.Fatal("active direct handler was closed")
 	}
+	if err := live.replace(next, false); err != nil {
+		t.Fatal(err)
+	}
+	await(t, bypass.Done())
 	finishBypass()
 	await(t, direct.ended)
+	deadline := time.Now().Add(time.Second)
+	for direct.closes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if direct.closes.Load() != 1 {
+		t.Fatal("drained direct-forward handler was not retired exactly once")
+	}
+	_, finishNext := startHeld(t, live, next)
+	finishNext()
+	await(t, next.ended)
 }
 
 func TestFailedReplacementLeavesCurrentServerAndSessionsUntouched(t *testing.T) {

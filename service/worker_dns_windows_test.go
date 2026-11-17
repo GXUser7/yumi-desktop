@@ -111,3 +111,37 @@ func TestLiveWindowsDNSGuardBlocksOtherResolversAndRestoresOnClose(t *testing.T)
 		}
 	}
 }
+
+func TestTunnelDNSProtectionPropagatesBlockIPv6AndBypassLAN(t *testing.T) {
+	type call struct{ v6, lan bool }
+	var calls []call
+	var guards []*testDNSGuard
+	p := newTunnelDNSProtection(true, false)
+	p.flush = func() {}
+	p.openTunnel = func(blockIPv6, bypassLAN bool) (firewall.Firewall, error) {
+		calls = append(calls, call{blockIPv6, bypassLAN})
+		g := &testDNSGuard{}
+		guards = append(guards, g)
+		return g, nil
+	}
+	if err := p.enable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0] != (call{true, false}) {
+		t.Fatalf("unexpected first ProtectTunnel args: %+v", calls)
+	}
+	p.configure(false, true)
+	if guards[0].closed != 1 {
+		t.Fatal("configure did not close old guard when policy changed")
+	}
+	if err := p.enable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[1] != (call{false, true}) {
+		t.Fatalf("unexpected second ProtectTunnel args: %+v", calls)
+	}
+	p.close()
+	if guards[1].closed != 1 {
+		t.Fatal("close did not close second guard")
+	}
+}

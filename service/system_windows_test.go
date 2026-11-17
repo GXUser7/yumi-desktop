@@ -3,14 +3,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"golang.org/x/sys/windows/registry"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 func TestLegacyLocationSnapshotMigratesAndClearsBothPathsAfterRecovery(t *testing.T) {
@@ -190,5 +194,88 @@ func TestLocationPolicyRoundTripPreservesBothValuesTypesAndAbsence(t *testing.T)
 	_ = key.SetStringValue("DisableLocation", "administrator policy")
 	if err := capturePolicyValues(key, &sysState{}); err == nil {
 		t.Fatal("accepted an unknown policy type that cannot be restored")
+	}
+}
+
+func TestLegacySysStateRefusesNonRegularAndJunctionTarget(t *testing.T) {
+	t.Setenv("ProgramData", t.TempDir())
+	legacy := legacySysStatePath()
+	// A directory at legacySysStatePath is not a regular file and must be refused.
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSysState(); err == nil {
+		t.Fatal("accepted a directory at legacy sysstate path")
+	}
+	_ = os.Remove(legacy)
+
+	// A junction at legacySysStatePath (or symlink if allowed) must also be refused.
+	target := t.TempDir()
+	cmd := exec.Command("cmd.exe", "/c", "mklink", "/J", legacy, target)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("mklink /J failed: %v", err)
+	}
+	if _, err := readSysState(); err == nil {
+		t.Fatal("accepted a reparse point at legacy sysstate path")
+	}
+}
+
+func TestSecureDirectoryAndWorkerJournalRefuseReparsePointsAndRotate(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("ProgramData", tmp)
+	target := t.TempDir()
+	root := programDataRoot()
+	if err := exec.Command("cmd.exe", "/c", "mklink", "/J", root, target).Run(); err != nil {
+		t.Fatalf("mklink /J failed: %v", err)
+	}
+	if err := secureDirectory(root); err == nil {
+		t.Fatal("secureDirectory accepted a junction/reparse point")
+	}
+	if f := workerJournal(); f != nil {
+		_ = f.Close()
+		t.Fatal("workerJournal opened a junction directory")
+	}
+
+	// Now test normal journal write + >1 MiB rotation.
+	t.Setenv("ProgramData", t.TempDir())
+	f := workerJournal()
+	if f == nil {
+		t.Fatal("workerJournal returned nil on clean temp dir")
+	}
+	_ = f.Close()
+
+	logPath := filepath.Join(programDataRoot(), "worker.log")
+	oversized := bytes.Repeat([]byte("A"), (1<<20)+128)
+	if err := os.WriteFile(logPath, oversized, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rotated := workerJournal()
+	if rotated == nil {
+		t.Fatal("workerJournal returned nil during rotation")
+	}
+	_ = rotated.Close()
+
+	bakInfo, err := os.Stat(logPath + ".1")
+	if err != nil || bakInfo.Size() != int64(len(oversized)) {
+		t.Fatalf("expected rotated worker.log.1 with %d bytes, got %v %v", len(oversized), bakInfo, err)
+	}
+	curInfo, err := os.Stat(logPath)
+	if err != nil || curInfo.Size() >= 1<<20 {
+		t.Fatalf("expected fresh rotated worker.log, got %v %v", curInfo, err)
+	}
+}
+
+func TestTzutilPathResolvesSystemDirectory(t *testing.T) {
+	sysDir, err := windows.GetSystemDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tzutilPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(sysDir, "tzutil.exe")
+	if !strings.EqualFold(got, want) {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }

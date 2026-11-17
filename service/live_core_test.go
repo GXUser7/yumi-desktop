@@ -126,7 +126,12 @@ func TestLiveCoreKeepsDirectSocketsAndCumulativeProxyCounters(t *testing.T) {
 	exchange(off, "vpn-off-direct")
 	before := count()
 	next("proxy-node")
-	exchange(off, "retained-direct")
+	_ = off.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := off.Read(make([]byte, 1)); err == nil {
+		t.Fatal("pre-VPN direct-forward socket survived reconnecting to VPN")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("pre-VPN direct-forward socket was left open instead of being interrupted")
+	}
 	exchange(bypass, "game-after-reconnect")
 	if count() != before {
 		t.Fatal("direct traffic counted as VPN traffic")

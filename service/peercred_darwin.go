@@ -8,6 +8,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// XUCRED_VERSION in Darwin's <sys/ucred.h>.
+const xucredVersion uint32 = 0
+
 // Who is on the other end of this socket, as the kernel swears it: LOCAL_PEERCRED hands over the
 // credential structure the socket was created with, which the connecting process cannot forge.
 func peerUID(conn net.Conn) (int, bool) {
@@ -25,7 +28,7 @@ func peerUID(conn net.Conn) (int, bool) {
 	}
 	if err := raw.Control(func(fd uintptr) {
 		cred, err := unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
-		if err != nil || cred == nil {
+		if err != nil || cred == nil || cred.Version != xucredVersion {
 			return
 		}
 		uid, answer = int(cred.Uid), true

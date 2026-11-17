@@ -5,10 +5,10 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -38,23 +38,45 @@ const lfsvcName = "lfsvc"
 const locationPolicyKey = `SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors`
 
 func sysStatePath() string {
-	root := os.Getenv("ProgramData")
+	root := programDataRoot()
 	if root == "" {
 		return ""
 	}
-	return filepath.Join(root, "Yumi Desktop", "state", "sysstate.json")
+	return filepath.Join(root, "state", "sysstate.json")
 }
 
 func legacySysStatePath() string {
-	root := os.Getenv("ProgramData")
+	root := programDataRoot()
 	if root == "" {
 		return ""
 	}
-	return filepath.Join(root, "Yumi Desktop", "sysstate.json")
+	return filepath.Join(root, "sysstate.json")
 }
 
-func currentWindowsTimezone() (string, error) { return runSystemCommand("tzutil", "/g") }
-func setWindowsTimezone(id string) error      { _, err := runSystemCommand("tzutil", "/s", id); return err }
+func tzutilPath() (string, error) {
+	dir, err := windows.GetSystemDirectory()
+	if err != nil || dir == "" {
+		return "", errors.New("system directory unavailable")
+	}
+	return filepath.Join(dir, "tzutil.exe"), nil
+}
+
+func currentWindowsTimezone() (string, error) {
+	exe, err := tzutilPath()
+	if err != nil {
+		return "", err
+	}
+	return runSystemCommand(exe, "/g")
+}
+
+func setWindowsTimezone(id string) error {
+	exe, err := tzutilPath()
+	if err != nil {
+		return err
+	}
+	_, err = runSystemCommand(exe, "/s", id)
+	return err
+}
 
 func captureLocationPolicies(st *sysState) error {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, locationPolicyKey, registry.QUERY_VALUE)

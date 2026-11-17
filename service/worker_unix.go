@@ -39,9 +39,11 @@ func worker() {
 		return
 	}
 	var initial struct {
-		Config json.RawMessage `json:"config"`
-		Group  *OutboundGroup  `json:"group"`
-		Status Status          `json:"status"`
+		Config    json.RawMessage `json:"config"`
+		Group     *OutboundGroup  `json:"group"`
+		Status    Status          `json:"status"`
+		BlockIPv6 bool            `json:"blockIpv6"`
+		BypassLAN bool            `json:"bypassLan"`
 	}
 	if json.Unmarshal(line, &initial) != nil {
 		return
@@ -100,6 +102,8 @@ func worker() {
 		Group      *OutboundGroup  `json:"group"`
 		Status     Status          `json:"status"`
 		Disconnect bool            `json:"disconnect"`
+		BlockIPv6  bool            `json:"blockIpv6"`
+		BypassLAN  bool            `json:"bypassLan"`
 	}
 	updates := make(chan control)
 	go func() {
@@ -124,6 +128,7 @@ func worker() {
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	dnsProtected := true
 	for {
 		if initial.Status.State == "connected" {
 			initial.Status.Upload = counter("uplink") - baseUp
@@ -137,6 +142,15 @@ func worker() {
 		case next, ok := <-updates:
 			if !ok {
 				return
+			}
+			wasProtected := dnsProtected
+			if !next.Disconnect && !dnsProtected {
+				if err := applySystemDNS(); err != nil {
+					initial.Status.Error = "dns_configuration_failed"
+					initial.Status.Detail = detailOf(err)
+					continue
+				}
+				dnsProtected = true
 			}
 			document := next.Config
 			if next.Disconnect {
@@ -156,11 +170,19 @@ func worker() {
 				}
 			}
 			if err != nil {
+				if !wasProtected && dnsProtected {
+					restoreWorkerNetwork()
+					dnsProtected = false
+				}
 				initial.Status.Error = "hot_swap_failed"
 				initial.Status.Detail = detailOf(err)
 				continue
 			}
 			if next.Disconnect {
+				if dnsProtected {
+					restoreWorkerNetwork()
+					dnsProtected = false
+				}
 				initial.Status = Status{Version: 1, State: "disconnected", ProbePort: initial.Status.ProbePort, ProbeUser: initial.Status.ProbeUser, ProbePassword: initial.Status.ProbePassword, TunName: initial.Status.TunName}
 			} else {
 				wasConnected := initial.Status.State == "connected"

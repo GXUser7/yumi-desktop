@@ -38,9 +38,11 @@ func worker() {
 		return
 	}
 	var initial struct {
-		Config json.RawMessage `json:"config"`
-		Group  *OutboundGroup  `json:"group"`
-		Status Status          `json:"status"`
+		Config    json.RawMessage `json:"config"`
+		Group     *OutboundGroup  `json:"group"`
+		Status    Status          `json:"status"`
+		BlockIPv6 bool            `json:"blockIpv6"`
+		BypassLAN bool            `json:"bypassLan"`
 	}
 	if json.Unmarshal(line, &initial) != nil {
 		return
@@ -70,7 +72,7 @@ func worker() {
 		fail("core_initialization_failed", err)
 		return
 	}
-	dns := newTunnelDNSProtection()
+	dns := newTunnelDNSProtection(initial.BlockIPv6, initial.BypassLAN)
 	defer func() { cleanAdapter(); instance.Close(); dns.close() }()
 	if err = dns.enable(); err != nil {
 		fail("dns_configuration_failed", err)
@@ -94,6 +96,8 @@ func worker() {
 		Group      *OutboundGroup  `json:"group"`
 		Status     Status          `json:"status"`
 		Disconnect bool            `json:"disconnect"`
+		BlockIPv6  bool            `json:"blockIpv6"`
+		BypassLAN  bool            `json:"bypassLan"`
 	}
 	updates := make(chan control)
 	go func() {
@@ -134,6 +138,7 @@ func worker() {
 			}
 			wasProtected := initial.Status.State == "connected"
 			if !next.Disconnect {
+				dns.configure(next.BlockIPv6, next.BypassLAN)
 				if err := dns.enable(); err != nil {
 					initial.Status.Error = "dns_configuration_failed"
 					initial.Status.Detail = detailOf(err)

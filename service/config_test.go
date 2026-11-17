@@ -258,11 +258,41 @@ func TestPrivilegeBoundary(t *testing.T) {
 }
 
 func TestInvalidOptions(t *testing.T) {
-	for _, dns := range []string{"tls://1.1.1.1", "https+local://1.1.1.1/dns-query", "file:///secret", "https://user:password@example.com/dns"} {
+	for _, dns := range []string{
+		"tls://1.1.1.1", "https+local://1.1.1.1/dns-query", "file:///secret", "https://user:password@example.com/dns",
+		"localhost", "LOCALHOST", "sub.localhost", "https://localhost/dns-query", "udp://localhost",
+		"fakedns", "FakeDNS", "https://fakedns/dns-query",
+	} {
 		r := fixture()
 		r.Options.DNS = dns
 		if validateOptions(*r.Options) == nil {
 			t.Fatalf("accepted resolver %s", dns)
+		}
+	}
+	for _, badEP := range []string{"bad host:51820", "example.com", "example.com:0", "example.com:99999", "example.com:+80"} {
+		r := fixture()
+		r.Outbound = obj{
+			"protocol": "wireguard",
+			"settings": obj{
+				"secretKey": "k",
+				"peers":     []any{obj{"publicKey": "p", "endpoint": badEP}},
+			},
+		}
+		if validateOutbound(r.Outbound) == nil {
+			t.Fatalf("accepted invalid endpoint %q", badEP)
+		}
+	}
+	for _, goodEP := range []string{"wg.example.com:51820", "[2001:db8::1]:51820"} {
+		r := fixture()
+		r.Outbound = obj{
+			"protocol": "wireguard",
+			"settings": obj{
+				"secretKey": "k",
+				"peers":     []any{obj{"publicKey": "p", "endpoint": goodEP}},
+			},
+		}
+		if err := validateOutbound(r.Outbound); err != nil {
+			t.Fatalf("refused valid endpoint %q: %v", goodEP, err)
 		}
 	}
 	r := fixture()
@@ -298,6 +328,8 @@ func TestGeoDownloadVerifiesAndReplacesAtomically(t *testing.T) {
 			_, _ = w.Write([]byte(hex.EncodeToString(sum[:]) + "  db.dat\n"))
 		case "/small.dat":
 			_, _ = w.Write([]byte("<html>blocked</html>"))
+		case "/nosum.dat":
+			_, _ = w.Write([]byte(body))
 		default:
 			http.NotFound(w, r)
 		}
@@ -319,8 +351,15 @@ func TestGeoDownloadVerifiesAndReplacesAtomically(t *testing.T) {
 	if data, _ := os.ReadFile(filepath.Join(dir, "geoip.dat")); string(data) != body {
 		t.Fatal("a failed download replaced the good database")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "geoip.dat.part")); err == nil {
-		t.Fatal("left a partial file behind")
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".geo-*")); len(leftovers) != 0 {
+		t.Fatalf("left temporary files behind: %v", leftovers)
+	}
+
+	if downloadGeo(context.Background(), server.Client(), dir, []geoAsset{{"geosite.dat", server.URL + "/nosum.dat"}}) == nil {
+		t.Fatal("accepted a database without a checksum")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".geo-*")); len(leftovers) != 0 {
+		t.Fatalf("left temporary files behind after missing checksum: %v", leftovers)
 	}
 
 	if downloadGeo(context.Background(), server.Client(), dir, []geoAsset{{"geosite.dat", server.URL + "/small.dat"}}) == nil {

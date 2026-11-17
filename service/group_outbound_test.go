@@ -17,9 +17,66 @@ import (
 	"time"
 
 	xnet "github.com/xtls/xray-core/common/net"
+	cserial "github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
+	xoutbound "github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/infra/conf/serial"
+	"github.com/xtls/xray-core/transport"
 )
+
+type slowRefreshHandler struct {
+	entered chan struct{}
+	closed  chan struct{}
+}
+
+func (h *slowRefreshHandler) Tag() string                           { return "proxy-node" }
+func (h *slowRefreshHandler) Start() error                          { return nil }
+func (h *slowRefreshHandler) Close() error                          { close(h.closed); return nil }
+func (h *slowRefreshHandler) SenderSettings() *cserial.TypedMessage { return nil }
+func (h *slowRefreshHandler) ProxySettings() *cserial.TypedMessage  { return nil }
+func (h *slowRefreshHandler) Dispatch(ctx context.Context, _ *transport.Link) {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+}
+
+func TestGroupStartBoundsInitialRefreshAndClosesCleanly(t *testing.T) {
+	hanging := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hanging.Close()
+
+	h0 := &slowRefreshHandler{entered: make(chan struct{}, 1), closed: make(chan struct{})}
+	h1 := &slowRefreshHandler{entered: make(chan struct{}, 1), closed: make(chan struct{})}
+	group := &groupOutbound{
+		members:     []xoutbound.Handler{h0, h1},
+		spec:        OutboundGroup{Members: make([]map[string]any, 2), Strategy: "cost"},
+		probeURL:    hanging.URL,
+		initialWait: 80 * time.Millisecond,
+	}
+	started := time.Now()
+	if err := group.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("group.Start() blocked for %v despite bounded initialWait", elapsed)
+	}
+	if err := group.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-h0.closed:
+	case <-time.After(time.Second):
+		t.Fatal("member 0 not closed")
+	}
+	select {
+	case <-h1.closed:
+	case <-time.After(time.Second):
+		t.Fatal("member 1 not closed")
+	}
+}
 
 // No credentials or remote addresses are committed. The opt-in JVM check writes this private
 // request to .local; this test verifies its real protocol handshakes without a TUN or privileges.

@@ -6,18 +6,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/GXUser7/yumi-desktop/service/firewall"
-	"io"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/GXUser7/yumi-desktop/service/firewall"
 )
 
 const serviceName = "app.yumi.desktop.tunnel"
@@ -51,6 +49,8 @@ func systemStateDirectory() string {
 	return "/var/lib/yumi-desktop"
 }
 
+func dataRoot() string { return systemStateDirectory() }
+
 func geoDirectory() string {
 	root := systemStateDirectory()
 	if root == "" {
@@ -62,21 +62,31 @@ func geoDirectory() string {
 // The journal sits in the state directory for the same reason it sits under ProgramData on
 // Windows: a program directory that changes under a running install is the kind of thing
 // installers and package managers both take badly.
-func workerJournal() io.Writer {
+func workerJournal() *os.File {
+	journalMu.Lock()
+	defer journalMu.Unlock()
 	root := systemStateDirectory()
 	if root == "" {
-		return io.Discard
+		return nil
 	}
 	if os.MkdirAll(root, 0o755) != nil {
-		return io.Discard
+		return nil
+	}
+	if dirInfo, err := os.Lstat(root); err != nil || dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+		return nil
 	}
 	path := filepath.Join(root, "worker.log")
-	if info, err := os.Stat(path); err == nil && info.Size() > 1<<20 {
-		_ = os.Remove(path)
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil
+		}
+		if info.Size() > 1<<20 {
+			_ = os.Rename(path, path+".1")
+		}
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
-		return io.Discard
+		return nil
 	}
 	_, _ = file.WriteString("\n--- " + time.Now().Format(time.RFC3339) + " ---\n")
 	return file
@@ -85,7 +95,20 @@ func workerJournal() io.Writer {
 // Only the daemon and the administrators may write what the core parses; on unix that is a
 // directory the daemon created as root, which is exactly that.
 func secureDirectory(dir string) error {
-	return os.MkdirAll(dir, 0o755)
+	if dir == "" {
+		return errors.New("empty directory")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("directory is not regular")
+	}
+	return nil
 }
 
 /** This process's own account, as a uid in decimal — the unix answer to the owner SID. */
@@ -232,15 +255,15 @@ WantedBy=multi-user.target
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		return err
 	}
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
-		return fmt.Errorf("daemon-reload: %s", strings.TrimSpace(string(out)))
+	if out, err := runSystemCommand("systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("daemon-reload: %s", out)
 	}
 	// A restart covers the update path, where the unit already existed with an old owner in it.
-	if out, err := exec.Command("systemctl", "restart", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("restart: %s", strings.TrimSpace(string(out)))
+	if out, err := runSystemCommand("systemctl", "restart", unit); err != nil {
+		return fmt.Errorf("restart: %s", out)
 	}
-	if out, err := exec.Command("systemctl", "enable", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("enable: %s", strings.TrimSpace(string(out)))
+	if out, err := runSystemCommand("systemctl", "enable", unit); err != nil {
+		return fmt.Errorf("enable: %s", out)
 	}
 	return nil
 }
@@ -269,29 +292,38 @@ func installLaunchd(exe, owner string) error {
 	}
 	// Bootout first so an update replaces a running daemon instead of colliding with it; the
 	// error when nothing was loaded is the good outcome and is ignored.
-	_ = exec.Command("launchctl", "bootout", "system/"+serviceName).Run()
-	if out, err := exec.Command("launchctl", "bootstrap", "system", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("bootstrap: %s", strings.TrimSpace(string(out)))
+	_, _ = runSystemCommand("launchctl", "bootout", "system/"+serviceName)
+	if out, err := runSystemCommand("launchctl", "bootstrap", "system", path); err != nil {
+		return fmt.Errorf("bootstrap: %s", out)
 	}
 	return nil
 }
 
 func removeService() error {
+	var err error
 	if isDarwin() {
-		_ = exec.Command("launchctl", "bootout", "system/"+serviceName).Run()
-		return os.Remove("/Library/LaunchDaemons/" + serviceName + ".plist")
+		_, _ = runSystemCommand("launchctl", "bootout", "system/"+serviceName)
+		if e := os.Remove("/Library/LaunchDaemons/" + serviceName + ".plist"); e != nil && !errors.Is(e, os.ErrNotExist) {
+			err = errors.Join(err, e)
+		}
+	} else {
+		const unit = "yumi-tunnel.service"
+		_, _ = runSystemCommand("systemctl", "disable", "--now", unit)
+		if e := os.Remove("/etc/systemd/system/" + unit); e != nil && !errors.Is(e, os.ErrNotExist) {
+			err = errors.Join(err, e)
+		} else {
+			_, _ = runSystemCommand("systemctl", "daemon-reload")
+		}
 	}
-	const unit = "yumi-tunnel.service"
-	_ = exec.Command("systemctl", "disable", "--now", unit).Run()
-	err := os.Remove("/etc/systemd/system/" + unit)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	err = errors.Join(err, firewall.CleanupLeftovers())
+	restoreWorkerNetwork()
+	restoreAbandonedLocation()
+	if helper := installedServicePath(); helper != "" {
+		if e := os.Remove(helper); e != nil && !errors.Is(e, os.ErrNotExist) {
+			err = errors.Join(err, e)
+		}
 	}
-	if err != nil {
-		return err
-	}
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	return nil
+	return err
 }
 
 func main() {

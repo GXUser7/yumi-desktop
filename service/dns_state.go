@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,10 +15,11 @@ type dnsServiceState struct {
 	Servers []string `json:"servers"`
 }
 type dnsState struct {
-	Mode      string            `json:"mode"`
-	Interface string            `json:"interface,omitempty"`
-	Original  []byte            `json:"original,omitempty"`
-	Services  []dnsServiceState `json:"services,omitempty"`
+	Mode          string            `json:"mode"`
+	Interface     string            `json:"interface,omitempty"`
+	Original      []byte            `json:"original,omitempty"`
+	SymlinkTarget string            `json:"symlinkTarget,omitempty"`
+	Services      []dnsServiceState `json:"services,omitempty"`
 }
 type dnsManager struct {
 	directory       string
@@ -92,7 +93,7 @@ func parseMacDNSServers(text string) ([]string, error) {
 	}
 	servers := strings.Fields(text)
 	for _, server := range servers {
-		if net.ParseIP(server) == nil {
+		if _, err := netip.ParseAddr(server); err != nil {
 			return nil, fmt.Errorf("unexpected DNS response %q", text)
 		}
 	}
@@ -117,18 +118,74 @@ func (m dnsManager) applyResolved(tun string) (err error) {
 	}
 	return nil
 }
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".yumi-resolv-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err = f.Write(data); err == nil {
+		err = f.Chmod(mode)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, path)
+}
+
+func restoreSymlinkAtomic(path, target string) error {
+	dir := filepath.Dir(path)
+	tmpDir, err := os.MkdirTemp(dir, ".yumi-resolv-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	link := filepath.Join(tmpDir, "resolv.conf")
+	if err := os.Symlink(target, link); err != nil {
+		return err
+	}
+	return os.Rename(link, path)
+}
+
 func (m dnsManager) applyFile() (err error) {
 	if err = m.restore(); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(m.resolvPath)
+	info, err := os.Lstat(m.resolvPath)
 	if err != nil {
 		return err
 	}
-	if err = m.save(&dnsState{Mode: "file", Original: data}); err != nil {
+	var st *dnsState
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(m.resolvPath)
+		if err != nil {
+			return err
+		}
+		st = &dnsState{Mode: "file", SymlinkTarget: target}
+	} else {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", m.resolvPath)
+		}
+		data, err := os.ReadFile(m.resolvPath)
+		if err != nil {
+			return err
+		}
+		st = &dnsState{Mode: "file", Original: data}
+	}
+	if err = m.save(st); err != nil {
 		return err
 	}
-	if err = os.WriteFile(m.resolvPath, []byte("# managed by Yumi Desktop\nnameserver "+tunDNSV4+"\n"), 0o644); err != nil {
+	if err = writeFileAtomic(m.resolvPath, []byte("# managed by Yumi Desktop\nnameserver "+tunDNSV4+"\n"), 0o644); err != nil {
 		return errors.Join(err, m.restore())
 	}
 	return nil
@@ -171,8 +228,14 @@ func (m dnsManager) restore() error {
 			}
 		}
 	case "file":
-		if err := os.WriteFile(m.resolvPath, st.Original, 0o644); err != nil {
-			return err
+		if st.SymlinkTarget != "" {
+			if err := restoreSymlinkAtomic(m.resolvPath, st.SymlinkTarget); err != nil {
+				return err
+			}
+		} else {
+			if err := writeFileAtomic(m.resolvPath, st.Original, 0o644); err != nil {
+				return err
+			}
 		}
 	default:
 		return fmt.Errorf("unknown saved DNS mode %q", st.Mode)
@@ -188,7 +251,7 @@ func (m dnsManager) restoreLegacyFile() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(m.resolvPath, data, 0o644); err != nil {
+	if err := writeFileAtomic(m.resolvPath, data, 0o644); err != nil {
 		return err
 	}
 	return os.Remove(backup)

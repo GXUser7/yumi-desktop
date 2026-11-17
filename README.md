@@ -1,5 +1,7 @@
 # Yumi Desktop
 
+[English](README.md) · [Русский](README.ru.md)
+
 > The tunnel service runs with system privileges; its responsibilities and access controls
 > are described below.
 
@@ -26,10 +28,14 @@ glass over them, and dragging the window knocks them about on springs.
   VPN still opens them directly. YouTube stays in the tunnel.
 * **Kill switch** — from connect until disconnect nothing leaves around the tunnel, even when the
   server or the core falls over.
-* **Location as the server's** — while connected, the system timezone moves onto the selected
-  server's and the system's location sources go quiet. Sites and applications cannot obtain a
-  fresh position from those system sources. This does not synthesize GPS coordinates or erase a browser's cached location. Everything is restored on disconnect, and the machine's
-  state is written down first, so even a crash puts it back. Off until enabled in Settings.
+* **Location as the server's (for Claude and other geo-strict services)** — while connected,
+  Yumi can hide your real whereabouts beyond the exit IP: the system timezone moves onto the
+  selected server's country (and follows live server switches), OS location sources go quiet
+  (`lfsvc` and policies on Windows, `GeoClue` on Linux, `locationd` on macOS), DNS queries are
+  locked to the tunnel, and IPv6 stays blackholed when off — giving sites and apps like Claude a
+  consistent IP, clock and location signal. Off until enabled in Settings; everything is written to
+  a snapshot first and restored on disconnect or after a crash. Does not synthesize GPS coordinates
+  or erase a browser's cached location. See [Hiding your real location](#hiding-your-real-location).
 * **Speed test** — a dial and a live trace, through the tunnel or around it.
 * **Fifteen palettes**, light and dark, plus AMOLED black; Unbounded and Onest, as in YouCloud.
 * **Connect on launch**, optionally, to the server you selected; off until you enable it in Settings.
@@ -103,8 +109,6 @@ behaves accordingly), and the macOS build is Apple Silicon only.
 
 ## How it is split
 
-## How it is split
-
 The application never touches the network stack. It talks to a local service over a named pipe,
 and the service is the only thing that holds the tunnel:
 
@@ -156,6 +160,45 @@ tunnel and whatever it routes around it), loopback, DHCP and — when "local net
 crashed core or a dropped server and come down only when you disconnect. They live in a dynamic
 session, so if the service itself dies Windows removes them: a crash can cost you the kill switch,
 never the network.
+
+### Hiding your real location
+
+Services with strict region checks — such as Claude — often look past your IP address to the
+system clock's timezone, OS location APIs (Wi-Fi triangulation), DNS leaks and IPv6 traffic. Yumi
+combines **Match the server's location** (Settings → Protection, off by default) with the tunnel's
+built-in leak protections:
+
+* **System timezone matching** — reads the two-letter country code from the flag in the selected
+  server's name and sets the matching timezone via `tzutil` (Windows), `timedatectl` (Linux) or
+  `systemsetup` (macOS) once connected. Hot-switching to a server in another country updates the
+  timezone live without restarting the tunnel; servers without a flag keep the current clock while
+  still silencing location sources. Settings displays the active system timezone.
+* **Silencing OS location sources** — prevents apps and browsers from obtaining a Wi-Fi or
+  network-triangulated fix while connected:
+  * **Windows**: sets `DisableLocation` and `DisableWindowsLocationProvider` under
+    `HKLM\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors` and stops `lfsvc`.
+  * **Linux**: runtime-masks and stops `geoclue.service`.
+  * **macOS**: disables and unloads `com.apple.locationd`.
+* **Crash-safe snapshot and restore** — before making any change, the service writes a snapshot
+  (`sysstate.json`, recording the previous timezone, policy values/types/absence and location
+  service state) and persists its target timezone intent prior to switching the clock. Disconnects,
+  worker exits and service restarts after a crash restore the exact prior state without overwriting
+  pre-existing administrator policies or already-disabled services.
+* **DNS and IPv6 leak protection** — tunnel DNS queries go through the configured resolver (DoH
+  `https://1.1.1.1/dns-query` by default, or TCP/UDP/IP). On Windows, a dynamic WFP session blocks
+  TCP/UDP port 53 to every resolver except the tunnel (`172.31.255.2`), stopping physical-adapter
+  or router DNS fallback even with the kill switch off and LAN bypass on, and flushes the Windows
+  DNS cache. On Linux and macOS, the system resolver is redirected into the tunnel and restored from
+  a snapshot. When IPv6 is disabled (the default), Xray omits IPv6 tunnel routes and blackholes
+  `::/0`.
+* **Clean server switches and routing overrides** — switching servers closes existing VPN flows so
+  open browsers and apps reconnect through the new exit node, while kill switch (optional) keeps
+  traffic inside the tunnel across core drops and custom domain rules override the Russian-site
+  bypass list.
+
+Honest limits: this mode does not synthesize fake GPS coordinates, alter browser fingerprints or
+clear location data and cookies already cached by a browser, and browser-managed encrypted DNS
+follows the browser's own settings and routing rules.
 
 ### Routing databases
 

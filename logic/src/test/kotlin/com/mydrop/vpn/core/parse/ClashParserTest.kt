@@ -94,4 +94,24 @@ class ClashParserTest {
         assertTrue(ClashParser.parse("mode: rule\nrules:\n  - MATCH,DIRECT", null).isEmpty())
         assertTrue(ClashParser.parse("", null).isEmpty())
     }
+
+    @Test
+    fun `inlineMap handles quotes, brackets, trailing comments, depth cap, and normalizes server and reality key`() {
+        val deep = "{a: ".repeat(14) + "x: 1" + "}".repeat(14)
+        val doc = """
+            proxies:
+              - {name: "a,b{c}#keep", type: vless, server: "[2001:db8::1].", port: 443, uuid: u1, tls: true, public-key: ab+cd/ef=, alpn: [h2, http/1.1], ws-opts: {path: "/ws,1", headers: {Host: cdn.example.com}}} # trailing comment
+              - {name: deep, type: trojan, server: пример.рф., port: 443, password: pw, extra: $deep}
+        """.trimIndent()
+        val nodes = ClashParser.parse(doc, "sub")
+        assertEquals(2, nodes.size)
+        val first = nodes[0]
+        assertEquals("a,b{c}#keep", first.name)
+        assertEquals("2001:db8::1", first.server)
+        assertEquals("ab-cd_ef", first.tls?.reality?.publicKey)
+        assertEquals(listOf("h2", "http/1.1"), first.tls?.alpn)
+
+        val second = nodes[1]
+        assertEquals("xn--e1afmkfd.xn--p1ai", second.server)
+    }
 }

@@ -51,7 +51,7 @@ object ClashParser {
                 current?.let(blocks::add)
                 current = mutableMapOf()
                 // `- {name: a, type: vless}` — the whole entry inline.
-                val head = trimmed.removePrefix("- ").trim()
+                val head = trimmed.removePrefix("- ").stripComment().trim()
                 if (head.startsWith("{")) {
                     current.putAll(inlineMap(head))
                 } else {
@@ -72,7 +72,7 @@ object ClashParser {
     }
 
     private fun node(fields: Map<String, String>, subscriptionId: String?): ProxyNode? {
-        val server = fields["server"] ?: return null
+        val server = normalizeServerHost(fields["server"]) ?: return null
         // The range, not just "is a number". A `port: 0` or `port: 99999` from a mis-rendered
         // template made a node that looked ordinary in the list and could never connect.
         val port = fields["port"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
@@ -179,7 +179,7 @@ object ClashParser {
                 .orEmpty(),
             reality = realityKey?.let {
                 RealityOptions(
-                    publicKey = it,
+                    publicKey = normalizeRealityKey(it),
                     shortId = fields.getAny("short-id", "short_id", "shortId", "sid").orEmpty(),
                     spiderX = fields.getAny("spider-x", "spider_x", "spiderX", "spx", "path") ?: "/",
                 )
@@ -279,9 +279,17 @@ object ClashParser {
      */
     private fun String.stripComment(): String {
         var quote: Char? = null
+        var escaped = false
         forEachIndexed { index, ch ->
+            if (escaped) {
+                escaped = false
+                return@forEachIndexed
+            }
             when {
-                quote != null -> if (ch == quote) quote = null
+                quote != null -> {
+                    if (quote == '"' && ch == '\\') escaped = true
+                    else if (ch == quote) quote = null
+                }
                 ch == '"' || ch == '\'' -> quote = ch
                 ch == '#' && (index == 0 || this[index - 1].isWhitespace()) ->
                     return substring(0, index).trim()
@@ -290,36 +298,106 @@ object ClashParser {
         return trim()
     }
 
-    /** `{a: 1, b: {c: 2}}` — flattened, because nested keys do not collide with the outer ones. */
+    private const val MAX_INLINE_DEPTH = 8
+
+    /** `{a: 1, b: {c: 2}}` — iterative, depth-capped, and quote-aware. */
     private fun inlineMap(text: String): Map<String, String> {
-        val body = text.trim().removePrefix("{").removeSuffix("}")
         val result = mutableMapOf<String, String>()
-        var depth = 0
-        val piece = StringBuilder()
+        val queue = ArrayDeque<Pair<String, Int>>()
+        queue.addLast(text.trim() to 0)
 
-        fun flush() {
-            val part = piece.toString().trim()
-            piece.clear()
-            if (part.isEmpty()) return
-            if (part.contains('{')) {
-                result.putAll(inlineMap(part.substringAfter('{').let { "{$it" }))
-                part.substringBefore('{').toPair()?.let { (key, value) ->
-                    if (value.isNotEmpty()) result[key] = value
+        while (queue.isNotEmpty()) {
+            val (raw, depth) = queue.removeFirst()
+            if (depth > MAX_INLINE_DEPTH) continue
+            val trimmed = raw.trim()
+            val body = when {
+                trimmed.startsWith('{') && trimmed.endsWith('}') -> trimmed.substring(1, trimmed.length - 1)
+                trimmed.startsWith('{') -> trimmed.substring(1)
+                else -> trimmed
+            }
+
+            val piece = StringBuilder()
+            var quote: Char? = null
+            var escaped = false
+            var braceDepth = 0
+            var bracketDepth = 0
+
+            fun flush() {
+                val part = piece.toString().trim()
+                piece.clear()
+                if (part.isEmpty()) return
+
+                var colonIdx = -1
+                var q: Char? = null
+                var esc = false
+                for (i in part.indices) {
+                    val c = part[i]
+                    if (esc) {
+                        esc = false
+                        continue
+                    }
+                    if (q != null) {
+                        if (q == '"' && c == '\\') esc = true
+                        else if (c == q) q = null
+                    } else if (c == '"' || c == '\'') {
+                        q = c
+                    } else if (c == ':') {
+                        colonIdx = i
+                        break
+                    }
                 }
-            } else {
-                part.toPair()?.let { (key, value) -> result[key] = value }
+                if (colonIdx <= 0) return
+                val key = part.substring(0, colonIdx).trim().trim('"', '\'')
+                if (key.isEmpty()) return
+                val rawValue = part.substring(colonIdx + 1).trim()
+                if (rawValue.startsWith('{')) {
+                    if (depth + 1 <= MAX_INLINE_DEPTH) {
+                        queue.addLast(rawValue to (depth + 1))
+                    }
+                } else {
+                    result[key] = rawValue.cleanValue()
+                }
             }
-        }
 
-        for (symbol in body) {
-            when {
-                symbol == '{' -> { depth++; piece.append(symbol) }
-                symbol == '}' -> { depth--; piece.append(symbol) }
-                symbol == ',' && depth == 0 -> flush()
-                else -> piece.append(symbol)
+            for (symbol in body) {
+                if (escaped) {
+                    escaped = false
+                    piece.append(symbol)
+                    continue
+                }
+                if (quote != null) {
+                    if (quote == '"' && symbol == '\\') escaped = true
+                    else if (symbol == quote) quote = null
+                    piece.append(symbol)
+                    continue
+                }
+                when (symbol) {
+                    '"', '\'' -> {
+                        quote = symbol
+                        piece.append(symbol)
+                    }
+                    '{' -> {
+                        braceDepth++
+                        piece.append(symbol)
+                    }
+                    '}' -> {
+                        if (braceDepth > 0) braceDepth--
+                        piece.append(symbol)
+                    }
+                    '[' -> {
+                        bracketDepth++
+                        piece.append(symbol)
+                    }
+                    ']' -> {
+                        if (bracketDepth > 0) bracketDepth--
+                        piece.append(symbol)
+                    }
+                    ',' if braceDepth == 0 && bracketDepth == 0 -> flush()
+                    else -> piece.append(symbol)
+                }
             }
+            flush()
         }
-        flush()
         return result
     }
 

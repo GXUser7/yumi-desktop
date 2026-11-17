@@ -146,4 +146,43 @@ class PairingProtocolTest {
         assertFalse(encoded.contains("statistics", ignoreCase = true))
         assertFalse(encoded.contains("internalId", ignoreCase = true))
     }
+
+    @Test
+    fun inviteDecodeRejectsNonNumericHostAndNonSecp256r1PublicKey() {
+        val validKeys = PairingCrypto.keyPair()
+        val sid = PairingCrypto.sessionId()
+        val domainInvite = "yumi://pair?v=1&host=evil.example.com&port=43127&sid=$sid&key=${PairingCrypto.publicKey(validKeys.public)}&name=TV"
+        assertNull(PairingInvite.decode(domainInvite))
+
+        val p384 = java.security.KeyPairGenerator.getInstance("EC").apply {
+            initialize(java.security.spec.ECGenParameterSpec("secp384r1"))
+        }.generateKeyPair()
+        val p384Encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(p384.public.encoded)
+        assertNull(decodePublicKey(p384Encoded))
+        val p384Invite = "yumi://pair?v=1&host=192.168.1.20&port=43127&sid=$sid&key=$p384Encoded&name=TV"
+        assertNull(PairingInvite.decode(p384Invite))
+    }
+
+    @Test
+    fun transferValidationRejectsRestrictedHeadersAndNullBytes() {
+        for (forbidden in listOf("X-Device-OS", "x-device-model", "X-Ver-OS", "Host")) {
+            assertNull(
+                "Expected header $forbidden to be rejected",
+                SubscriptionTransfer(
+                    name = "x",
+                    url = "https://example.com/sub",
+                    headers = mapOf(forbidden to "v"),
+                ).validate(),
+            )
+        }
+        assertNull(SubscriptionTransfer(name = "bad\u0000name", url = "https://example.com/sub").validate())
+        assertNull(SubscriptionTransfer(name = "ok", url = "https://example.com/sub\u0000").validate())
+        assertNull(
+            SubscriptionTransfer(
+                name = "ok",
+                url = "https://example.com/sub",
+                userAgentOverride = "UA\u0000",
+            ).validate(),
+        )
+    }
 }

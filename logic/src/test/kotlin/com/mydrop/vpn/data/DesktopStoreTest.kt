@@ -24,4 +24,27 @@ class DesktopStoreTest {
         assertEquals("old",store.value)
         blocker.delete();directory.delete()
     }
+    @Test fun relativeFileAndCorruptRecoveryWorkSafely() {
+        val tempDir = Files.createTempDirectory("yumi-corrupt").toFile()
+        try {
+            val file = File(tempDir, "settings.json").apply { writeText("{corrupt") }
+            var failed = false
+            val store = JsonStore(file, String.serializer(), "fallback", TestScope()) { failed = true }
+            assertTrue(failed)
+            assertEquals("fallback", store.value)
+            assertTrue(tempDir.listFiles()?.any { it.name.startsWith("settings.json.corrupt-") } == true)
+            // Relative path without explicit parent should resolve parentFile via absoluteFile.
+            val relativeName = "yumi-rel-test-${System.nanoTime()}.json"
+            val relFile = File(relativeName)
+            try {
+                val relStore = JsonStore(relFile, String.serializer(), "init", TestScope())
+                relStore.update { "ok" }
+                assertEquals("ok", relStore.value)
+            } finally {
+                relFile.delete()
+            }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

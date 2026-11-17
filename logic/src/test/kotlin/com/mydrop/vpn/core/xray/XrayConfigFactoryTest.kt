@@ -53,6 +53,13 @@ class XrayConfigFactoryTest {
         transport = transport,
     )
 
+    private fun validWgKey(seed: Int = 1): String =
+        java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + seed).toByte() })
+
+    private fun validRealityKey(seed: Int = 1): String =
+        java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(ByteArray(32) { (it + seed).toByte() })
+
     private val settings = AppSettings()
 
     private fun build(
@@ -393,12 +400,13 @@ class XrayConfigFactoryTest {
      */
     @Test
     fun `wireguard is a peer with an endpoint and no stream layer`() {
+        val priv = validWgKey(1)
         val config = build(
             node(
                 server = "wg.example.com",
                 port = 51820,
                 settings = ProxySettings.WireGuard(
-                    privateKey = "priv",
+                    privateKey = priv,
                     peerPublicKey = "pub",
                     localAddresses = listOf("10.0.0.2/32"),
                     reserved = listOf(1, 2, 3),
@@ -410,7 +418,7 @@ class XrayConfigFactoryTest {
         assertNull("wireguard has no stream layer to give it", outbound["streamSettings"])
 
         val settings = outbound["settings"]!!.jsonObject
-        assertEquals("priv", settings["secretKey"]!!.jsonPrimitive.content)
+        assertEquals(priv, settings["secretKey"]!!.jsonPrimitive.content)
         assertNull("the pre-1.11 sing-box spelling has no place here", settings["peer_public_key"])
 
         val peer = settings["peers"]!!.jsonArray.single().jsonObject
@@ -424,7 +432,7 @@ class XrayConfigFactoryTest {
             node(
                 server = "2001:db8::1",
                 port = 51820,
-                settings = ProxySettings.WireGuard(privateKey = "priv", peerPublicKey = "pub"),
+                settings = ProxySettings.WireGuard(privateKey = validWgKey(2), peerPublicKey = "pub"),
             ),
         )
         val peer = config.outboundNamed(XrayConfigFactory.nodeTag("n1"))["settings"]!!
@@ -450,12 +458,13 @@ class XrayConfigFactoryTest {
     /** REALITY brings its own verification, so its nodes are not what the report above is about. */
     @Test
     fun `a reality node is not reported as forced verification`() {
+        val pbk = validRealityKey(1)
         val nodes = listOf(
             node(
                 tls = TlsOptions(
                     insecure = true,
                     serverName = "decoy.example.com",
-                    reality = RealityOptions(publicKey = "pbk", shortId = "ab", spiderX = "/"),
+                    reality = RealityOptions(publicKey = pbk, shortId = "ab", spiderX = "/"),
                 ),
             ),
         )
@@ -465,11 +474,12 @@ class XrayConfigFactoryTest {
 
     @Test
     fun `reality keeps the camouflage name and always names a fingerprint`() {
+        val pbk = validRealityKey(2)
         val config = build(
             node(
                 tls = TlsOptions(
                     serverName = "decoy.example.com",
-                    reality = RealityOptions(publicKey = "pbk", shortId = "ab", spiderX = "/x"),
+                    reality = RealityOptions(publicKey = pbk, shortId = "ab", spiderX = "/x"),
                 ),
             ),
         )
@@ -478,7 +488,7 @@ class XrayConfigFactoryTest {
 
         val reality = stream["realitySettings"]!!.jsonObject
         assertEquals("decoy.example.com", reality["serverName"]!!.jsonPrimitive.content)
-        assertEquals("pbk", reality["publicKey"]!!.jsonPrimitive.content)
+        assertEquals(pbk, reality["publicKey"]!!.jsonPrimitive.content)
         assertEquals("ab", reality["shortId"]!!.jsonPrimitive.content)
         // Go's own ClientHello is the signature the whole exercise exists to avoid.
         assertEquals("chrome", reality["fingerprint"]!!.jsonPrimitive.content)
@@ -551,7 +561,7 @@ class XrayConfigFactoryTest {
         assertNull(XrayConfigFactory.unsupported(node(transport = TransportOptions.Xhttp())))
         assertNull(
             XrayConfigFactory.unsupported(
-                node(settings = ProxySettings.WireGuard(privateKey = "a", peerPublicKey = "b")),
+                node(settings = ProxySettings.WireGuard(privateKey = validWgKey(3), peerPublicKey = "b")),
             ),
         )
     }
@@ -616,19 +626,23 @@ class XrayConfigFactoryTest {
     }
 
     /**
-     * A resolver named by domain has to be looked up before it can be asked anything, and there is
-     * no tunnel to do that through yet — the one query that genuinely must go out directly.
+     * A domain-named remote DoH resolver must ride the proxy balancer rather than going direct,
+     * which would leak every encrypted DNS query and trigger a freedom UseIP loop.
      */
     @Test
-    fun `a domain-named resolver gets its bootstrap sent direct`() {
+    fun `a domain-named remote resolver stays on the proxy balancer rather than going direct`() {
         val config = build(
             node(),
             settings = settings.copy(remoteDns = "https://dns.example.com/dns-query"),
         )
-        val bootstrap = config.rules().first { rule ->
-            rule["domain"]?.jsonArray?.any { it.jsonPrimitive.content == "full:dns.example.com" } == true
-        }
-        assertEquals(XrayConfigFactory.DIRECT_TAG, bootstrap["outboundTag"]!!.jsonPrimitive.content)
+        val dnsRules = config.dnsRules()
+        assertFalse(
+            dnsRules.any { rule ->
+                rule["outboundTag"]?.jsonPrimitive?.content == XrayConfigFactory.DIRECT_TAG &&
+                    rule["domain"]?.jsonArray?.any { it.jsonPrimitive.content == "full:dns.example.com" } == true
+            },
+        )
+        assertEquals(XrayConfigFactory.BALANCER_TAG, dnsRules.last()["balancerTag"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -735,10 +749,11 @@ class XrayConfigFactoryTest {
         val probe = config["inbounds"]!!.jsonArray.map { it.jsonObject }
             .first { it["tag"]?.jsonPrimitive?.content == XrayConfigFactory.PROBE_TAG }
 
+        assertEquals("http", probe["protocol"]!!.jsonPrimitive.content)
         assertEquals("127.0.0.1", probe["listen"]!!.jsonPrimitive.content)
-        assertEquals("password", probe["settings"]!!.jsonObject["auth"]!!.jsonPrimitive.content)
         val account = probe["settings"]!!.jsonObject["accounts"]!!.jsonArray.single().jsonObject
         assertEquals("user", account["user"]!!.jsonPrimitive.content)
+        assertEquals("pass", account["pass"]!!.jsonPrimitive.content)
     }
 
     /** The probe measures the tunnel, so it rides it whatever the routing mode says. */
@@ -824,5 +839,103 @@ class XrayConfigFactoryTest {
         assertNull(result!!.group)
         assertEquals("a.example", result.server)
         assertEquals("Auto", result.name)
+    }
+
+    // ------------------------------------------------------------------ Audit Hardening
+
+    @Test
+    fun `domain directDns gets bootstrap server and rules mode scopes direct dns to category-ru`() {
+        val config = build(
+            node(),
+            settings = settings.copy(
+                routingMode = RoutingMode.Rules,
+                remoteDns = "https://1.1.1.1/dns-query",
+                directDns = "https://dns.yandex.ru/dns-query",
+            ),
+            geoAvailable = true,
+        )
+        val servers = config["dns"]!!.jsonObject["servers"]!!.jsonArray
+        val scopedDirect = servers.firstOrNull {
+            it is JsonObject && it["address"]?.jsonPrimitive?.content == "https://dns.yandex.ru/dns-query"
+        } as? JsonObject
+        assertNotNull(scopedDirect)
+        assertEquals(
+            listOf("geosite:category-ru"),
+            scopedDirect!!["domains"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+        val bootstrap = servers.firstOrNull {
+            it is JsonObject && it["address"]?.jsonPrimitive?.content == "1.1.1.1"
+        } as? JsonObject
+        assertNotNull(bootstrap)
+        assertEquals(
+            listOf("full:dns.yandex.ru"),
+            bootstrap!!["domains"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+    }
+
+    @Test
+    fun `disabling ipv6 emits default ipv6 block rule and enabling ipv6 omits it`() {
+        val disabled = build(node(), settings = settings.copy(enableIpv6 = false)).rules()
+        assertTrue(
+            disabled.any { rule ->
+                rule["outboundTag"]?.jsonPrimitive?.content == XrayConfigFactory.BLOCK_TAG &&
+                    rule["ip"]?.jsonArray?.any { it.jsonPrimitive.content == "::/0" } == true
+            },
+        )
+        val enabled = build(node(), settings = settings.copy(enableIpv6 = true)).rules()
+        assertFalse(
+            enabled.any { rule ->
+                rule["outboundTag"]?.jsonPrimitive?.content == XrayConfigFactory.BLOCK_TAG &&
+                    rule["ip"]?.jsonArray?.any { it.jsonPrimitive.content == "::/0" } == true
+            },
+        )
+    }
+
+    @Test
+    fun `unsupported rejects socks4, invalid wireguard key, unknown vless flow, bad reality keys and shortIds`() {
+        assertNotNull(XrayConfigFactory.unsupported(node(settings = ProxySettings.Socks(version = "4"))))
+        assertNotNull(XrayConfigFactory.unsupported(node(settings = ProxySettings.WireGuard(privateKey = "", peerPublicKey = "pub"))))
+        assertNotNull(XrayConfigFactory.unsupported(node(settings = ProxySettings.WireGuard(privateKey = "short", peerPublicKey = "pub"))))
+        assertNotNull(XrayConfigFactory.unsupported(node(settings = ProxySettings.Vless(uuid = "u", flow = "xtls-rprx-direct"))))
+        assertNotNull(
+            XrayConfigFactory.unsupported(
+                node(tls = TlsOptions(reality = RealityOptions(publicKey = "too-short"))),
+            ),
+        )
+        assertNotNull(
+            XrayConfigFactory.unsupported(
+                node(tls = TlsOptions(reality = RealityOptions(publicKey = validRealityKey(1), shortId = "zzzz"))),
+            ),
+        )
+        assertNotNull(
+            XrayConfigFactory.unsupported(
+                node(tls = TlsOptions(reality = RealityOptions(publicKey = validRealityKey(1), shortId = "123"))),
+            ),
+        )
+        assertNotNull(
+            XrayConfigFactory.unsupported(
+                node(tls = TlsOptions(reality = RealityOptions(publicKey = validRealityKey(1), shortId = "0123456789abcdef00"))),
+            ),
+        )
+    }
+
+    @Test
+    fun `buildReality normalizes publicKey, shortId, and prepends slash to spiderX`() {
+        val rawBytes = ByteArray(32) { (it + 11).toByte() }
+        val stdBase64 = java.util.Base64.getEncoder().encodeToString(rawBytes)
+        val urlSafeBase64 = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(rawBytes)
+        val config = build(
+            node(
+                tls = TlsOptions(
+                    serverName = "decoy.example.com",
+                    reality = RealityOptions(publicKey = stdBase64, shortId = "AB:CD", spiderX = "path?x=1"),
+                ),
+            ),
+        )
+        val reality = config.outboundNamed(XrayConfigFactory.nodeTag("n1"))["streamSettings"]!!
+            .jsonObject["realitySettings"]!!.jsonObject
+        assertEquals(urlSafeBase64, reality["publicKey"]!!.jsonPrimitive.content)
+        assertEquals("abcd", reality["shortId"]!!.jsonPrimitive.content)
+        assertEquals("/path?x=1", reality["spiderX"]!!.jsonPrimitive.content)
     }
 }

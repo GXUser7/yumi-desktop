@@ -1,5 +1,6 @@
 package com.mydrop.vpn.core.parse
 
+import com.google.re2j.Pattern
 import com.mydrop.vpn.core.model.NodeGroup
 import com.mydrop.vpn.core.model.ProxyNode
 import com.mydrop.vpn.core.model.identified
@@ -108,7 +109,10 @@ object ConfigDocumentParser {
         val balancers = (routing["balancers"] as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
         for (balancer in balancers) {
             val selector = (balancer["selector"] as? JsonArray)
-                ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNullSafe() }
+                ?.mapNotNull { element ->
+                    val prim = element as? JsonPrimitive ?: return@mapNotNull null
+                    if (prim.isString) prim.content else null
+                }
                 .orEmpty()
             val chosen = tagged.filter { (tag, _) -> tag.isNotEmpty() && selector.any { tag.startsWith(it) } }
             val fallbackTag = balancer.str("fallbackTag")
@@ -119,8 +123,19 @@ object ConfigDocumentParser {
             val type = strategy?.str("type")?.lowercase().orEmpty()
             val options = strategy?.get("settings") as? JsonObject
             val costs = (options?.get("costs") as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
+            val compiledCosts = costs.mapNotNull { cost ->
+                val match = cost.str("match") ?: return@mapNotNull null
+                val value = (cost["value"] as? JsonPrimitive)?.doubleOrNull ?: 0.0
+                val isRegex = cost.bool("regexp")
+                val pattern = if (isRegex) runCatching { Pattern.compile(match) }.getOrNull() else null
+                CompiledCost(match, isRegex, pattern, value)
+            }
             // Stable, so candidates the costs do not tell apart keep the order they were written in.
-            val ordered = if (costs.isNotEmpty()) chosen.sortedBy { (tag, _) -> costOf(costs, tag) } else chosen
+            val ordered = if (compiledCosts.isNotEmpty()) {
+                chosen.sortedBy { (tag, _) -> costOf(compiledCosts, tag) }
+            } else {
+                chosen
+            }
 
             val members = (ordered + listOfNotNull(fallback)).map { it.second }.distinctBy { it.id }
             if (members.size < 2) continue
@@ -140,20 +155,26 @@ object ConfigDocumentParser {
         return null
     }
 
+    private data class CompiledCost(
+        val match: String,
+        val regexp: Boolean,
+        val pattern: Pattern?,
+        val value: Double,
+    )
+
     /**
      * What a `leastLoad` cost list charges for [tag]: the first entry that matches it, as the core
-     * reads them — a regular expression when `regexp` says so, a plain substring otherwise.
-     * Unmatched costs nothing, which is also the core's reading.
+     * reads them — a linear RE2 regular expression when `regexp` says so, a plain substring
+     * otherwise. Unmatched costs nothing, which is also the core's reading.
      */
-    private fun costOf(costs: List<JsonObject>, tag: String): Double =
+    private fun costOf(costs: List<CompiledCost>, tag: String): Double =
         costs.firstOrNull { cost ->
-            val match = cost.str("match") ?: return@firstOrNull false
-            if (cost.bool("regexp")) {
-                runCatching { Regex(match).containsMatchIn(tag) }.getOrDefault(false)
+            if (cost.regexp) {
+                cost.pattern?.matcher(tag)?.find() == true
             } else {
-                tag.contains(match)
+                tag.contains(cost.match)
             }
-        }?.let { (it["value"] as? JsonPrimitive)?.doubleOrNull } ?: 0.0
+        }?.value ?: 0.0
 
     /** A Go duration as the core writes it — `2s`, `1500ms`, `1m` — in milliseconds; 0 if unreadable. */
     private fun durationMillis(value: String?): Int {
@@ -205,7 +226,7 @@ object ConfigDocumentParser {
         val type = outbound.str("type")?.lowercase() ?: return null
         if (type in plumbingTypes) return null
 
-        val server = outbound.str("server") ?: return null
+        val server = normalizeServerHost(outbound.str("server")) ?: return null
         val port = outbound.port("server_port") ?: return null
         val name = outbound.str("tag")?.takeIf { it.isNotBlank() } ?: "$server:$port"
 
@@ -238,7 +259,7 @@ object ConfigDocumentParser {
         val servers = (settingsObject["servers"] as? JsonArray)?.firstOrNull()?.jsonObject
         val endpoint = vnext ?: servers ?: return null
 
-        val server = endpoint.str("address") ?: return null
+        val server = normalizeServerHost(endpoint.str("address")) ?: return null
         val port = endpoint.port("port") ?: return null
         val user = (endpoint["users"] as? JsonArray)?.firstOrNull()?.jsonObject
 
@@ -277,13 +298,20 @@ object ConfigDocumentParser {
         stream?.str("network", "net")?.lowercase()?.let { declared ->
             if (declared !in KNOWN_NETWORKS && declared !in PLAIN_NETWORKS) return null
         }
+        val security = stream?.str("security")?.lowercase()
+        val tls = when (security) {
+            null, "", "none" -> null
+            "tls" -> xrayTls(stream)
+            "reality" -> xrayTls(stream) ?: return null
+            else -> return null
+        }
         return ProxyNode(
             id = "",
             name = label?.takeIf { it.isNotBlank() } ?: outbound.str("tag") ?: "$server:$port",
             server = server,
             port = port,
             settings = proxySettings,
-            tls = stream?.let(::xrayTls),
+            tls = tls,
             transport = stream?.let(::xrayTransport),
             subscriptionId = subscriptionId,
         ).identified()
@@ -295,37 +323,49 @@ object ConfigDocumentParser {
 
     private fun xrayTls(stream: JsonObject): TlsOptions? {
         val security = stream.str("security")?.lowercase()
-        if (security.isNullOrEmpty() || security == "none") return null
-
-        val tlsSettings = stream["tlsSettings"]?.jsonObject
-            ?: stream["tls_settings"]?.jsonObject
-            ?: stream["tls-settings"]?.jsonObject
-        val realitySettings = stream["realitySettings"]?.jsonObject
-            ?: stream["reality_settings"]?.jsonObject
-            ?: stream["reality-settings"]?.jsonObject
-        val active = realitySettings ?: tlsSettings
-
-        return TlsOptions(
-            serverName = active?.str("serverName", "server_name", "server-name", "servername", "sni", "peer"),
-            insecure = tlsSettings?.bool("allowInsecure", "allow_insecure", "allowinsecure", "skip-cert-verify", "skip_cert_verify", "insecure") ?: false,
-            alpn = ((tlsSettings?.get("alpn") ?: tlsSettings?.get("alpn_list")) as? JsonArray)
-                ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNullSafe() }
-                .orEmpty(),
-            fingerprint = active?.str("fingerprint", "client_fingerprint", "client-fingerprint", "fp"),
-            pinnedCertSha256 = tlsSettings
-                ?.str("pinnedPeerCertSha256", "pinned_peer_cert_sha256", "pcs")
-                .orEmpty(),
-            verifyPeerCertByName = tlsSettings
-                ?.str("verifyPeerCertByName", "verify_peer_cert_by_name", "vcn")
-                .orEmpty(),
-            reality = (realitySettings?.str("publicKey", "public_key", "public-key", "pbk", "publickey", "pubkey", "key"))?.let { key ->
-                RealityOptions(
-                    publicKey = normalizeRealityKey(key),
-                    shortId = realitySettings.str("shortId", "short_id", "short-id", "shortid", "sid").orEmpty(),
-                    spiderX = realitySettings.str("spiderX", "spider_x", "spider-x", "spiderx", "spx", "path") ?: "/",
+        return when (security) {
+            "tls" -> {
+                val tlsSettings = stream["tlsSettings"]?.jsonObject
+                    ?: stream["tls_settings"]?.jsonObject
+                    ?: stream["tls-settings"]?.jsonObject
+                TlsOptions(
+                    serverName = tlsSettings?.str("serverName", "server_name", "server-name", "servername", "sni", "peer"),
+                    insecure = tlsSettings?.bool("allowInsecure", "allow_insecure", "allowinsecure", "skip-cert-verify", "skip_cert_verify", "insecure") ?: false,
+                    alpn = ((tlsSettings?.get("alpn") ?: tlsSettings?.get("alpn_list")) as? JsonArray)
+                        ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNullSafe() }
+                        .orEmpty(),
+                    fingerprint = tlsSettings?.str("fingerprint", "client_fingerprint", "client-fingerprint", "fp"),
+                    pinnedCertSha256 = tlsSettings
+                        ?.str("pinnedPeerCertSha256", "pinned_peer_cert_sha256", "pcs")
+                        .orEmpty(),
+                    verifyPeerCertByName = tlsSettings
+                        ?.str("verifyPeerCertByName", "verify_peer_cert_by_name", "vcn")
+                        .orEmpty(),
+                    reality = null,
                 )
-            },
-        )
+            }
+            "reality" -> {
+                val realitySettings = stream["realitySettings"]?.jsonObject
+                    ?: stream["reality_settings"]?.jsonObject
+                    ?: stream["reality-settings"]?.jsonObject
+                    ?: return null
+                val key = realitySettings.str("publicKey", "public_key", "public-key", "pbk", "publickey", "pubkey", "key")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: return null
+                TlsOptions(
+                    serverName = realitySettings.str("serverName", "server_name", "server-name", "servername", "sni", "peer"),
+                    insecure = false,
+                    alpn = emptyList(),
+                    fingerprint = realitySettings.str("fingerprint", "client_fingerprint", "client-fingerprint", "fp"),
+                    reality = RealityOptions(
+                        publicKey = normalizeRealityKey(key),
+                        shortId = realitySettings.str("shortId", "short_id", "short-id", "shortid", "sid").orEmpty(),
+                        spiderX = realitySettings.str("spiderX", "spider_x", "spider-x", "spiderx", "spx", "path") ?: "/",
+                    ),
+                )
+            }
+            else -> null
+        }
     }
 
     private fun xrayTransport(stream: JsonObject): TransportOptions? =
@@ -383,7 +423,7 @@ object ConfigDocumentParser {
     // -------------------------------------------------------------- SIP008
 
     private fun sip008(entry: JsonObject, subscriptionId: String?): ProxyNode? {
-        val server = entry.str("server") ?: return null
+        val server = normalizeServerHost(entry.str("server")) ?: return null
         val port = entry.port("server_port") ?: return null
         val settings = ProxySettings.Shadowsocks(
             method = entry.str("method") ?: return null,

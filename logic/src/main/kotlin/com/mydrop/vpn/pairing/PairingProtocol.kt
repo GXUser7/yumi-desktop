@@ -1,16 +1,23 @@
 package com.mydrop.vpn.pairing
 
+import com.mydrop.vpn.core.net.isNumericAddress
+import java.math.BigInteger
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.AlgorithmParameters
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.PublicKey
 import java.security.SecureRandom
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPoint
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import javax.crypto.Cipher
@@ -64,6 +71,7 @@ data class PairingInvite(
                 deviceName = values["name"].orEmpty(),
             ).takeIf {
                 it.version == VERSION && it.port in 1..65535 &&
+                    isNumericAddress(it.host) &&
                     Base64.getUrlDecoder().decode(it.sessionId).size >= 16 &&
                     decodePublicKey(it.receiverPublicKey) != null
             }
@@ -83,14 +91,24 @@ data class SubscriptionTransfer(
     fun validate(): SubscriptionTransfer? = takeIf {
         version == VERSION &&
             name.length in 1..256 &&
+            '\u0000' !in name &&
             url.length in 8..16_384 &&
+            '\u0000' !in url && '\n' !in url && '\r' !in url &&
             (url.startsWith("https://", true) || url.startsWith("http://", true)) &&
             (userAgentOverride == null ||
-                userAgentOverride.length <= 1_024 && '\n' !in userAgentOverride && '\r' !in userAgentOverride) &&
+                (userAgentOverride.length <= 1_024 &&
+                    '\n' !in userAgentOverride &&
+                    '\r' !in userAgentOverride &&
+                    '\u0000' !in userAgentOverride)) &&
             headers.size <= 32 && headers.all { (key, value) ->
-                !key.equals("x-hwid", ignoreCase = true) &&
-                    key.length in 1..128 && value.length <= 4_096 && '\n' !in key && '\r' !in key &&
-                    '\n' !in value && '\r' !in value
+                val lower = key.lowercase()
+                lower != "x-hwid" &&
+                    !lower.startsWith("x-device-") &&
+                    lower != "x-ver-os" &&
+                    lower != "host" &&
+                    key.length in 1..128 && value.length <= 4_096 &&
+                    '\n' !in key && '\r' !in key && '\u0000' !in key &&
+                    '\n' !in value && '\r' !in value && '\u0000' !in value
             }
     }
 }
@@ -201,8 +219,39 @@ internal object PairingCrypto {
         "yumi-pair-v1:$sessionId:$direction".toByteArray()
 }
 
+private val P256_SPEC: ECParameterSpec by lazy {
+    AlgorithmParameters.getInstance("EC").apply {
+        init(ECGenParameterSpec("secp256r1"))
+    }.getParameterSpec(ECParameterSpec::class.java)
+}
+
 internal fun decodePublicKey(encoded: String): PublicKey? = runCatching {
-    KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(encoded.base64UrlBytes()))
+    val key = KeyFactory.getInstance("EC")
+        .generatePublic(X509EncodedKeySpec(encoded.base64UrlBytes())) as? ECPublicKey
+        ?: return null
+    val params = key.params ?: return null
+    val expected = P256_SPEC
+    if (params.curve != expected.curve ||
+        params.generator != expected.generator ||
+        params.order != expected.order ||
+        params.cofactor != expected.cofactor
+    ) {
+        return null
+    }
+    val point = key.w
+    if (point == ECPoint.POINT_INFINITY) return null
+    val field = expected.curve.field as? ECFieldFp ?: return null
+    val p = field.p
+    val x = point.affineX
+    val y = point.affineY
+    if (x < BigInteger.ZERO || x >= p || y < BigInteger.ZERO || y >= p) return null
+    val lhs = y.modPow(BigInteger.TWO, p)
+    val rhs = x.modPow(BigInteger.valueOf(3), p)
+        .add(expected.curve.a.multiply(x))
+        .add(expected.curve.b)
+        .mod(p)
+    if (lhs != rhs) return null
+    key
 }.getOrNull()
 
 internal fun ByteArray.base64Url(): String =

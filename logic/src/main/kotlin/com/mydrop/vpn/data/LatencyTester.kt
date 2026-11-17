@@ -5,9 +5,13 @@ import com.mydrop.vpn.core.model.NodeGroup
 import com.mydrop.vpn.core.model.PingMode
 import com.mydrop.vpn.core.model.ProxyNode
 import java.io.Closeable
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -41,7 +45,20 @@ import kotlinx.coroutines.withContext
  * unmeasurable for that reason.
  */
 class LatencyTester(private val maxConcurrency: Int = 16) {
+    private var resolver: (String) -> InetAddress = InetAddress::getByName
+    private var timeoutMillis: Int = LatencyResult.TIMEOUT_MILLIS
+
+    internal constructor(
+        resolver: (String) -> InetAddress,
+        timeoutMillis: Int = LatencyResult.TIMEOUT_MILLIS,
+        maxConcurrency: Int = 16,
+    ) : this(maxConcurrency) {
+        this.resolver = resolver
+        this.timeoutMillis = timeoutMillis
+    }
+
     private val groupProbes = Semaphore(maxConcurrency)
+    private val probeExecutor = Dispatchers.IO.asExecutor()
 
     suspend fun measure(node: ProxyNode, mode: PingMode = PingMode.Tcp): LatencyResult {
         val group = node.group
@@ -87,17 +104,58 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
         return if (ok) ((System.nanoTime() - start) / 1_000_000).toInt() else null
     }
 
-    private suspend fun tcpHandshake(node: ProxyNode): Boolean = probeSocket(Socket()) {
-        it.connect(InetSocketAddress(node.server, node.port), TIMEOUT)
+    private suspend fun tcpHandshake(node: ProxyNode): Boolean = probeSocket(::Socket) { socket ->
+        val host = node.server.trim().removeSurrounding("[", "]")
+        val address = resolver(host)
+        socket.connect(InetSocketAddress(address, node.port), timeoutMillis)
     }
 
-    /** Cancellation closes an in-flight socket, rather than waiting for its timeout. */
-    private suspend fun <S : Closeable> probeSocket(socket: S, block: (S) -> Unit): Boolean =
-        suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { runCatching { socket.close() } }
-            val success = socket.use { runCatching { block(it) }.isSuccess }
-            continuation.resume(success)
-        }
+    /**
+     * Runs blocking DNS resolution and socket I/O off the structured coroutine so cancellation or
+     * [withTimeoutOrNull] returns immediately even when `getaddrinfo` blocks.
+     */
+    private suspend fun <S : Closeable> probeSocket(
+        createSocket: () -> S,
+        block: (S) -> Unit,
+    ): Boolean {
+        val socketRef = AtomicReference<S?>(null)
+        val cancelled = AtomicBoolean(false)
+        return withTimeoutOrNull(timeoutMillis.toLong()) {
+            suspendCancellableCoroutine { continuation ->
+                continuation.invokeOnCancellation {
+                    cancelled.set(true)
+                    socketRef.getAndSet(null)?.let { runCatching { it.close() } }
+                }
+                probeExecutor.execute {
+                    var socket: S? = null
+                    val success = try {
+                        if (cancelled.get() || !continuation.isActive) {
+                            false
+                        } else {
+                            socket = createSocket()
+                            socketRef.set(socket)
+                            if (cancelled.get() || !continuation.isActive) {
+                                runCatching { socket.close() }
+                                false
+                            } else {
+                                block(socket)
+                                true
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        false
+                    } finally {
+                        cancelled.set(true)
+                        socketRef.set(null)
+                        socket?.let { runCatching { it.close() } }
+                    }
+                    if (continuation.isActive) {
+                        continuation.resume(success)
+                    }
+                }
+            }
+        } ?: false
+    }
 
     /**
      * Connect plus a full TLS handshake. Costs two or three round trips instead of one, and in
@@ -107,13 +165,17 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
      * Certificates are not validated: see [probeSocketFactory] for why that is the only setting
      * under which this mode measures anything at all.
      */
-    private suspend fun tlsHandshake(node: ProxyNode): Boolean = probeSocket(Socket()) { raw ->
-        raw.connect(InetSocketAddress(node.server, node.port), TIMEOUT)
-        val name = node.tls?.serverName?.takeIf(String::isNotEmpty) ?: node.server
-        (probeSocketFactory.createSocket(raw, name, node.port, false) as SSLSocket).use { tls ->
-            tls.soTimeout = TIMEOUT
-            tls.startHandshake()
-        }
+    private suspend fun tlsHandshake(node: ProxyNode): Boolean = probeSocket(::Socket) { raw ->
+        val host = node.server.trim().removeSurrounding("[", "]")
+        val address = resolver(host)
+        raw.connect(InetSocketAddress(address, node.port), timeoutMillis)
+        val name = (node.tls?.serverName?.takeIf(String::isNotBlank) ?: node.server)
+            .trim()
+            .removeSurrounding("[", "]")
+        val tls = probeSocketFactory.createSocket(raw, name, node.port, false) as SSLSocket
+        tls.soTimeout = timeoutMillis
+        tls.startHandshake()
+        // Intentionally do not call tls.close(): closing `raw` in probeSocket avoids hanging on close_notify.
     }
 
     /**
@@ -145,9 +207,10 @@ class LatencyTester(private val maxConcurrency: Int = 16) {
      * drop it, and endpoints with obfuscation (Hysteria2's salamander, say) will not answer at
      * all, so those still read as unreachable.
      */
-    private suspend fun quicProbe(node: ProxyNode): Boolean = probeSocket(DatagramSocket()) { socket ->
-        socket.soTimeout = TIMEOUT
-        val address = InetAddress.getByName(node.server)
+    private suspend fun quicProbe(node: ProxyNode): Boolean = probeSocket(::DatagramSocket) { socket ->
+        socket.soTimeout = timeoutMillis
+        val host = node.server.trim().removeSurrounding("[", "]")
+        val address = resolver(host)
         val packet = versionNegotiationProbe()
         socket.send(DatagramPacket(packet, packet.size, address, node.port))
         socket.receive(DatagramPacket(ByteArray(1500), 1500))

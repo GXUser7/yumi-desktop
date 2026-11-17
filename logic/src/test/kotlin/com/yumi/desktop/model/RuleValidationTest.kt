@@ -7,6 +7,9 @@ class RuleValidationTest {
     @Test fun normalizesDomainsAndApplications() {
         assertEquals("example.com",RuleValidation.domain("*.Example.COM."))
         assertEquals("2001:db8::/32",RuleValidation.network("2001:db8::/32"))
+        assertEquals("2001:db8::1/64",RuleValidation.network(" [2001:db8::1] / 64 "))
+        assertEquals("2001:db8::1",RuleValidation.network("[2001:db8::1]"))
+        assertEquals("10.0.0.0/8",RuleValidation.network(" 10.0.0.0 / 08 "))
     }
     @Test fun applicationsAreProcessNames() {
         // Older settings held whole paths; they come back as the name the core matches on. The

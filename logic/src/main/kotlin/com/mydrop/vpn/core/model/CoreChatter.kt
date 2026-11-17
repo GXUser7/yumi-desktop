@@ -64,6 +64,7 @@ class CoreChatter(
     data class Verdict(val write: Boolean, val suppressed: Int)
 
     /** Whether one line from the core may be written now. */
+    @Synchronized
     fun admit(nowMillis: Long): Verdict {
         refill(nowMillis)
 
@@ -100,6 +101,7 @@ class CoreChatter(
     }
 
     /** Forgotten along with the core that was shouting. */
+    @Synchronized
     fun reset() {
         tokens = burst.toDouble()
         refilledAtMillis = UNSTARTED

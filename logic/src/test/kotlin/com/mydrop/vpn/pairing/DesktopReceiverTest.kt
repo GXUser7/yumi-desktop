@@ -53,4 +53,55 @@ class DesktopReceiverTest {
             assertEquals(0,calls);assertTrue(receiver.state.value is PairingReceiverState.Waiting)
         }finally{receiver.stop();scope.cancel()}
     }
+
+    @Test fun preClaimUnauthenticatedConnectionsAreIgnoredAndSessionSurvives(): Unit = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        var received: SubscriptionTransfer? = null
+        val receiver = PairingReceiver(
+            { InetAddress.getByName("127.0.0.1") as Inet4Address },
+            scope,
+        ) { received = it; PairingResult(true, "accepted", it.name) }
+        try {
+            receiver.start("Desktop")
+            val waiting = withTimeout(3000) {
+                receiver.state.first { it is PairingReceiverState.Waiting }
+            } as PairingReceiverState.Waiting
+
+            // Garbage pre-claim connection must be closed without poisoning Waiting state.
+            withContext(Dispatchers.IO) {
+                Socket("127.0.0.1", waiting.invite.port).use { rogue ->
+                    rogue.soTimeout = 3000
+                    rogue.getOutputStream().write(byteArrayOf(0, 0, 0, 5, 1, 2, 3, 4, 5))
+                    rogue.getOutputStream().flush()
+                    assertEquals(-1, rogue.getInputStream().read())
+                }
+            }
+            assertTrue(receiver.state.value is PairingReceiverState.Waiting)
+
+            // Valid authenticated transfer still succeeds on the same session.
+            val transfer = SubscriptionTransfer(name = "Legit", url = "https://provider.example/sub/ok")
+            val (request, key) = PairingCrypto.request(waiting.invite, transfer)
+            withContext(Dispatchers.IO) {
+                Socket("127.0.0.1", waiting.invite.port).use { socket ->
+                    socket.soTimeout = 3000
+                    val bytes = PairingCrypto.json.encodeToString(request).toByteArray()
+                    val output = DataOutputStream(socket.getOutputStream())
+                    output.writeInt(bytes.size)
+                    output.write(bytes)
+                    output.flush()
+                    val input = DataInputStream(socket.getInputStream())
+                    val length = input.readInt()
+                    val reply = ByteArray(length)
+                    input.readFully(reply)
+                    val envelope = PairingCrypto.json.decodeFromString<ReplyEnvelope>(reply.decodeToString())
+                    assertEquals("accepted", PairingCrypto.openReply(envelope, key, waiting.invite.sessionId).status)
+                }
+            }
+            assertEquals(transfer, received)
+            withTimeout(3000) { receiver.state.first { it is PairingReceiverState.Complete } }
+        } finally {
+            receiver.stop()
+            scope.cancel()
+        }
+    }
 }

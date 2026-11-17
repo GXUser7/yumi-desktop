@@ -90,20 +90,38 @@ import kotlinx.serialization.json.*
 
 object ConnectRequestFactory {
     fun create(node: ProxyNode, settings: AppSettings, desktop: DesktopSettings): ServiceRequest {
-        fun outbound(server: ProxyNode): JsonObject {
-            val document = XrayConfigFactory.build(listOf(server), server, settings.copy(routingMode = RoutingMode.Global), geoAvailable = false)
-            return Json.parseToJsonElement(document.json).jsonObject.getValue("outbounds").jsonArray.first().jsonObject
+        require(node.settings !is ProxySettings.Direct) { "Direct node cannot be used as a proxy outbound" }
+        val carried = requireNotNull(XrayConfigFactory.carriable(node)) {
+            val reason = XrayConfigFactory.unsupported(node) ?: node.protocol.label
+            "Unsupported node: $reason"
         }
-        val members = node.dialed().map(::outbound)
+        require(carried.dialed().none { it.settings is ProxySettings.Direct }) {
+            "Direct node cannot be used as a proxy outbound"
+        }
+        fun outbound(server: ProxyNode): JsonObject {
+            val document = XrayConfigFactory.build(
+                listOf(server),
+                server,
+                settings.copy(routingMode = RoutingMode.Global),
+                geoAvailable = false,
+            )
+            return Json.parseToJsonElement(document.json).jsonObject
+                .getValue("outbounds").jsonArray.first().jsonObject
+        }
+        val members = carried.dialed().map(::outbound)
         val outbound = members.first()
-        return ServiceRequest(command = "connect", nodeId = node.id, outbound = outbound,
-            group = node.group?.let { OutboundGroup(members, it.strategy, it.maxDelayMillis) },
+        return ServiceRequest(
+            command = "connect",
+            nodeId = node.id,
+            outbound = outbound,
+            group = carried.group?.let { OutboundGroup(members, it.strategy, it.maxDelayMillis) },
             serverCountry = WorldMap.countryCodeOf(node.name) ?: "",
-            options = options(settings, desktop))
+            options = options(settings, desktop),
+        )
     }
 
     fun options(settings: AppSettings, desktop: DesktopSettings): TunnelOptions = TunnelOptions(
-        mtu = settings.mtu,
+        mtu = settings.mtu.coerceIn(1280, 9000),
         ipv6 = settings.enableIpv6,
         bypassLan = settings.bypassLan,
         dns = settings.remoteDns,

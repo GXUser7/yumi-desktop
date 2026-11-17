@@ -128,7 +128,7 @@ data class ProxyNode(
         }
 
         private fun ProxySettings.credentialFingerprint(): String = when (this) {
-            is ProxySettings.Vless -> uuid
+            is ProxySettings.Vless -> if (flow.isEmpty()) uuid else "$uuid|$flow"
             is ProxySettings.Vmess -> uuid
             is ProxySettings.Trojan -> password
             is ProxySettings.Shadowsocks -> "$method:$password"
@@ -137,7 +137,7 @@ data class ProxyNode(
             is ProxySettings.Hysteria -> auth
             is ProxySettings.Tuic -> "$uuid:$password"
             is ProxySettings.AnyTls -> password
-            is ProxySettings.WireGuard -> peerPublicKey
+            is ProxySettings.WireGuard -> "$privateKey|$peerPublicKey|${localAddresses.joinToString(",")}"
             is ProxySettings.Ssh -> "$user:$password"
             is ProxySettings.Http -> "$username:$password"
             is ProxySettings.Socks -> "$username:$password"

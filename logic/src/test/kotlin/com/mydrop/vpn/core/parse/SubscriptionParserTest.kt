@@ -100,4 +100,14 @@ class SubscriptionParserTest {
         assertNull(SubscriptionParser.parseUserInfo(""))
         assertNull(SubscriptionParser.parseUserInfo("garbage"))
     }
+
+    @Test
+    fun `happ crypt subscription body returns UnsupportedFormat`() {
+        val plain = SubscriptionParser.parse("happ://crypt3/encrypted-payload", "sub-1")
+        assertTrue(plain is SubscriptionBody.UnsupportedFormat)
+
+        val encoded = Base64.getEncoder().encodeToString("happ://crypt4/payload".toByteArray())
+        val fromB64 = SubscriptionParser.parse(encoded, "sub-1")
+        assertTrue(fromB64 is SubscriptionBody.UnsupportedFormat)
+    }
 }

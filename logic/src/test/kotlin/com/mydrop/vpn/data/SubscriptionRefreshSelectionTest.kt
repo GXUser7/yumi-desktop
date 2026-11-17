@@ -8,6 +8,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -178,5 +181,34 @@ class SubscriptionRefreshSelectionTest {
             rotated.id,
             repo.state.value.selectedNodeId,
         )
+    }
+
+    @Test
+    fun `selectedNode hides nodes belonging to a disabled subscription`() {
+        val repo = repository()
+        val mine = node("Бельгия", "be.example.com", "uuid-1", sub)
+        repo.seed(mine)
+        repo.selectNode(mine.id)
+        assertEquals(mine, repo.selectedNode())
+
+        repo.setSubscriptionEnabled(sub, false)
+        assertNull(repo.selectedNode())
+
+        repo.setSubscriptionEnabled(sub, true)
+        assertEquals(mine, repo.selectedNode())
+    }
+
+    @Test
+    fun `recordLatencies map overload records successes and failures atomically`() {
+        val repo = repository()
+        val a = node("A", "a.example.com", "u1", sub)
+        val b = node("B", "b.example.com", "u2", sub)
+        repo.seed(a, b)
+
+        repo.recordLatencies(mapOf(a.id to 42L, b.id to null))
+        val latencies = repo.state.value.latencies
+        assertEquals(42, latencies[a.id]!!.millis)
+        assertFalse(latencies[a.id]!!.failed)
+        assertTrue(latencies[b.id]!!.failed)
     }
 }

@@ -48,9 +48,13 @@ object RuleValidation {
     }
     fun network(raw: String): String {
         val parts = raw.trim().split('/')
-        require(parts.size in 1..2 && isNumericAddress(parts[0])) { "Invalid IP address" }
-        if (parts.size == 2) require(parts[1].toIntOrNull() in 0..(if (':' in parts[0]) 128 else 32)) { "Invalid prefix" }
-        return raw.trim()
+        require(parts.size in 1..2) { "Invalid IP address" }
+        val address = parts[0].trim().removeSurrounding("[", "]").trim()
+        require(isNumericAddress(address)) { "Invalid IP address" }
+        if (parts.size == 1) return address
+        val prefix = parts[1].trim().toIntOrNull()
+        require(prefix != null && prefix in 0..(if (':' in address) 128 else 32)) { "Invalid prefix" }
+        return "$address/$prefix"
     }
 
     /**

@@ -10,8 +10,12 @@ import com.mydrop.vpn.core.net.isNumericAddress
     /** Process names — `chrome.exe` — the way Clash keeps them. Older settings hold full paths,
      *  which [RuleValidation.application] turns into names as they are read. */
     val applications: List<String> = emptyList(),
+    /** Whether [applications] is applied to the tunnel; turning it off keeps the list saved. */
+    val applicationsEnabled: Boolean = true,
     val domains: List<String> = emptyList(),
     val networks: List<String> = emptyList(),
+    /** Whether [domains] and [networks] are applied to the tunnel; turning it off keeps both saved. */
+    val sitesEnabled: Boolean = true,
     val launchAtLogin: Boolean = false,
     /** Connect the selected server once the service is ready after application startup. */
     val connectOnLaunch: Boolean = false,

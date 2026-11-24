@@ -224,9 +224,13 @@ private fun PickerRow(
 
 /** The program's icon on a soft plate, or a generic one where the program has none to give. */
 @Composable
-fun AppIcon(icon: ImageBitmap?, fallback: androidx.compose.ui.graphics.vector.ImageVector = Icons.Rounded.Apps) {
+fun AppIcon(
+    icon: ImageBitmap?,
+    fallback: androidx.compose.ui.graphics.vector.ImageVector = Icons.Rounded.Apps,
+    modifier: Modifier = Modifier,
+) {
     Box(
-        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f)),
+        modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f)),
         contentAlignment = Alignment.Center,
     ) {
         if (icon != null) Image(icon, null, Modifier.size(28.dp))
@@ -234,7 +238,7 @@ fun AppIcon(icon: ImageBitmap?, fallback: androidx.compose.ui.graphics.vector.Im
     }
 }
 
-private object AppIconCache {
+internal object AppIconCache {
     private const val MAX_ENTRIES = 256
     private val missing = Any()
     private val entries = object : LinkedHashMap<String, Any>(MAX_ENTRIES, 0.75f, true) {
@@ -252,17 +256,29 @@ private object AppIconCache {
     fun put(path: String, bitmap: ImageBitmap?) = synchronized(this) {
         entries[path] = bitmap ?: missing
     }
+
+    fun clear() = synchronized(this) { entries.clear() }
 }
 
 /** The icon Explorer shows for [path], loaded off the UI thread and cached in an LRU map. */
 @Composable
-fun rememberAppIcon(path: String?): ImageBitmap? {
+fun rememberAppIcon(path: String?): ImageBitmap? =
+    rememberAppIcon(path) { target -> AppCatalog.icon(target, 32)?.toComposeImageBitmap() }
+
+@Composable
+internal fun rememberAppIcon(path: String?, load: suspend (String) -> ImageBitmap?): ImageBitmap? {
     val cached = remember(path) { if (path.isNullOrBlank()) true to null else AppIconCache.get(path) }
-    val icon by produceState(cached.second, path) {
+    var icon by remember(path) { mutableStateOf(cached.second) }
+    LaunchedEffect(path) {
         if (!path.isNullOrBlank() && !cached.first) {
-            val loaded = withContext(Dispatchers.IO) { AppCatalog.icon(path, 32)?.toComposeImageBitmap() }
+            val existing = AppIconCache.get(path)
+            if (existing.first) {
+                icon = existing.second
+                return@LaunchedEffect
+            }
+            val loaded = withContext(Dispatchers.IO) { load(path) }
             AppIconCache.put(path, loaded)
-            value = loaded
+            icon = loaded
         }
     }
     return icon

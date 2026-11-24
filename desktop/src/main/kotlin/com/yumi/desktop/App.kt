@@ -1140,12 +1140,30 @@ private val ReadingWidth = 860.dp
         RussiaPanel(m, current, status)
 
         GlassPanel(Modifier.fillMaxWidth()) {
+            val appsAlpha by animateFloatAsState(if (current.applicationsEnabled) 1f else 0.55f, colorTween(), label = "routing-apps-alpha")
             SectionTitle(
                 m.text("Приложения", "Applications"),
-                if (current.splitMode == SplitMode.ExceptSelected) m.text("Мимо VPN", "Around the VPN") else m.text("Через VPN", "Through the VPN"),
+                when {
+                    !current.applicationsEnabled -> m.text("Список выключен", "List off")
+                    current.splitMode == SplitMode.ExceptSelected -> m.text("Мимо VPN", "Around the VPN")
+                    else -> m.text("Через VPN", "Through the VPN")
+                },
             ) {
                 AccentButton(m.text("Выбрать", "Choose"), icon = Icons.Rounded.Add) { picking = true }
+                Switch(
+                    current.applicationsEnabled,
+                    { m.changeDesktop({ d -> d.copy(applicationsEnabled = it) }) },
+                    Modifier.testTag("routing-apps-switch"),
+                )
             }
+            if (!current.applicationsEnabled) Text(
+                m.text(
+                    "Список сохранён, но сейчас не применяется к туннелю.",
+                    "The list is saved, but is not applied to the tunnel right now.",
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             if (current.applications.isEmpty()) Text(
                 m.text(
                     "Найди программу в списке запущенных и установленных или впиши имя процесса — например, telegram.exe.",
@@ -1155,29 +1173,69 @@ private val ReadingWidth = 860.dp
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             current.applications.forEach { process ->
-                val app = known.firstOrNull { it.process.equals(process, true) }
-                Row(
-                    Modifier.fillMaxWidth().clip(RowShape).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)).padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    AppIcon(rememberAppIcon(app?.path), Icons.Rounded.Terminal)
-                    Column(Modifier.weight(1f)) {
-                        Text(app?.name ?: com.yumi.desktop.platform.AppCatalog.prettify(process), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(process, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-                    }
-                    if (app?.running == true) Plate(m.text("запущено", "running"))
-                    PanelIconButton(Icons.Rounded.Close, m.text("Убрать", "Remove"), size = 40.dp) {
-                        m.changeDesktop(current.copy(applications = current.applications - process), true)
+                key(process.lowercase()) {
+                    val app = known.firstOrNull { it.process.equals(process, true) }
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .testTag("routing-app-${process.lowercase()}")
+                            .graphicsLayer { alpha = appsAlpha }
+                            .clip(RowShape)
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        AppIcon(
+                            rememberAppIcon(app?.path),
+                            Icons.Rounded.Terminal,
+                            Modifier.testTag("routing-app-icon-${process.lowercase()}"),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(app?.name ?: com.yumi.desktop.platform.AppCatalog.prettify(process), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(process, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                        }
+                        if (app?.running == true) Plate(m.text("запущено", "running"))
+                        PanelIconButton(
+                            Icons.Rounded.Close,
+                            m.text("Убрать", "Remove"),
+                            Modifier.testTag("routing-app-remove-${process.lowercase()}"),
+                            size = 40.dp,
+                        ) {
+                            m.changeDesktop({ it.copy(applications = it.applications - process) })
+                        }
                     }
                 }
             }
         }
 
         GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(m.text("Сайты и адреса", "Sites and addresses"), m.text("По имени и IP", "By name and IP"))
-            GlassField(domains, { domains = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("Домены, по одному в строке", "Domains, one per line"), placeholder = "example.com", singleLine = false, minLines = 3, isError = invalid)
-            GlassField(networks, { networks = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("IP и подсети, по одному в строке", "IP addresses and subnets, one per line"), placeholder = "203.0.113.0/24", singleLine = false, minLines = 3, isError = invalid)
+            val sitesAlpha by animateFloatAsState(if (current.sitesEnabled) 1f else 0.55f, colorTween(), label = "routing-sites-alpha")
+            SectionTitle(
+                m.text("Сайты и адреса", "Sites and addresses"),
+                when {
+                    !current.sitesEnabled -> m.text("Список выключен", "List off")
+                    current.splitMode == SplitMode.ExceptSelected -> m.text("Мимо VPN · по имени и IP", "Around the VPN · by name and IP")
+                    else -> m.text("Через VPN · по имени и IP", "Through the VPN · by name and IP")
+                },
+            ) {
+                Switch(
+                    current.sitesEnabled,
+                    { m.changeDesktop({ d -> d.copy(sitesEnabled = it) }) },
+                    Modifier.testTag("routing-sites-switch"),
+                )
+            }
+            if (!current.sitesEnabled) Text(
+                m.text(
+                    "Домены и адреса сохранены, но сейчас не применяются к туннелю.",
+                    "Domains and addresses are saved, but are not applied to the tunnel right now.",
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Column(Modifier.fillMaxWidth().graphicsLayer { alpha = sitesAlpha }, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                GlassField(domains, { domains = it; invalid = false }, Modifier.fillMaxWidth().testTag("routing-domains"), label = m.text("Домены, по одному в строке", "Domains, one per line"), placeholder = "example.com", singleLine = false, minLines = 3, isError = invalid)
+                GlassField(networks, { networks = it; invalid = false }, Modifier.fillMaxWidth().testTag("routing-networks"), label = m.text("IP и подсети, по одному в строке", "IP addresses and subnets, one per line"), placeholder = "203.0.113.0/24", singleLine = false, minLines = 3, isError = invalid)
+            }
             Text(
                 m.text(
                     "Домены включают поддомены и действуют сильнее баз: так можно вернуть в VPN отдельный российский сайт. Сторонний защищённый DNS и ECH могут скрыть имя сайта — тогда используй правило приложения или IP.",
@@ -1188,18 +1246,21 @@ private val ReadingWidth = 860.dp
             )
             if (invalid) Text(m.text("Проверь домены и IP-адреса.", "Check your domains and IP addresses."), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                AccentButton(m.text("Сохранить", "Save")) {
+                AccentButton(m.text("Сохранить", "Save"), Modifier.testTag("routing-sites-save")) {
                     try {
-                        val next = current.copy(
-                            domains = domains.lines().filter { it.isNotBlank() }.map(RuleValidation::domain).distinct(),
-                            networks = networks.lines().filter { it.isNotBlank() }.map(RuleValidation::network).distinct(),
-                        )
-                        m.changeDesktop(next, true)
+                        val parsedDomains = domains.lines().filter { it.isNotBlank() }.map(RuleValidation::domain).distinct()
+                        val parsedNetworks = networks.lines().filter { it.isNotBlank() }.map(RuleValidation::network).distinct()
+                        m.changeDesktop({ it.copy(domains = parsedDomains, networks = parsedNetworks) })
                     } catch (_: Exception) {
                         invalid = true
                     }
                 }
-                Text(m.text("Активное соединение переподключится.", "An active connection will reconnect."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    if (current.sitesEnabled) m.text("Активное соединение переподключится.", "An active connection will reconnect.")
+                    else m.text("Сохранится без переподключения, пока список выключен.", "Saved without reconnecting while the list is off."),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -1207,7 +1268,7 @@ private val ReadingWidth = 860.dp
     if (picking) AppPickerDialog(
         m,
         current.applications,
-        onDone = { chosen -> picking = false; if (chosen != current.applications) m.changeDesktop(current.copy(applications = chosen), true) },
+        onDone = { chosen -> picking = false; if (chosen != current.applications) m.changeDesktop({ it.copy(applications = chosen) }) },
         onDismiss = { picking = false },
     )
 }

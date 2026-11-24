@@ -4,11 +4,13 @@ import com.mydrop.vpn.core.model.AppSettings
 import com.mydrop.vpn.core.model.NodeGroup
 import com.mydrop.vpn.core.model.ProxyNode
 import com.mydrop.vpn.core.model.ProxySettings
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ConnectRequestTest {
@@ -69,5 +71,35 @@ class ConnectRequestTest {
         assertEquals(1280, lowMtu.options!!.mtu)
         val highMtu = ConnectRequestFactory.create(server("a.example.com"), AppSettings(mtu = 20_000), DesktopSettings())
         assertEquals(9000, highMtu.options!!.mtu)
+    }
+
+    @Test fun disabledRoutingListsAreOmittedWithoutLosingSavedRules() {
+        val base = DesktopSettings(
+            splitMode = SplitMode.OnlySelected,
+            applications = listOf("chrome.exe"),
+            domains = listOf("example.com"),
+            networks = listOf("192.0.2.0/24"),
+        )
+        val appsOff = ConnectRequestFactory.options(AppSettings(), base.copy(applicationsEnabled = false))
+        assertEquals(emptyList<String>(), appsOff.applications)
+        assertEquals(listOf("example.com"), appsOff.domains)
+        assertEquals(listOf("192.0.2.0/24"), appsOff.networks)
+
+        val sitesOff = ConnectRequestFactory.options(AppSettings(), base.copy(sitesEnabled = false))
+        assertEquals(listOf("chrome.exe"), sitesOff.applications)
+        assertEquals(emptyList<String>(), sitesOff.domains)
+        assertEquals(emptyList<String>(), sitesOff.networks)
+
+        val bothOff = ConnectRequestFactory.options(AppSettings(), base.copy(applicationsEnabled = false, sitesEnabled = false))
+        assertEquals(emptyList<String>(), bothOff.applications)
+        assertEquals(emptyList<String>(), bothOff.domains)
+        assertEquals(emptyList<String>(), bothOff.networks)
+
+        val legacy = Json.decodeFromString(
+            DesktopSettings.serializer(),
+            """{"applications":["chrome.exe"],"domains":["example.com"]}""",
+        )
+        assertTrue(legacy.applicationsEnabled)
+        assertTrue(legacy.sitesEnabled)
     }
 }

@@ -81,6 +81,51 @@ class ConnectionSettingsTest {
         } finally { f.close() }
     }
 
+    @Test fun routingListTogglesRebuildOnlyWhenActiveRulesActuallyChange() = runTest {
+        val f = Fixture(backgroundScope)
+        try {
+            runCurrent()
+            f.model.changeDesktop({
+                it.copy(
+                    applications = listOf("browser.exe"),
+                    domains = listOf("example.com"),
+                    networks = listOf("192.0.2.0/24"),
+                )
+            }).join()
+            f.model.toggleConnection().join()
+            assertEquals(1, f.backend.connects.size)
+            assertEquals(listOf("browser.exe"), f.backend.connects.last().options!!.applications)
+            assertEquals(listOf("example.com"), f.backend.connects.last().options!!.domains)
+
+            f.model.changeDesktop({ it.copy(applicationsEnabled = false) }).join()
+            assertEquals(2, f.backend.connects.size)
+            assertEquals(emptyList(), f.backend.connects.last().options!!.applications)
+            assertEquals(listOf("browser.exe"), f.model.desktop.value.applications)
+
+            // Editing a paused list keeps the tunnel steady until it is turned back on.
+            f.model.changeDesktop({ it.copy(applications = listOf("browser.exe", "chat.exe")) }).join()
+            assertEquals(2, f.backend.connects.size)
+
+            f.model.changeDesktop({ it.copy(applicationsEnabled = true) }).join()
+            assertEquals(3, f.backend.connects.size)
+            assertEquals(listOf("browser.exe", "chat.exe"), f.backend.connects.last().options!!.applications)
+
+            f.model.changeDesktop({ it.copy(sitesEnabled = false) }).join()
+            assertEquals(4, f.backend.connects.size)
+            assertEquals(emptyList(), f.backend.connects.last().options!!.domains)
+            assertEquals(emptyList(), f.backend.connects.last().options!!.networks)
+            assertEquals(listOf("example.com"), f.model.desktop.value.domains)
+
+            f.model.changeDesktop({ it.copy(domains = listOf("example.org")) }).join()
+            assertEquals(4, f.backend.connects.size)
+
+            f.model.changeDesktop({ it.copy(sitesEnabled = true) }).join()
+            assertEquals(5, f.backend.connects.size)
+            assertEquals(listOf("example.org"), f.backend.connects.last().options!!.domains)
+            assertEquals(listOf("192.0.2.0/24"), f.backend.connects.last().options!!.networks)
+        } finally { f.close() }
+    }
+
     @Test fun changesDuringStartupAreAppliedOnceWithTheLatestValues() = runTest {
         val f = Fixture(backgroundScope)
         try {

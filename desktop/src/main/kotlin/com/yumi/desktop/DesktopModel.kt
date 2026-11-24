@@ -365,11 +365,14 @@ class DesktopModel(
             if (reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) applyConnectionSettings()
         }
     }
-    fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = action {
+    fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = changeDesktop({ next }, reconnect)
+    fun changeDesktop(transform: (DesktopSettings) -> DesktopSettings, reconnect: Boolean = false) = action {
         commands.withLock {
-            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
-            if (next.launchAtLogin != desktop.value.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
-            val loweringShield = desktop.value.killSwitch && !next.killSwitch
+            val before = desktop.value
+            val previous = ConnectRequestFactory.options(settings.value, before)
+            val next = transform(before)
+            if (next.launchAtLogin != before.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
+            val loweringShield = before.killSwitch && !next.killSwitch
             desktop.update { next }
             if (!next.connectOnLaunch) startupConnectPending = false
             if ((reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) &&

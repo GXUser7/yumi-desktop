@@ -1,10 +1,16 @@
 package com.mydrop.vpn.data
 
 import com.mydrop.vpn.shared.R
+import com.mydrop.vpn.core.model.ProviderProfile
 import com.mydrop.vpn.core.model.ProxyNode
 import com.mydrop.vpn.core.model.Subscription
+import com.mydrop.vpn.core.model.SubscriptionFailureMetadata
 import com.mydrop.vpn.core.model.SubscriptionUpdate
+import com.mydrop.vpn.core.model.TransportOptions
 import com.mydrop.vpn.core.net.isNumericAddress
+import com.mydrop.vpn.core.net.sanitizeBillingUrl
+import com.mydrop.vpn.core.net.sanitizePortalUrl
+import com.mydrop.vpn.core.parse.ProviderProfileParser
 import com.mydrop.vpn.core.parse.SubscriptionBody
 import com.mydrop.vpn.core.parse.ProxyUriParser
 import com.mydrop.vpn.core.xray.XrayConfigFactory
@@ -72,6 +78,7 @@ class SubscriptionService(
      * outlives all of them.
      */
     private val probeEndpoint: () -> ProbeEndpoint? = { null },
+    private val allowLocalBillingHttp: Boolean = false,
 ) {
 
     private companion object {
@@ -128,6 +135,7 @@ class SubscriptionService(
             return SubscriptionUpdate.Failure(
                 subscription.id,
                 strings.get(R.string.error_http, response.code),
+                metadata = response.toFailureMetadata(),
             )
         }
 
@@ -155,17 +163,23 @@ class SubscriptionService(
                         return SubscriptionUpdate.Failure(
                             subscription.id,
                             strings.get(R.string.error_device_limit),
+                            metadata = response.toFailureMetadata(),
                         )
                     }
                     return SubscriptionUpdate.Failure(
                         subscription.id,
                         strings.get(R.string.error_panel_notice, notice),
+                        metadata = response.toFailureMetadata(),
                     )
                 }
 
                 // The same subscription as Xray documents, when this list flattened the provider's
                 // auto-select servers into their last resort; see autoSelectVariant.
-                val nodes = autoSelectVariant(subscription, body.nodes) ?: body.nodes
+                val documents = autoSelectVariant(subscription, body.nodes)
+                val nodes = documents?.nodes ?: body.nodes
+                // The provider's routing, from whichever answer was documents: this one, when the
+                // panel already sent them, or the second request above.
+                val profiles = ProviderProfileParser.parse(response.body) ?: documents?.profiles
 
                 // Refused here rather than left to fail at connect time. A protocol the core
                 // cannot speak makes a row that looks like every other row, pings like every other
@@ -209,12 +223,26 @@ class SubscriptionService(
                             ?: subscription.userInfo,
                         remoteTitle = response.profileTitle ?: subscription.remoteTitle,
                         webPageUrl = response.webPageUrl ?: subscription.webPageUrl,
+                        billingManifestUrl = response.billingManifestUrl
+                            ?: subscription.billingManifestUrl,
+                        paymentUrl = response.paymentUrl ?: subscription.paymentUrl,
+                        supportUrl = response.supportUrl ?: subscription.supportUrl,
                         lastUpdatedEpochMillis = System.currentTimeMillis(),
                         lastError = null,
                     ),
                     nodes = carried,
                     addedCount = 0,
                     removedCount = 0,
+                    providerRouting = profiles?.let { byName ->
+                        ProviderProfileParser.routingFor(carried, byName).also { routing ->
+                            logs.trace(
+                                "YumiSub",
+                                "${subscription.name}: provider routing for " +
+                                    "${routing.byNode.size}/${carried.size} servers, " +
+                                    "${routing.profiles.size} distinct",
+                            )
+                        }
+                    },
                 )
             }
 
@@ -222,10 +250,19 @@ class SubscriptionService(
                 SubscriptionUpdate.Failure(
                     subscription.id,
                     strings.get(R.string.error_unsupported_format, body.format),
+                    metadata = response.toFailureMetadata(),
                 )
 
             is SubscriptionBody.Empty ->
-                SubscriptionUpdate.Failure(subscription.id, strings.get(body.reason.messageRes))
+                SubscriptionUpdate.Failure(
+                    subscription.id,
+                    if (response.deviceLimitReached) {
+                        strings.get(R.string.error_device_limit)
+                    } else {
+                        strings.get(body.reason.messageRes)
+                    },
+                    metadata = response.toFailureMetadata(),
+                )
         }
     }
 
@@ -256,7 +293,7 @@ class SubscriptionService(
      * the selection; a group no link is named after is added at the end. A document without a
      * group, a request that fails, or an answer that is not documents changes nothing.
      */
-    private fun autoSelectVariant(subscription: Subscription, links: List<ProxyNode>): List<ProxyNode>? {
+    private fun autoSelectVariant(subscription: Subscription, links: List<ProxyNode>): DocumentsAnswer? {
         if (links.any { it.group != null }) return null
         val url = runCatching { URL(subscription.url) }.getOrNull() ?: return null
 
@@ -269,11 +306,15 @@ class SubscriptionService(
                 add(Triple("agent", subscription.url, asking))
             }
         }
+        var profiles: Map<String, ProviderProfile>? = null
         for ((how, variantUrl, asking) in variants) {
             val response = runCatching { fetch(variantUrl, asking) }.getOrNull()
-            val body = response?.takeIf { it.code in 200..299 }
-                ?.let { SubscriptionParser.parse(it.body, subscription.id) }
-            val groups = (body as? SubscriptionBody.Nodes)?.nodes.orEmpty().filter { it.group != null }
+            val answered = response?.takeIf { it.code in 200..299 }
+            val body = answered?.let { SubscriptionParser.parse(it.body, subscription.id) }
+            if (profiles == null) profiles = answered?.let { ProviderProfileParser.parse(it.body) }
+            val parsedNodes = (body as? SubscriptionBody.Nodes)?.nodes.orEmpty()
+            val groups = parsedNodes.filter { it.group != null }
+            val extraNodes = parsedNodes.filter { it.group == null && it.hasJsonOnlyExtras() }
             logs.trace(
                 "YumiSub",
                 "${subscription.name}: documents by $how: " + when {
@@ -283,16 +324,64 @@ class SubscriptionService(
                     else -> "${body.nodes.size} servers, ${groups.size} auto-select"
                 },
             )
-            if (groups.isNotEmpty()) return withGroups(links, groups)
+            if (groups.isNotEmpty() || extraNodes.isNotEmpty()) {
+                val merged = mergeJsonDetails(links, groups, extraNodes)
+                return DocumentsAnswer(merged, profiles)
+            }
         }
-        return null
+        return profiles?.let { DocumentsAnswer(nodes = null, profiles = it) }
     }
 
-    /** [links] with each of [groups] in the place of the link named after it; see [autoSelectVariant]. */
-    private fun withGroups(links: List<ProxyNode>, groups: List<ProxyNode>): List<ProxyNode> {
-        val byName = groups.associateBy { it.name }
-        val names = links.mapTo(HashSet()) { it.name }
-        return links.map { link -> byName[link.name] ?: link } + groups.filter { it.name !in names }
+    private fun ProxyNode.hasJsonOnlyExtras(): Boolean {
+        val grpc = transport as? TransportOptions.Grpc
+        return fragment != null ||
+            (transport as? TransportOptions.Xhttp)?.extraJson != null ||
+            grpc?.multiMode == true ||
+            grpc?.authority?.isNotBlank() == true
+    }
+
+    private class DocumentsAnswer(
+        val nodes: List<ProxyNode>?,
+        val profiles: Map<String, ProviderProfile>?,
+    )
+
+    private fun mergeJsonDetails(
+        links: List<ProxyNode>,
+        groups: List<ProxyNode>,
+        extraNodes: List<ProxyNode>,
+    ): List<ProxyNode> {
+        val groupByName = groups.associateBy { it.name.trim() }
+        val extrasByName = extraNodes.associateBy { it.name.trim() }
+        val names = links.mapTo(HashSet()) { it.name.trim() }
+        val updated = links.map { link ->
+            val key = link.name.trim()
+            groupByName[key] ?: extrasByName[key]?.let { doc -> mergeSingleExtras(link, doc) } ?: link
+        }
+        return updated + groups.filter { it.name.trim() !in names }
+    }
+
+    private fun mergeSingleExtras(link: ProxyNode, doc: ProxyNode): ProxyNode {
+        val mergedFragment = link.fragment ?: doc.fragment
+        val mergedTransport = when {
+            link.transport is TransportOptions.Xhttp &&
+                link.transport.extraJson == null &&
+                doc.transport is TransportOptions.Xhttp &&
+                doc.transport.extraJson != null ->
+                link.transport.copy(extraJson = doc.transport.extraJson)
+            link.transport is TransportOptions.Grpc &&
+                doc.transport is TransportOptions.Grpc -> {
+                val mergedMulti = link.transport.multiMode || doc.transport.multiMode
+                val mergedAuthority = link.transport.authority.ifBlank { doc.transport.authority }
+                if (mergedMulti == link.transport.multiMode && mergedAuthority == link.transport.authority) {
+                    link.transport
+                } else {
+                    link.transport.copy(multiMode = mergedMulti, authority = mergedAuthority)
+                }
+            }
+            else -> link.transport
+        }
+        if (mergedFragment == link.fragment && mergedTransport == link.transport) return link
+        return link.copy(fragment = mergedFragment, transport = mergedTransport)
     }
 
     internal data class Response(
@@ -305,7 +394,64 @@ class SubscriptionService(
         val hwidRequired: Boolean = false,
         /** It also said the account has no free device slots left. */
         val deviceLimitReached: Boolean = false,
-    )
+        val billingManifestUrl: String? = null,
+        val paymentUrl: String? = null,
+        val supportUrl: String? = null,
+    ) {
+        fun toFailureMetadata(): SubscriptionFailureMetadata? {
+            val parsedInfo = SubscriptionParser.parseUserInfo(userInfoHeader)
+            if (parsedInfo == null && profileTitle == null && webPageUrl == null &&
+                billingManifestUrl == null && paymentUrl == null && supportUrl == null
+            ) {
+                return null
+            }
+            return SubscriptionFailureMetadata(
+                userInfo = parsedInfo,
+                remoteTitle = profileTitle,
+                webPageUrl = webPageUrl,
+                billingManifestUrl = billingManifestUrl,
+                paymentUrl = paymentUrl,
+                supportUrl = supportUrl,
+            )
+        }
+    }
+
+    private fun buildParsedResponse(
+        code: Int,
+        body: String,
+        headerValue: (String) -> String?,
+        hasHeader: (String) -> Boolean,
+    ): Response {
+        val comments = SubscriptionParser.parseMetadataComments(body)
+        fun metaValue(vararg names: String): String? =
+            names.firstNotNullOfOrNull { headerValue(it)?.trim()?.takeIf(String::isNotEmpty) }
+                ?: names.firstNotNullOfOrNull { comments[it] }
+
+        return Response(
+            code = code,
+            body = body,
+            userInfoHeader = metaValue("subscription-userinfo"),
+            profileTitle = metaValue("profile-title")?.let(::decodeProfileTitle),
+            webPageUrl = sanitizePortalUrl(
+                metaValue("profile-web-page-url"),
+                allowLocalBillingHttp,
+            ),
+            hwidRequired = hasHeader("x-hwid-active") || hasHeader("x-hwid-not-supported"),
+            deviceLimitReached = hasHeader("x-hwid-max-devices-reached"),
+            billingManifestUrl = sanitizeBillingUrl(
+                metaValue("billing-manifest-url"),
+                allowLocalBillingHttp,
+            ),
+            paymentUrl = sanitizeBillingUrl(
+                metaValue("payment-url", "sub-expire-button-link"),
+                allowLocalBillingHttp,
+            ),
+            supportUrl = sanitizePortalUrl(
+                metaValue("support-url"),
+                allowLocalBillingHttp,
+            ),
+        )
+    }
 
     /**
      * A server that cannot be dialled: the all-zero UUID at `0.0.0.0:1` that panels use to carry a
@@ -545,17 +691,11 @@ class SubscriptionService(
                 }
                 val body = String(raw, Charsets.UTF_8)
 
-                return Response(
+                return buildParsedResponse(
                     code = code,
                     body = body,
-                    userInfoHeader = connection.getHeaderField("subscription-userinfo"),
-                    profileTitle = connection.getHeaderField("profile-title")
-                        ?.let(::decodeProfileTitle),
-                    webPageUrl = sanitizeWebPageUrl(connection.getHeaderField("profile-web-page-url")),
-                    hwidRequired = connection.getHeaderField("x-hwid-active") != null ||
-                        connection.getHeaderField("x-hwid-not-supported") != null,
-                    deviceLimitReached =
-                        connection.getHeaderField("x-hwid-max-devices-reached") != null,
+                    headerValue = { name -> connection.getHeaderField(name) },
+                    hasHeader = { name -> connection.getHeaderField(name) != null },
                 )
             } finally {
                 connection.disconnect()
@@ -712,15 +852,11 @@ class SubscriptionService(
                     }
                     val body = String(rawBytes, Charsets.UTF_8)
 
-                    return Response(
+                    return buildParsedResponse(
                         code = code,
                         body = body,
-                        userInfoHeader = headers["subscription-userinfo"]?.firstOrNull(),
-                        profileTitle = headers["profile-title"]?.firstOrNull()?.let(::decodeProfileTitle),
-                        webPageUrl = sanitizeWebPageUrl(headers["profile-web-page-url"]?.firstOrNull()),
-                        hwidRequired = headers.containsKey("x-hwid-active") ||
-                            headers.containsKey("x-hwid-not-supported"),
-                        deviceLimitReached = headers.containsKey("x-hwid-max-devices-reached"),
+                        headerValue = { name -> headers[name.lowercase()]?.firstOrNull() },
+                        hasHeader = { name -> headers.containsKey(name.lowercase()) },
                     )
                 }
             } finally {

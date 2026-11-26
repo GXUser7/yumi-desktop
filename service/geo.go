@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -173,4 +174,209 @@ func get(ctx context.Context, client *http.Client, url string) (io.ReadCloser, i
 		return nil, 0, fmt.Errorf("HTTP %d", response.StatusCode)
 	}
 	return response.Body, response.ContentLength, nil
+}
+
+type geoCategories struct {
+	geoip   map[string]struct{}
+	geosite map[string]struct{}
+}
+
+func loadGeoCategories(dir string) geoCategories {
+	out := geoCategories{
+		geoip:   map[string]struct{}{},
+		geosite: map[string]struct{}{},
+	}
+	if dir == "" {
+		return out
+	}
+	out.geoip = readGeoCodesFile(filepath.Join(dir, "geoip.dat"))
+	out.geosite = readGeoCodesFile(filepath.Join(dir, "geosite.dat"))
+	return out
+}
+
+func (g geoCategories) hasAny() bool {
+	return len(g.geoip) > 0 && len(g.geosite) > 0
+}
+
+func (g geoCategories) knows(entry string) bool {
+	trimmed := strings.TrimSpace(entry)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "ext:") {
+		return false
+	}
+	var prefix string
+	var codes map[string]struct{}
+	switch {
+	case strings.HasPrefix(lower, "geosite:"):
+		prefix = "geosite:"
+		codes = g.geosite
+	case strings.HasPrefix(lower, "geoip:"):
+		prefix = "geoip:"
+		codes = g.geoip
+	default:
+		return true
+	}
+	if len(codes) == 0 {
+		return false
+	}
+	code := trimmed[len(prefix):]
+	code = strings.TrimPrefix(code, "!")
+	if at := strings.IndexByte(code, '@'); at >= 0 {
+		code = code[:at]
+	}
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if code == "" {
+		return false
+	}
+	_, ok := codes[code]
+	return ok
+}
+
+func readGeoCodesFile(path string) map[string]struct{} {
+	codes := map[string]struct{}{}
+	f, err := os.Open(path)
+	if err != nil {
+		return codes
+	}
+	defer f.Close()
+	r := &protoGeoReader{r: bufio.NewReaderSize(f, 64*1024)}
+	for {
+		tag, ok, err := r.varintOrEOF()
+		if !ok || err != nil {
+			break
+		}
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 {
+			length, err := r.varint()
+			if err != nil || length > 128<<20 {
+				break
+			}
+			if code, err := r.readEntryCode(int64(length)); err == nil && code != "" {
+				codes[strings.ToUpper(code)] = struct{}{}
+			}
+		} else if err := r.skipValue(wire); err != nil {
+			break
+		}
+	}
+	return codes
+}
+
+type protoGeoReader struct {
+	r   *bufio.Reader
+	pos int64
+}
+
+func (p *protoGeoReader) byte() (byte, error) {
+	b, err := p.r.ReadByte()
+	if err == nil {
+		p.pos++
+	}
+	return b, err
+}
+
+func (p *protoGeoReader) varintOrEOF() (uint64, bool, error) {
+	first, err := p.byte()
+	if err != nil {
+		return 0, false, nil
+	}
+	val, err := p.varintFrom(first)
+	return val, true, err
+}
+
+func (p *protoGeoReader) varint() (uint64, error) {
+	first, err := p.byte()
+	if err != nil {
+		return 0, err
+	}
+	return p.varintFrom(first)
+}
+
+func (p *protoGeoReader) varintFrom(first byte) (uint64, error) {
+	res := uint64(first & 0x7F)
+	cur := first
+	shift := uint(7)
+	for cur&0x80 != 0 {
+		if shift > 63 {
+			return 0, errors.New("varint overflow")
+		}
+		b, err := p.byte()
+		if err != nil {
+			return 0, err
+		}
+		res |= uint64(b&0x7F) << shift
+		cur = b
+		shift += 7
+	}
+	return res, nil
+}
+
+func (p *protoGeoReader) skip(n int64) error {
+	if n < 0 {
+		return errors.New("negative skip")
+	}
+	for n > 0 {
+		d, err := p.r.Discard(int(min(n, 64*1024)))
+		p.pos += int64(d)
+		n -= int64(d)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *protoGeoReader) skipValue(wire uint64) error {
+	switch wire {
+	case 0:
+		_, err := p.varint()
+		return err
+	case 1:
+		return p.skip(8)
+	case 2:
+		l, err := p.varint()
+		if err != nil {
+			return err
+		}
+		return p.skip(int64(l))
+	case 5:
+		return p.skip(4)
+	default:
+		return fmt.Errorf("wire %d", wire)
+	}
+}
+
+func (p *protoGeoReader) readEntryCode(length int64) (string, error) {
+	end := p.pos + length
+	var code string
+	for p.pos < end {
+		tag, err := p.varint()
+		if err != nil {
+			return "", err
+		}
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 && code == "" {
+			l, err := p.varint()
+			if err != nil || l > 4096 || p.pos+int64(l) > end {
+				return "", errors.New("invalid entry code length")
+			}
+			buf := make([]byte, l)
+			if _, err := io.ReadFull(p.r, buf); err != nil {
+				return "", err
+			}
+			p.pos += int64(l)
+			code = string(buf)
+		} else {
+			if err := p.skipValue(wire); err != nil {
+				return "", err
+			}
+		}
+	}
+	if p.pos < end {
+		if err := p.skip(end - p.pos); err != nil {
+			return "", err
+		}
+	}
+	return code, nil
 }

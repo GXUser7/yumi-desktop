@@ -24,9 +24,10 @@ import (
 )
 
 type OutboundGroup struct {
-	Members        []map[string]any `json:"members"`
-	Strategy       string           `json:"strategy"`
-	MaxDelayMillis int              `json:"maxDelayMillis"`
+	Members         []map[string]any        `json:"members"`
+	Strategy        string                  `json:"strategy"`
+	MaxDelayMillis  int                     `json:"maxDelayMillis"`
+	MemberFragments map[string]FragmentSpec `json:"memberFragments,omitempty"`
 }
 
 // One selected row can contain several provider-ordered routes. These are measured with a real
@@ -69,18 +70,31 @@ func prepareGroupOutbound(instance *core.Instance, spec *OutboundGroup, first xo
 	group := &groupOutbound{spec: *spec, probeURL: "https://cp.cloudflare.com/generate_204"}
 	group.members = append(group.members, first)
 	for _, outbound := range spec.Members[1:] {
-		member := obj{}
-		for key, value := range outbound {
-			member[key] = value
+		member := cloneJSONMap(outbound)
+		if member == nil {
+			member = obj{}
+		}
+		origTag, _ := outbound["tag"].(string)
+		outbounds := []obj{member}
+		if spec.MemberFragments != nil {
+			if frag, ok := spec.MemberFragments[origTag]; ok {
+				fragTag := fragmentTag(frag)
+				attachFragmentDialerProxy(member, fragTag)
+				outbounds = append(outbounds, buildFragmentOutbound(fragTag, frag))
+			}
 		}
 		member["tag"] = "proxy-node"
-		data, err := json.Marshal(obj{"outbounds": []obj{member}})
+		data, err := json.Marshal(obj{"outbounds": outbounds})
 		if err != nil {
 			group.Close()
 			return nil, err
 		}
 		config, err := confserial.LoadJSONConfig(bytes.NewReader(data))
 		if err != nil {
+			group.Close()
+			return nil, err
+		}
+		if err := ensureFragmentOutbounds(instance, config); err != nil {
 			group.Close()
 			return nil, err
 		}

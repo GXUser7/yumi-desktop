@@ -113,7 +113,7 @@ class WindowsTunnelBackend internal constructor(
             }
         }
 
-        val reply = withTimeoutOrNull(timeoutMillis) {
+        val reply = withTimeoutOrNull(effectiveRequestTimeout(request, timeoutMillis)) {
             suspendCancellableCoroutine { cont ->
                 cont.invokeOnCancellation {
                     cancelled.set(true)
@@ -239,7 +239,7 @@ class UnixTunnelBackend(
     private val socketPath: Path = Path.of(DesktopPlatform.SOCKET_PATH),
     private val timeoutMillis: Long = 15_000,
 ) : TunnelBackend {
-    override suspend fun request(request: ServiceRequest): ServiceStatus = withTimeoutOrNull(timeoutMillis) {
+    override suspend fun request(request: ServiceRequest): ServiceStatus = withTimeoutOrNull(effectiveRequestTimeout(request, timeoutMillis)) {
         val job = coroutineContext[Job]
         runInterruptible(Dispatchers.IO) {
             try {
@@ -891,4 +891,58 @@ private interface Dwm : Library {
     companion object {
         val INSTANCE: Dwm = Native.load("dwmapi", Dwm::class.java)
     }
+}
+
+
+internal fun effectiveRequestTimeout(request: ServiceRequest, defaultMillis: Long): Long =
+    if (request.command == "probe") {
+        val perNode = request.probe?.timeoutMillis?.toLong() ?: 5_000L
+        maxOf(defaultMillis, perNode * 4L + 15_000L).coerceIn(30_000L, 120_000L)
+    } else {
+        defaultMillis
+    }
+
+fun probeServiceExecutable(): File? {
+    DesktopPlatform.serviceExecutable()?.takeIf { it.isFile }?.let { return it }
+    val windows = System.getProperty("os.name").orEmpty().contains("win", ignoreCase = true)
+    val binary = if (windows) "yumi-service.exe" else "yumi-service"
+    val cwd = File(System.getProperty("user.dir") ?: ".")
+    val candidates = listOf(
+        File(cwd, "runtime/$binary"),
+        File(cwd, "../runtime/$binary"),
+        File(cwd, "service/$binary"),
+        File(cwd, "../service/$binary"),
+    )
+    return candidates.firstOrNull { it.isFile && (windows || it.canExecute()) }
+}
+
+fun openExternalUrl(url: String): Boolean {
+    val trimmed = url.trim()
+    if (trimmed.isEmpty() || trimmed.any { it.isISOControl() || it.isWhitespace() }) return false
+    val uri = runCatching { java.net.URI(trimmed) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase(java.util.Locale.ROOT)
+    if (scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) return false
+
+    val browsed = runCatching {
+        if (java.awt.Desktop.isDesktopSupported()) {
+            val desktop = java.awt.Desktop.getDesktop()
+            if (desktop.isSupported(java.awt.Desktop.Action.BROWSE)) {
+                desktop.browse(uri)
+                return true
+            }
+        }
+        false
+    }.getOrDefault(false)
+    if (browsed) return true
+
+    val os = System.getProperty("os.name").orEmpty().lowercase(java.util.Locale.ROOT)
+    val command = when {
+        os.contains("win") -> listOf("rundll32", "url.dll,FileProtocolHandler", trimmed)
+        os.contains("mac") -> listOf("open", trimmed)
+        else -> listOf("xdg-open", trimmed)
+    }
+    return runCatching {
+        ProcessBuilder(command).start()
+        true
+    }.getOrDefault(false)
 }

@@ -2,6 +2,7 @@ package com.mydrop.vpn.core.model
 
 import java.security.MessageDigest
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 
 /**
  * One dialable server. A subscription refresh replaces nodes wholesale, so [id] is derived from
@@ -26,31 +27,41 @@ data class ProxyNode(
      * the fields above are then its first member's. See [NodeGroup].
      */
     val group: NodeGroup? = null,
+
+    /** Per-node packet fragmentation parameters imported from provider Xray JSON configs. */
+    val fragment: FragmentOptions? = null,
 ) {
     val protocol: Protocol get() = settings.protocol
 
     val address: String get() = "$server:$port"
 
+    @Volatile
+    @Transient
+    private var _badges: List<String>? = null
+
     /** Badges shown under the server name: protocol details that actually change behaviour. */
     val badges: List<String>
-        get() = buildList {
-            // First, because it changes what every other badge describes: only the first member.
-            group?.let { add("Auto ×${it.members.size}") }
-            (settings as? ProxySettings.Raw)?.declaredType
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { add(it) }
-            tls?.badge?.let(::add)
-            // Skipping verification is a decision with consequences, taken per server. It belongs
-            // where the list is read, not only inside the menu it was set from.
-            tls?.takeIf { it.enabled && it.insecure && it.reality == null }?.let { add("no-verify") }
-            transport?.label?.let(::add)
-            (settings as? ProxySettings.Vless)
-                ?.flow
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { add(if (it.contains("vision")) "Vision" else it) }
-            tls?.fingerprint?.takeIf { it.isNotEmpty() }?.let { add("uTLS:$it") }
-            if (multiplex?.enabled == true) add("Mux")
-        }
+        get() = _badges ?: computeBadges().also { _badges = it }
+
+    private fun computeBadges(): List<String> = buildList {
+        // First, because it changes what every other badge describes: only the first member.
+        group?.let { add("Auto ×${it.members.size}") }
+        (settings as? ProxySettings.Raw)?.declaredType
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { add(it) }
+        tls?.badge?.let(::add)
+        // Skipping verification is a decision with consequences, taken per server. It belongs
+        // where the list is read, not only inside the menu it was set from.
+        tls?.takeIf { it.enabled && it.insecure && it.reality == null }?.let { add("no-verify") }
+        transport?.label?.let(::add)
+        if (fragment != null) add("Fragment")
+        (settings as? ProxySettings.Vless)
+            ?.flow
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { add(if (it.contains("vision")) "Vision" else it) }
+        tls?.fingerprint?.takeIf { it.isNotEmpty() }?.let { add("uTLS:$it") }
+        if (multiplex?.enabled == true) add("Mux")
+    }
 
     companion object {
         /**

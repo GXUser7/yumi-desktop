@@ -11,6 +11,8 @@ sealed interface DeepLinkPayload {
     /** Resolvers: `tls://`, `quic://`, a DoH URL, or an `sdns://` stamp. */
     data class AddDns(val profiles: List<DnsProfile>) : DeepLinkPayload
 
+    data class BillingReturn(val subscriptionId: String, val orderId: String?) : DeepLinkPayload
+
     data class Unsupported(
         val raw: String,
         val reason: UnsupportedReason,
@@ -53,7 +55,7 @@ object DeepLinkParser {
         val scheme = text.substringBefore("://", missingDelimiterValue = "").lowercase()
 
         return when (scheme) {
-            "happ", "mydrop" -> parseAppLink(text, scheme)
+            "happ", "mydrop", "yumi" -> parseAppLink(text, scheme)
             // A DoH link and a subscription link are both https; only the resolver has the
             // well-known path, so asking the DNS parser first cannot swallow a subscription.
             "http", "https" -> DnsUriParser.parse(text)
@@ -89,6 +91,24 @@ object DeepLinkParser {
         val payloadWithFragment = rest.substringAfter('/', missingDelimiterValue = "")
         if (payloadWithFragment.isEmpty()) {
             return DeepLinkPayload.Unsupported(text, UnsupportedReason.NoPayload)
+        }
+
+        if (action == "billing") {
+            val payloadWithoutHash = payloadWithFragment.substringBefore('#')
+            val subpath = payloadWithoutHash.substringBefore('?').trimEnd('/').lowercase()
+            if (subpath == "return") {
+                val query = payloadWithoutHash.substringAfter('?', "")
+                val params = parseQuery(query)
+                val subId = params["sub_id"]?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: return DeepLinkPayload.Unsupported(text, UnsupportedReason.NoPayload)
+                val orderId = params["order_id"]?.trim()?.takeIf { it.isNotEmpty() }
+                return DeepLinkPayload.BillingReturn(subId, orderId)
+            }
+            return DeepLinkPayload.Unsupported(
+                text,
+                UnsupportedReason.UnsupportedAction,
+                action = "$action/$subpath",
+            )
         }
 
         val rawFragment = payloadWithFragment.substringAfter('#', "")

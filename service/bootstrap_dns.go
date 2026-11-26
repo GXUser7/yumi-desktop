@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -19,6 +21,7 @@ import (
 
 var (
 	bootstrapDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+	defaultDoHEndpoints = []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}
 	dnsTransactionID    atomic.Uint32
 	errDNSTruncated     = errors.New("dns response truncated")
 )
@@ -311,6 +314,105 @@ func queryDNSTCP(ctx context.Context, server string, id uint16, wire []byte, qty
 	return parseDNSAnswer(resp, id, qtype)
 }
 
+func queryDNSDoH(ctx context.Context, dohURL, host string, qtype dnsmessage.Type, outboundIface string) (netip.Addr, error) {
+	u, err := url.Parse(strings.TrimSpace(dohURL))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil {
+		return netip.Addr{}, errors.New("invalid DoH URL")
+	}
+	if isForbiddenDNSHost(u.Hostname()) && !isLoopbackTestDoH(u) {
+		return netip.Addr{}, errors.New("forbidden DoH host")
+	}
+	id, wire, err := buildDNSQuery(host, qtype)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	targetHost := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	dialHost := targetHost
+	if _, err := netip.ParseAddr(targetHost); err != nil && !isLoopbackTestDoH(u) {
+		if resolvedHost, resErr := resolveDirectRFC1035(ctx, targetHost, false, outboundIface); resErr == nil && resolvedHost.IsValid() {
+			dialHost = resolvedHost.String()
+		}
+	}
+	transport := &http.Transport{
+		Proxy:               nil,
+		DisableKeepAlives:   true,
+		TLSHandshakeTimeout: 3 * time.Second,
+		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			addr := net.JoinHostPort(dialHost, port)
+			d := bootstrapDialer(outboundIface, addr)
+			return d.DialContext(dialCtx, network, addr)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(wire))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return netip.Addr{}, fmt.Errorf("DoH HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return parseDNSAnswer(body, id, qtype)
+}
+
+func isLoopbackTestDoH(u *url.URL) bool {
+	if u == nil || u.Scheme != "http" {
+		return false
+	}
+	ip, err := netip.ParseAddr(u.Hostname())
+	return err == nil && ip.IsLoopback()
+}
+
+func resolveHostWithDoH(ctx context.Context, host string, preferIPv6, bypassDnscache bool, outboundIface, dohURL string) (netip.Addr, error) {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" {
+		return netip.Addr{}, errors.New("empty host")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap(), nil
+	}
+	var endpoints []string
+	if clean := strings.TrimSpace(dohURL); clean != "" {
+		endpoints = append(endpoints, clean)
+	} else if len(bootstrapDNSServers) >= 2 && bootstrapDNSServers[0] == "1.1.1.1:53" && bootstrapDNSServers[1] == "8.8.8.8:53" {
+		endpoints = append(endpoints, defaultDoHEndpoints...)
+	}
+	qtypes := []dnsmessage.Type{dnsmessage.TypeA}
+	if preferIPv6 {
+		qtypes = append(qtypes, dnsmessage.TypeAAAA)
+	}
+	for _, endpoint := range endpoints {
+		for _, qtype := range qtypes {
+			attemptCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+			addr, err := queryDNSDoH(attemptCtx, endpoint, host, qtype, outboundIface)
+			cancel()
+			if err == nil && addr.IsValid() {
+				return addr, nil
+			}
+		}
+	}
+	return resolveBootstrapHost(ctx, host, preferIPv6, bypassDnscache, outboundIface)
+}
+
 func cloneRequestForConnect(r Request) Request {
 	cloned := r
 	if r.Options != nil {
@@ -318,7 +420,28 @@ func cloneRequestForConnect(r Request) Request {
 		o.Applications = append([]string(nil), r.Options.Applications...)
 		o.Domains = append([]string(nil), r.Options.Domains...)
 		o.Networks = append([]string(nil), r.Options.Networks...)
+		if r.Options.CustomRules != nil {
+			cr := *r.Options.CustomRules
+			cr.Proxy = append([]string(nil), cr.Proxy...)
+			cr.Direct = append([]string(nil), cr.Direct...)
+			cr.Block = append([]string(nil), cr.Block...)
+			o.CustomRules = &cr
+		}
+		if r.Options.ProviderProfile != nil {
+			pp := *r.Options.ProviderProfile
+			pp.Rules = append([]ProviderRuleSpec(nil), pp.Rules...)
+			if pp.DNS != nil {
+				d := *pp.DNS
+				d.Servers = append([]any(nil), d.Servers...)
+				pp.DNS = &d
+			}
+			o.ProviderProfile = &pp
+		}
 		cloned.Options = &o
+	}
+	if r.Fragment != nil {
+		f := *r.Fragment
+		cloned.Fragment = &f
 	}
 	cloned.Outbound = cloneJSONMap(r.Outbound)
 	if r.Group != nil {
@@ -326,6 +449,12 @@ func cloneRequestForConnect(r Request) Request {
 		group.Members = make([]map[string]any, len(r.Group.Members))
 		for i, member := range r.Group.Members {
 			group.Members[i] = cloneJSONMap(member)
+		}
+		if len(r.Group.MemberFragments) > 0 {
+			group.MemberFragments = make(map[string]FragmentSpec, len(r.Group.MemberFragments))
+			for k, v := range r.Group.MemberFragments {
+				group.MemberFragments[k] = v
+			}
 		}
 		cloned.Group = &group
 	}
@@ -387,6 +516,62 @@ func preserveServerName(out map[string]any, originalHost string) {
 			realitySettings["serverName"] = originalHost
 		}
 	}
+	network, _ := stream["network"].(string)
+	switch network {
+	case "ws":
+		ws, _ := stream["wsSettings"].(map[string]any)
+		if ws == nil {
+			ws = map[string]any{}
+			stream["wsSettings"] = ws
+		}
+		hdrs, _ := ws["headers"].(map[string]any)
+		hasHeaderHost := hdrs != nil && strings.TrimSpace(stringVal(hdrs["Host"])) != ""
+		if strings.TrimSpace(stringVal(ws["host"])) == "" && !hasHeaderHost {
+			ws["host"] = originalHost
+			if hdrs == nil {
+				hdrs = map[string]any{}
+				ws["headers"] = hdrs
+			}
+			hdrs["Host"] = originalHost
+		}
+	case "httpupgrade":
+		up, _ := stream["httpupgradeSettings"].(map[string]any)
+		if up == nil {
+			up = map[string]any{}
+			stream["httpupgradeSettings"] = up
+		}
+		if strings.TrimSpace(stringVal(up["host"])) == "" {
+			up["host"] = originalHost
+		}
+	case "xhttp":
+		xh, _ := stream["xhttpSettings"].(map[string]any)
+		if xh == nil {
+			xh = map[string]any{}
+			stream["xhttpSettings"] = xh
+		}
+		if strings.TrimSpace(stringVal(xh["host"])) == "" {
+			xh["host"] = originalHost
+		}
+	case "grpc":
+		gr, _ := stream["grpcSettings"].(map[string]any)
+		if gr != nil && strings.TrimSpace(stringVal(gr["authority"])) == "" {
+			hasExplicitSNI := false
+			if ts, _ := stream["tlsSettings"].(map[string]any); ts != nil && strings.TrimSpace(stringVal(ts["serverName"])) != "" {
+				hasExplicitSNI = true
+			}
+			if rs, _ := stream["realitySettings"].(map[string]any); rs != nil && strings.TrimSpace(stringVal(rs["serverName"])) != "" {
+				hasExplicitSNI = true
+			}
+			if !hasExplicitSNI {
+				gr["authority"] = originalHost
+			}
+		}
+	}
+}
+
+func stringVal(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypassDnscache bool) Request {
@@ -395,8 +580,16 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 	resolved := map[string]netip.Addr{}
 	failed := map[string]bool{}
 	preferIPv6 := cloned.Options != nil && cloned.Options.IPv6
+	dohURL := ""
+	resolveServers := true
+	if cloned.Options != nil {
+		dohURL = cloned.Options.ResolveDohUrl
+		if cloned.Options.ResolveServerAddress != nil && !*cloned.Options.ResolveServerAddress {
+			resolveServers = false
+		}
+	}
 
-	resolve := func(host string) (netip.Addr, bool) {
+	resolveWith := func(host string, useDoH bool) (netip.Addr, bool) {
 		host = strings.TrimSuffix(strings.TrimSpace(host), ".")
 		if host == "" {
 			return netip.Addr{}, false
@@ -410,7 +603,15 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 		if failed[host] {
 			return netip.Addr{}, false
 		}
-		addr, err := resolveBootstrapHost(ctx, host, preferIPv6, bypassDnscache, outboundIface)
+		var (
+			addr netip.Addr
+			err  error
+		)
+		if useDoH {
+			addr, err = resolveHostWithDoH(ctx, host, preferIPv6, bypassDnscache, outboundIface, dohURL)
+		} else {
+			addr, err = resolveBootstrapHost(ctx, host, preferIPv6, bypassDnscache, outboundIface)
+		}
 		if err != nil {
 			failed[host] = true
 			return netip.Addr{}, false
@@ -420,14 +621,24 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 		return addr, true
 	}
 
-	if cloned.Options != nil && cloned.Options.DNS != "" {
-		dnsHost := cloned.Options.DNS
+	resolveDNSName := func(raw string) {
+		if raw == "" {
+			return
+		}
+		dnsHost := strings.TrimPrefix(raw, "udp://")
 		if strings.Contains(dnsHost, "://") {
 			if u, err := url.Parse(dnsHost); err == nil {
 				dnsHost = u.Hostname()
 			}
+		} else if h, _, err := net.SplitHostPort(dnsHost); err == nil {
+			dnsHost = h
 		}
-		resolve(dnsHost)
+		resolveWith(dnsHost, false)
+	}
+
+	if cloned.Options != nil {
+		resolveDNSName(cloned.Options.DNS)
+		resolveDNSName(cloned.Options.DirectDNS)
 	}
 
 	var walkSettings func(out map[string]any, node any)
@@ -438,7 +649,7 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 				switch k {
 				case "address":
 					if addr, ok := val.(string); ok {
-						if ip, replaced := resolve(addr); replaced {
+						if ip, replaced := resolveWith(addr, true); replaced {
 							preserveServerName(out, addr)
 							v["address"] = ip.String()
 						}
@@ -446,7 +657,7 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 				case "endpoint":
 					if ep, ok := val.(string); ok {
 						if host, port, err := net.SplitHostPort(ep); err == nil {
-							if ip, replaced := resolve(host); replaced {
+							if ip, replaced := resolveWith(host, true); replaced {
 								v["endpoint"] = net.JoinHostPort(ip.String(), port)
 							}
 						}
@@ -471,10 +682,12 @@ func bootstrapRequest(ctx context.Context, r Request, outboundIface string, bypa
 		}
 	}
 
-	rewriteOutbound(cloned.Outbound)
-	if cloned.Group != nil {
-		for _, member := range cloned.Group.Members {
-			rewriteOutbound(member)
+	if resolveServers {
+		rewriteOutbound(cloned.Outbound)
+		if cloned.Group != nil {
+			for _, member := range cloned.Group.Members {
+				rewriteOutbound(member)
+			}
 		}
 	}
 	if len(dnsHosts) > 0 {

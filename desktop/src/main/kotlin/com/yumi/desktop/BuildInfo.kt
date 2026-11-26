@@ -5,4 +5,4 @@ package com.yumi.desktop
  * build script, `desktop/build.gradle.kts` and `installer/Yumi.iss` — which `tools/build.ps1`
  * checks agree before it builds anything.
  */
-const val AppVersion = "1.0.5"
+const val AppVersion = "1.1.0"

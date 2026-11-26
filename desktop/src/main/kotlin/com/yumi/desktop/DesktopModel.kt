@@ -1,10 +1,13 @@
 package com.yumi.desktop
 
 import com.mydrop.vpn.core.model.*
+import com.mydrop.vpn.core.net.sanitizeBillingUrl
+import com.mydrop.vpn.core.net.sanitizePortalUrl
 import com.mydrop.vpn.core.parse.*
 import com.mydrop.vpn.core.xray.XrayConfigFactory
 import com.mydrop.vpn.data.*
 import com.mydrop.vpn.pairing.*
+import com.mydrop.vpn.shared.R
 import com.yumi.desktop.model.*
 import com.yumi.desktop.platform.*
 import com.yumi.desktop.update.*
@@ -12,7 +15,10 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -22,7 +28,7 @@ class DesktopModel(
     val backend: TunnelBackend = WindowsTunnelBackend(),
     val directory: File = DesktopPlatform.dataDirectory(),
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-    private val measureLatency: suspend (ProxyNode, PingMode) -> LatencyResult = if (backend is DemoBackend) backend::measureLatency else LatencyTester()::measure,
+    private val measureLatency: (suspend (ProxyNode, PingMode) -> LatencyResult)? = null,
     private val checkTunnel: suspend (ProbeEndpoint) -> Boolean = DefaultCheckTunnel,
     private val serviceInstaller: (suspend () -> ServiceRepair)? =
         if (backend is UnixTunnelBackend && DesktopPlatform.serviceExecutable() != null) ({ DesktopPlatform.repairService() }) else null,
@@ -89,6 +95,63 @@ class DesktopModel(
     private val subscriptionService = SubscriptionService(logs, strings, identity = {
         DeviceIdentity(settings.value.deviceId, System.getProperty("os.name"), System.getProperty("os.version"), "Yumi Desktop")
     }, probeEndpoint = { status.value.probe() })
+    val billingService = BillingService(logs, strings, probeEndpoint = { status.value.probe() })
+    val billingSheet = MutableStateFlow<BillingDialogState?>(null)
+    val serviceLogs = MutableStateFlow("")
+    val serviceLogsRefreshing = MutableStateFlow(false)
+    private val coreProber = CoreProber { nodes, currentSettings, timeoutMillis, concurrency, onResult ->
+        val spec = ConnectRequestFactory.buildProbeSpec(nodes, currentSettings, desktop.value, timeoutMillis, concurrency)
+        if (spec.targets.isEmpty()) return@CoreProber
+        val ipcReply = runCatching { backend.request(ServiceRequest(command = "probe", probe = spec)) }.getOrNull()
+        val ipcResults = ipcReply?.probeResults
+        if (ipcResults != null) {
+            ipcResults.forEach { item -> onResult(item.id, item.millis.takeIf { it > 0 }) }
+            return@CoreProber
+        }
+        val exe = probeServiceExecutable() ?: return@CoreProber
+        val payload = ProbeJson.encodeToString(ProbeSpec.serializer(), spec)
+        val output = withContext(Dispatchers.IO) {
+            val process = ProcessBuilder(exe.absolutePath, "--probe")
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    awaitCancellation()
+                } finally {
+                    process.destroyForcibly()
+                }
+            }
+            try {
+                process.outputStream.use { out ->
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                }
+                val stdout = process.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                if (process.waitFor() == 0) stdout else ""
+            } finally {
+                cancelWatcher.cancel()
+            }
+        }
+        if (output.isNotBlank()) {
+            val parsed = runCatching {
+                ProbeJson.decodeFromString(ListSerializer(ProbeResultItem.serializer()), output.trim())
+            }.getOrNull()
+            parsed?.forEach { item -> onResult(item.id, item.millis.takeIf { it > 0 }) }
+        }
+    }
+    private val latencyTester = LatencyTester(
+        timeoutProvider = { settings.value.probeTimeoutMillis },
+        settingsProvider = { settings.value },
+        coreProber = coreProber,
+        isTunnelRunning = { status.value.state == "connected" },
+    )
+    private suspend fun probeSingle(node: ProxyNode, mode: PingMode): LatencyResult =
+        measureLatency?.invoke(node, mode)
+            ?: if (backend is DemoBackend) backend.measureLatency(node, mode)
+            else latencyTester.measure(node, mode)
+
+    private suspend fun probeTunnelHealth(probe: ProbeEndpoint): Int? =
+        DefaultProbe.probe(probe, settings.value.probeUrl)
 
     init {
         pingJob = scope.launch {
@@ -110,7 +173,7 @@ class DesktopModel(
         val names = desktop.value.applications.mapNotNull { runCatching { RuleValidation.application(it) }.getOrNull() }.distinct()
         if (names != desktop.value.applications) desktop.update { it.copy(applications = names) }
         // Once on launch, before any waiting, so startup auto-connect uses an up-to-date server list.
-        startupRefresh = if (settings.value.subscriptionAutoUpdate) {
+        startupRefresh = if (settings.value.subscriptionAutoUpdate && settings.value.subscriptionUpdateOnStart) {
             scope.launch { refreshDue(startup = true) }
         } else null
         statusJob = scope.launch {
@@ -249,7 +312,7 @@ class DesktopModel(
                 next.groupLatency, System.currentTimeMillis())
             connectionHealth.value = ConnectionHealth.Checking
             if (node != null) connectionProbe = scope.launch {
-                val result = try { measureLatency(node, settings.value.pingMode) }
+                val result = try { probeSingle(node, settings.value.pingMode) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { LatencyResult(node.id, 0, System.currentTimeMillis(), failed = true) }
                 ensureActive()
@@ -266,7 +329,7 @@ class DesktopModel(
                     while (isActive) {
                         val rtt = try {
                             if (checkTunnel === DefaultCheckTunnel) {
-                                DefaultProbe.probe(probe)
+                                probeTunnelHealth(probe)
                             } else {
                                 val started = System.nanoTime()
                                 if (checkTunnel(probe)) ((System.nanoTime() - started) / 1_000_000).toInt().coerceAtLeast(1) else null
@@ -331,7 +394,13 @@ class DesktopModel(
     private suspend fun connectNode(node: ProxyNode?) {
         if (node == null) { message.value = text("Добавьте подписку и выберите сервер.", "Add a subscription and choose a server."); return }
         settingsReconnectPending = false
-        val request = ConnectRequestFactory.create(node, settings.value, desktop.value)
+        val request = ConnectRequestFactory.create(
+            node = node,
+            settings = settings.value,
+            desktop = desktop.value,
+            providerProfile = profiles.providerProfileFor(node),
+            dnsOverride = profiles.selectedDnsProfile()?.url,
+        )
         // Preserve geo/service metadata while the connect command is in flight. Dropping it
         // makes afterStatus mistake the next poll for newly downloaded databases and reconnect.
         val hotSwap = status.value.state == "connected"
@@ -358,24 +427,34 @@ class DesktopModel(
             if (reconnect) { cancelSpeed(); connectSelected() }
         }
     }
+    private fun currentReconnectKey(
+        appSettings: AppSettings = settings.value,
+        desktopSettings: DesktopSettings = desktop.value,
+    ): ConnectReconnectKey = ConnectRequestFactory.reconnectKey(
+        settings = appSettings,
+        desktop = desktopSettings,
+        dnsOverride = profiles.selectedDnsProfile()?.url,
+        providerProfile = (activeNode.value ?: profiles.selectedNode())?.let(profiles::providerProfileFor),
+    )
+
     fun changeSettings(transform: (AppSettings) -> AppSettings, reconnect: Boolean = false) = action {
         commands.withLock {
-            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
+            val previous = currentReconnectKey()
             settings.update(transform)
-            if (reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) applyConnectionSettings()
+            if (reconnect || previous != currentReconnectKey()) applyConnectionSettings()
         }
     }
     fun changeDesktop(next: DesktopSettings, reconnect: Boolean = false) = changeDesktop({ next }, reconnect)
     fun changeDesktop(transform: (DesktopSettings) -> DesktopSettings, reconnect: Boolean = false) = action {
         commands.withLock {
             val before = desktop.value
-            val previous = ConnectRequestFactory.options(settings.value, before)
+            val previous = currentReconnectKey(desktopSettings = before)
             val next = transform(before)
             if (next.launchAtLogin != before.launchAtLogin) DesktopPlatform.setLaunchAtLogin(next.launchAtLogin)
             val loweringShield = before.killSwitch && !next.killSwitch
             desktop.update { next }
             if (!next.connectOnLaunch) startupConnectPending = false
-            if ((reconnect || previous != ConnectRequestFactory.options(settings.value, desktop.value)) &&
+            if ((reconnect || previous != currentReconnectKey(desktopSettings = desktop.value)) &&
                 status.value.state in listOf("connected", "connecting")) applyConnectionSettings()
             // Switching the kill switch off while it holds a dead tunnel means "give me my
             // internet back", not "next time": the block comes down now.
@@ -403,16 +482,57 @@ class DesktopModel(
 
     private suspend fun importDns(dnsProfiles: List<DnsProfile>) {
         val first = dnsProfiles.firstOrNull() ?: error("No DNS profile")
-        profiles.addDnsProfiles(dnsProfiles)
         commands.withLock {
-            val previous = ConnectRequestFactory.options(settings.value, desktop.value)
+            val previous = currentReconnectKey()
+            profiles.addDnsProfiles(dnsProfiles)
+            profiles.selectDnsProfile(first.id)
             settings.update { it.copy(remoteDns = first.url) }
-            if (previous != ConnectRequestFactory.options(settings.value, desktop.value) &&
+            if (previous != currentReconnectKey() &&
                 status.value.state in listOf("connected", "connecting")
             ) {
                 applyConnectionSettings()
             }
         }
+    }
+
+    fun addDnsProfile(raw: String): Boolean {
+        val parsed = DnsUriParser.parse(raw) ?: return false
+        action { importDns(listOf(parsed)) }
+        return true
+    }
+
+    fun selectDnsProfile(id: String?) = action {
+        commands.withLock {
+            val previous = currentReconnectKey()
+            profiles.selectDnsProfile(id)
+            if (previous != currentReconnectKey() &&
+                status.value.state in listOf("connected", "connecting")
+            ) {
+                applyConnectionSettings()
+            }
+        }
+    }
+
+    fun removeDnsProfile(id: String) = action {
+        commands.withLock {
+            val previous = currentReconnectKey()
+            profiles.removeDnsProfile(id)
+            if (previous != currentReconnectKey() &&
+                status.value.state in listOf("connected", "connecting")
+            ) {
+                applyConnectionSettings()
+            }
+        }
+    }
+
+    fun addCustomRule(ruleAction: CustomRules.Action, raw: String): Boolean {
+        val normalized = CustomRules.normalize(raw) ?: return false
+        changeSettings({ it.copy(customRules = it.customRules.adding(ruleAction, normalized)) })
+        return true
+    }
+
+    fun removeCustomRule(ruleAction: CustomRules.Action, entry: String) {
+        changeSettings({ it.copy(customRules = it.customRules.removing(ruleAction, entry)) })
     }
 
     fun importText(raw: String) = action {
@@ -434,6 +554,13 @@ class DesktopModel(
                 profiles.addNodes(supported.map { it.copy(subscriptionId = null) })
             }
             is DeepLinkPayload.AddDns -> importDns(deepLink.profiles)
+            is DeepLinkPayload.BillingReturn -> {
+                val subs = profiles.state.value.subscriptions
+                val targets = subs.firstOrNull { it.id == deepLink.subscriptionId }?.let(::listOf)
+                    ?: subs.filter { it.enabled }
+                targets.forEach { refresh(it) }
+                if (targets.isNotEmpty()) message.value = strings.get(R.string.billing_renewed_ok)
+            }
             is DeepLinkPayload.Unsupported -> {
                 val parsed = SubscriptionParser.parse(value, "manual")
                 if (parsed is SubscriptionBody.Nodes) {
@@ -452,12 +579,145 @@ class DesktopModel(
     suspend fun refresh(subscription: Subscription, notifyOnFailure: Boolean = false) = subscriptions.withLock {
         withBusy {
             when (val result = subscriptionService.fetch(subscription)) {
-                is SubscriptionUpdate.Success -> if (profiles.state.value.subscriptions.any { it.id == subscription.id }) profiles.applySubscriptionUpdate(
-                    subscription.id, result.nodes, result.subscription.userInfo, result.subscription.remoteTitle, result.subscription.webPageUrl)
+                is SubscriptionUpdate.Success -> if (profiles.state.value.subscriptions.any { it.id == subscription.id }) {
+                    profiles.applySubscriptionUpdate(
+                        subscriptionId = subscription.id,
+                        fetchedNodes = result.nodes,
+                        userInfo = result.subscription.userInfo,
+                        remoteTitle = result.subscription.remoteTitle,
+                        webPageUrl = result.subscription.webPageUrl,
+                        providerRouting = result.providerRouting,
+                        billingManifestUrl = result.subscription.billingManifestUrl,
+                        paymentUrl = result.subscription.paymentUrl,
+                        supportUrl = result.subscription.supportUrl,
+                    )
+                }
                 is SubscriptionUpdate.Failure -> {
                     val errorText = result.message.ifBlank { text("Не удалось обновить подписку", "Subscription refresh failed") }
-                    profiles.recordSubscriptionError(subscription.id, errorText)
+                    profiles.recordSubscriptionError(subscription.id, errorText, result.metadata)
                     if (notifyOnFailure) message.value = errorText
+                }
+            }
+        }
+    }
+
+    fun openSubscriptionBilling(subscriptionId: String) {
+        val sub = profiles.state.value.subscriptions.firstOrNull { it.id == subscriptionId } ?: return
+        when {
+            sub.billingManifestUrl != null -> {
+                billingSheet.value = BillingDialogState(subscription = sub, loading = true)
+                action { loadBillingManifest(sub) }
+            }
+            sub.paymentUrl != null -> {
+                val safe = sanitizeBillingUrl(sub.paymentUrl)
+                if (safe == null) {
+                    message.value = strings.get(R.string.billing_error_unsafe_url)
+                } else if (!openExternalUrl(safe)) {
+                    message.value = strings.get(R.string.billing_error_browser_missing)
+                }
+            }
+            sub.webPageUrl != null -> openSubscriptionPortal(subscriptionId)
+        }
+    }
+
+    fun openSubscriptionPortal(subscriptionId: String) {
+        val sub = profiles.state.value.subscriptions.firstOrNull { it.id == subscriptionId } ?: return
+        openExternalBillingUrl(sub.webPageUrl.orEmpty())
+    }
+
+    fun openSubscriptionSupport(subscriptionId: String) {
+        val sub = profiles.state.value.subscriptions.firstOrNull { it.id == subscriptionId } ?: return
+        openExternalBillingUrl(sub.supportUrl.orEmpty())
+    }
+
+    fun openExternalBillingUrl(url: String) {
+        val safe = sanitizePortalUrl(url)
+        if (safe == null) {
+            message.value = strings.get(R.string.billing_error_unsafe_url)
+            return
+        }
+        billingSheet.value = null
+        if (!openExternalUrl(safe)) {
+            message.value = strings.get(R.string.billing_error_browser_missing)
+        }
+    }
+
+    fun retryBillingManifest() {
+        val sub = billingSheet.value?.subscription ?: return
+        billingSheet.value = BillingDialogState(subscription = sub, loading = true)
+        action { loadBillingManifest(sub) }
+    }
+
+    fun dismissBillingSheet() {
+        billingSheet.value = null
+    }
+
+    fun clearBillingCheckoutError() {
+        billingSheet.update { it?.copy(checkoutError = null) }
+    }
+
+    fun submitBillingCheckout(
+        planId: String?,
+        addonId: String?,
+        paymentMethod: String,
+        promoCode: String?,
+    ) {
+        val current = billingSheet.value ?: return
+        val endpoint = current.manifest?.checkout?.endpoint
+        if (endpoint.isNullOrBlank()) {
+            billingSheet.update {
+                it?.copy(checkoutError = strings.get(R.string.billing_error_no_checkout))
+            }
+            return
+        }
+        billingSheet.update { it?.copy(submitting = true, checkoutError = null) }
+        action {
+            val request = BillingCheckoutRequest(
+                planId = planId,
+                addonId = addonId,
+                paymentMethod = paymentMethod,
+                promoCode = promoCode?.trim()?.takeIf { it.isNotEmpty() },
+                returnUrl = "yumi://billing/return?sub_id=${current.subscription.id}",
+            )
+            when (
+                val result = billingService.createCheckout(
+                    endpoint = endpoint,
+                    request = request,
+                    acceptLanguage = Locale.getDefault().toLanguageTag(),
+                )
+            ) {
+                is BillingResult.Success -> {
+                    billingSheet.value = null
+                    if (!openExternalUrl(result.value.paymentUrl)) {
+                        message.value = strings.get(R.string.billing_error_browser_missing)
+                    }
+                }
+                is BillingResult.Failure -> {
+                    billingSheet.update {
+                        if (it?.subscription?.id == current.subscription.id) {
+                            it.copy(submitting = false, checkoutError = result.message)
+                        } else {
+                            it
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun loadBillingManifest(sub: Subscription) {
+        val url = sub.billingManifestUrl ?: return
+        val result = billingService.fetchManifest(
+            manifestUrl = url,
+            acceptLanguage = Locale.getDefault().toLanguageTag(),
+        )
+        billingSheet.update { state ->
+            if (state?.subscription?.id != sub.id) {
+                state
+            } else {
+                when (result) {
+                    is BillingResult.Success -> state.copy(loading = false, manifest = result.value, loadError = null)
+                    is BillingResult.Failure -> state.copy(loading = false, loadError = result.message)
                 }
             }
         }
@@ -520,32 +780,170 @@ class DesktopModel(
             .filter { it.enabled && now - (it.lastUpdatedEpochMillis ?: 0L) >= due }
             .forEach { refresh(it) }
     }
+    private suspend fun disconnectIfMatches(matches: (ProxyNode) -> Boolean) {
+        val active = activeNode.value
+        val saved = connection.value.node
+        if (((active != null && matches(active)) || (saved != null && matches(saved))) &&
+            (status.value.state in listOf("connecting", "connected", "disconnecting") || status.value.killSwitch)
+        ) {
+            cancelSpeed()
+            updateStatus(backend.request(ServiceRequest(command = "disconnect")))
+        }
+    }
+
     fun removeSubscription(id: String) = action {
         commands.withLock {
-            val active = activeNode.value
-            val saved = connection.value.node
-            if ((active?.subscriptionId == id || saved?.subscriptionId == id) &&
-                (status.value.state in listOf("connecting", "connected", "disconnecting") || status.value.killSwitch)
-            ) {
-                cancelSpeed(); updateStatus(backend.request(ServiceRequest(command = "disconnect")))
-            }
+            disconnectIfMatches { it.subscriptionId == id }
             profiles.removeSubscription(id)
             if (connection.value.node?.subscriptionId == id) {
                 connection.update { ActiveConnection() }
             }
         }
     }
-    /** collectLatest cancels and joins the previous sweep before starting this one. */
-    fun matchingServers(): List<ProxyNode> {
-        val query = serverQuery.value.trim()
-        return profiles.nodes.filter { query.isEmpty() || it.name.contains(query, ignoreCase = true) }
+
+    fun setSubscriptionEnabled(id: String, enabled: Boolean) = action {
+        commands.withLock {
+            if (!enabled) {
+                disconnectIfMatches { it.subscriptionId == id }
+                if (connection.value.node?.subscriptionId == id) {
+                    connection.update { ActiveConnection() }
+                }
+            }
+            profiles.setSubscriptionEnabled(id, enabled)
+        }
     }
+
+    fun removeNode(id: String) = action {
+        commands.withLock {
+            disconnectIfMatches { it.id == id }
+            profiles.removeNode(id)
+            if (connection.value.node?.id == id) {
+                connection.update { ActiveConnection() }
+            }
+        }
+    }
+
+    fun filteredServers(
+        nodes: List<ProxyNode> = profiles.nodes,
+        query: String = serverQuery.value,
+        appSettings: AppSettings = settings.value,
+        latencies: Map<String, LatencyResult> = profiles.state.value.latencies,
+    ): List<ProxyNode> {
+        val facetFiltered = ServerFilter.filterNodes(nodes, appSettings)
+        val needle = query.trim()
+        val queried = if (needle.isEmpty()) {
+            facetFiltered
+        } else {
+            facetFiltered.filter {
+                it.name.contains(needle, ignoreCase = true) ||
+                    it.server.contains(needle, ignoreCase = true) ||
+                    it.protocol.label.contains(needle, ignoreCase = true)
+            }
+        }
+        return when (appSettings.serverSort) {
+            ServerSort.Default -> queried
+            ServerSort.Name -> queried.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+            ServerSort.Protocol -> queried.sortedBy { it.protocol.label }
+            ServerSort.Latency -> queried.sortedBy { node ->
+                val result = latencies[node.id]
+                when {
+                    result == null -> Int.MAX_VALUE - 1
+                    result.failed -> Int.MAX_VALUE
+                    else -> result.millis
+                }
+            }
+        }
+    }
+
+    /** collectLatest cancels and joins the previous sweep before starting this one. */
+    fun matchingServers(): List<ProxyNode> = filteredServers()
+
     fun searchServers(query: String) {
         serverQuery.value = query
         if (pinging.value) ping()
     }
+
+    fun toggleProtocolFilter(protocol: Protocol) {
+        settings.update { current ->
+            val resolved = ServerFilter.resolveProtocols(profiles.nodes, current.serverFilterProtocols)
+            val next = if (protocol in resolved) resolved - protocol else resolved + protocol
+            current.copy(serverFilterProtocols = next)
+        }
+        if (pinging.value) ping()
+    }
+
+    fun toggleCountryFilter(code: String) {
+        val clean = code.trim().uppercase()
+        settings.update { current ->
+            val resolved = ServerFilter.resolveCountries(profiles.nodes, current.serverFilterCountries)
+            val next = if (clean in resolved) resolved - clean else resolved + clean
+            current.copy(serverFilterCountries = next)
+        }
+        if (pinging.value) ping()
+    }
+
+    fun setCountryFilterMode(mode: CountryFilterMode) {
+        settings.update { it.copy(serverFilterCountryMode = mode) }
+        if (pinging.value) ping()
+    }
+
+    fun setServerSort(sort: ServerSort) {
+        settings.update { it.copy(serverSort = sort) }
+    }
+
+    fun resetServerFilters() {
+        val hadFacet = settings.value.serverFilterProtocols.isNotEmpty() || settings.value.serverFilterCountries.isNotEmpty()
+        settings.update {
+            it.copy(
+                serverFilterProtocols = emptySet(),
+                serverFilterCountries = emptySet(),
+                serverFilterCountryMode = CountryFilterMode.Include,
+                serverSort = ServerSort.Default,
+            )
+        }
+        if (hadFacet && pinging.value) ping()
+    }
+
+    fun selectFastestServer() {
+        val candidates = filteredServers(query = "")
+        if (profiles.nodes.isNotEmpty() && candidates.isEmpty()) {
+            message.value = text("По активным фильтрам серверы не найдены.", "No servers match the active filters.")
+            return
+        }
+        val latencies = profiles.state.value.latencies
+        val fastest = candidates.minByOrNull { node ->
+            val lr = latencies[node.id]
+            if (lr == null || lr.failed || lr.millis <= 0) Int.MAX_VALUE else lr.millis
+        }
+        val bestResult = fastest?.let { latencies[it.id] }
+        if (fastest == null || bestResult == null || bestResult.failed || bestResult.millis <= 0) {
+            message.value = strings.get(R.string.message_measure_first)
+            return
+        }
+        selectNode(fastest.id)
+    }
+
+    fun pingNode(id: String) {
+        val node = profiles.nodes.firstOrNull { it.id == id } ?: return
+        pingRequests.update { PingRequest(it.sequence + 1, listOf(node)) }
+    }
+
     fun ping() { val nodes = matchingServers(); pingRequests.update { PingRequest(it.sequence + 1, nodes) } }
     fun pingAll() { val nodes = profiles.nodes; pingRequests.update { PingRequest(it.sequence + 1, nodes) } }
+
+    fun refreshServiceLogs(): Job {
+        serviceLogsRefreshing.value = true
+        return scope.launch(Dispatchers.IO) {
+            try {
+                val reply = runCatching { backend.request(ServiceRequest(command = "logs")) }.getOrNull()
+                if (reply?.logs != null) {
+                    serviceLogs.value = reply.logs.orEmpty()
+                }
+            } finally {
+                serviceLogsRefreshing.value = false
+            }
+        }
+    }
 
     private suspend fun measureServers(nodes: List<ProxyNode>) = coroutineScope {
         val pending = java.util.concurrent.ConcurrentLinkedQueue<LatencyResult>()
@@ -561,16 +959,20 @@ class DesktopModel(
         // A bounded worker pool also avoids creating thousands of waiting coroutines.
         val remaining = java.util.concurrent.ConcurrentLinkedQueue(nodes)
         try {
-            List(minOf(16, nodes.size)) {
-                launch {
-                    while (isActive) {
-                        val node = remaining.poll() ?: break
-                        val result = measureLatency(node, mode)
-                        ensureActive()
-                        pending.add(result)
+            if (measureLatency == null && backend !is DemoBackend) {
+                latencyTester.measureAll(nodes, mode) { result -> pending.add(result) }
+            } else {
+                List(minOf(16, nodes.size)) {
+                    launch {
+                        while (isActive) {
+                            val node = remaining.poll() ?: break
+                            val result = probeSingle(node, mode)
+                            ensureActive()
+                            pending.add(result)
+                        }
                     }
-                }
-            }.joinAll()
+                }.joinAll()
+            }
             writer.cancelAndJoin()
             ensureActive()
             flush()
@@ -677,6 +1079,7 @@ class DesktopModel(
         const val CONNECTION_CHECK_MILLIS = 15_000L
         /** How stale a list has to be for opening the window to be a reason to refresh it. */
         const val STARTUP_FLOOR_MILLIS = 2 * 60_000L
+        val ProbeJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
         val DefaultProbe = TunnelHealthProbe()
         val DefaultCheckTunnel: suspend (ProbeEndpoint) -> Boolean = { DefaultProbe.reachable(it) }
     }

@@ -102,4 +102,56 @@ class ConnectRequestTest {
         assertTrue(legacy.applicationsEnabled)
         assertTrue(legacy.sitesEnabled)
     }
+
+    @Test fun tlsOverrideFragmentRulesAndProbeSpecNeverEmitClientSockopt() {
+        val node = server("edge.example.com").copy(
+            tls = com.mydrop.vpn.core.model.TlsOptions(serverName = "edge.example.com", fingerprint = "chrome"),
+            fragment = com.mydrop.vpn.core.model.FragmentOptions(packets = "1-2", length = "10-30", interval = "3-7"),
+        )
+        val settings = AppSettings(
+            tlsFingerprint = com.mydrop.vpn.core.model.TlsFingerprintOverride.Firefox,
+            fragmentMode = com.mydrop.vpn.core.model.FragmentMode.TcpSegments,
+            fragmentScope = com.mydrop.vpn.core.model.FragmentScope.AllTcp,
+            directDns = "9.9.9.9",
+            hijackDns = false,
+            blockQuic = true,
+            blockAds = true,
+            customRules = com.mydrop.vpn.core.model.CustomRules(
+                proxy = listOf("domain:blocked.example"),
+                direct = listOf("10.10.0.0/16"),
+                block = listOf("domain:ads.example"),
+            ),
+            resolveServerAddress = true,
+            resolveDohUrl = "https://dns.google/dns-query",
+        )
+        val req = ConnectRequestFactory.create(node, settings, DesktopSettings())
+        val outboundJson = req.outbound!!.toString()
+        assertTrue(!outboundJson.contains("\"sockopt\""))
+        assertEquals("firefox", req.outbound!!.getValue("streamSettings").jsonObject.getValue("tlsSettings").jsonObject.getValue("fingerprint").jsonPrimitive.content)
+        assertEquals("1-3", req.fragment!!.packets)
+        assertEquals(settings.fragmentLength, req.fragment!!.length)
+        assertEquals(settings.fragmentInterval, req.fragment!!.interval)
+
+        val perNodeReq = ConnectRequestFactory.create(
+            node,
+            settings.copy(fragmentMode = com.mydrop.vpn.core.model.FragmentMode.Off),
+            DesktopSettings(),
+        )
+        assertTrue(!perNodeReq.outbound!!.toString().contains("\"sockopt\""))
+        assertEquals("1-2", perNodeReq.fragment!!.packets)
+        assertEquals("10-30", perNodeReq.fragment!!.length)
+        assertEquals("3-7", perNodeReq.fragment!!.interval)
+        assertEquals("9.9.9.9", req.options!!.directDns)
+        assertEquals(false, req.options!!.hijackDns)
+        assertEquals(true, req.options!!.blockQuic)
+        assertEquals(true, req.options!!.blockAds)
+        assertEquals(listOf("domain:blocked.example"), req.options!!.customRules!!.proxy)
+        assertEquals("https://dns.google/dns-query", req.options!!.resolveDohUrl)
+
+        val probeSpec = ConnectRequestFactory.buildProbeSpec(listOf(node), settings, DesktopSettings(), 3500, 6)
+        assertEquals(1, probeSpec.targets.size)
+        assertEquals(3500, probeSpec.timeoutMillis)
+        assertEquals(6, probeSpec.concurrency)
+        assertTrue(!probeSpec.targets.single().outbound.toString().contains("\"sockopt\""))
+    }
 }

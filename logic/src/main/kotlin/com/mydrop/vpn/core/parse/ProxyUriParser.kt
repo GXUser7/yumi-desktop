@@ -89,6 +89,7 @@ object ProxyUriParser {
             uuid = uuid,
             flow = p.q("flow").orEmpty(),
             packetEncoding = p.q("packetencoding", "packet-encoding", "packet_encoding") ?: "xudp",
+            encryption = p.q("encryption")?.trim()?.takeIf { it.isNotEmpty() } ?: "none",
         )
         return node(p, settings, subId, uri)
     }
@@ -118,7 +119,11 @@ object ProxyUriParser {
                 path = path,
                 headers = if (headerHost.isNotEmpty()) mapOf("Host" to headerHost) else emptyMap(),
             )
-            "grpc" -> TransportOptions.Grpc(serviceName = o.str("path").orEmpty())
+            "grpc" -> TransportOptions.Grpc(
+                serviceName = o.str("path").orEmpty(),
+                multiMode = o.str("type")?.equals("multi", ignoreCase = true) == true,
+                authority = o.str("authority").orEmpty(),
+            )
             "h2", "http" -> TransportOptions.Http(host = splitCsv(headerHost), path = path)
             "httpupgrade" -> TransportOptions.HttpUpgrade(host = headerHost, path = path)
             "quic" -> TransportOptions.Quic
@@ -432,6 +437,8 @@ object ProxyUriParser {
             )
             "grpc" -> TransportOptions.Grpc(
                 serviceName = q("servicename", "service_name", "service-name", "path").orEmpty(),
+                multiMode = q("mode")?.equals("multi", ignoreCase = true) == true,
+                authority = q("authority").orEmpty(),
             )
             "httpupgrade" -> TransportOptions.HttpUpgrade(host = hostHeader, path = path)
             // Two names for one transport: `splithttp` is what it was called before it was
@@ -440,6 +447,7 @@ object ProxyUriParser {
                 path = path,
                 host = hostHeader,
                 mode = q("mode").orEmpty().ifEmpty { "auto" },
+                extraJson = q("extra")?.trim()?.takeIf(::isValidJsonObject),
             )
             // `http`/`h2` and `quic` are deliberately absent, and their absence is the point.
             // The core removed both transports outright and answers a document naming either with
@@ -475,14 +483,25 @@ object ProxyUriParser {
             fingerprint = q("fp", "fingerprint", "client-fingerprint", "client_fingerprint"),
             pinnedCertSha256 = q("pcs", "pinnedpeercertsha256", "pinned_peer_cert_sha256").orEmpty(),
             verifyPeerCertByName = q("vcn", "verifypeercertbyname", "verify_peer_cert_by_name").orEmpty(),
+            echConfigList = q("ech", "echconfiglist", "ech_config_list").orEmpty(),
             reality = realityKey?.let {
                 RealityOptions(
                     publicKey = normalizeRealityKey(it),
                     shortId = q("sid", "short-id", "shortid", "short_id").orEmpty(),
-                    spiderX = q("spx", "spider-x", "spiderx", "spider_x", "path") ?: "/",
+                    spiderX = normalizeSpiderX(q("spx", "spider-x", "spiderx", "spider_x", "path")),
+                    mldsa65Verify = q("pqv", "mldsa65verify", "mldsa65_verify", "mldsa65-verify").orEmpty(),
                 )
             },
         )
+    }
+
+    private fun normalizeSpiderX(raw: String?): String {
+        val trimmed = raw?.trim().orEmpty()
+        return when {
+            trimmed.isEmpty() -> "/"
+            trimmed.startsWith('/') -> trimmed
+            else -> "/$trimmed"
+        }
     }
 
     private fun ParsedUri.multiplex(): MultiplexOptions? {
@@ -518,6 +537,9 @@ object ProxyUriParser {
         decoded.contains(':') &&
             decoded.none { ch -> ch.code < 0x20 && ch != '\t' } &&
             decoded.none { ch -> ch.code == 0x7f }
+
+    private fun isValidJsonObject(raw: String): Boolean =
+        raw.startsWith("{") && runCatching { lenientJson.parseToJsonElement(raw) is JsonObject }.getOrDefault(false)
 
     /** vmess JSON mixes strings and numbers for the same field depending on the panel. */
     private fun JsonObject.str(vararg keys: String): String? {

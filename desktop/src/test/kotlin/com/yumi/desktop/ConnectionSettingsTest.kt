@@ -78,6 +78,46 @@ class ConnectionSettingsTest {
             f.model.changeSettings({ it.copy(themeMode = ThemeMode.Light) }).join()
             f.model.changeDesktop(f.model.desktop.value.copy(connectOnLaunch = true)).join()
             assertEquals(13, f.backend.connects.size, "Appearance and launch preferences must not rebuild a tunnel")
+
+            // Ported core-affecting settings also rebuild without caller reconnect flags, while UI/ping settings stay quiet.
+            val extraReconnectChanges: List<(AppSettings) -> AppSettings> = listOf(
+                { it.copy(tlsFingerprint = TlsFingerprintOverride.Firefox) },
+                { it.copy(fragmentMode = FragmentMode.TcpSegments) },
+                { it.copy(fragmentLength = "10-20") },
+                { it.copy(directDns = "9.9.9.9") },
+                { it.copy(hijackDns = false) },
+                { it.copy(blockQuic = false) },
+                { it.copy(blockAds = true) },
+                { it.copy(customRules = CustomRules(proxy = listOf("domain:blocked.example"))) },
+                { it.copy(resolveServerAddress = false) },
+                { it.copy(resolveDohUrl = "https://dns.google/dns-query") },
+            )
+            extraReconnectChanges.forEach { change ->
+                val count = f.backend.connects.size
+                f.model.changeSettings(change).join()
+                assertEquals(count + 1, f.backend.connects.size)
+            }
+            val beforeDnsProfile = f.backend.connects.size
+            val quad9 = DnsProfile(id = "quad9", name = "Quad9", url = "https://dns.quad9.net/dns-query")
+            f.model.profiles.addDnsProfiles(listOf(quad9))
+            f.model.selectDnsProfile(null).join()
+            assertEquals(beforeDnsProfile + 1, f.backend.connects.size)
+            f.model.selectDnsProfile(quad9.id).join()
+            assertEquals(beforeDnsProfile + 2, f.backend.connects.size)
+            assertEquals("https://dns.quad9.net/dns-query", f.backend.connects.last().options!!.dns)
+            f.model.removeDnsProfile(quad9.id).join()
+            assertEquals(beforeDnsProfile + 3, f.backend.connects.size)
+
+            val quietCount = f.backend.connects.size
+            f.model.changeSettings({
+                it.copy(
+                    settingsMode = SettingsMode.Simple,
+                    showRecommendedBadges = false,
+                    pingMode = PingMode.Tcp,
+                    probeUrl = "https://cp.cloudflare.com/generate_204",
+                )
+            }).join()
+            assertEquals(quietCount, f.backend.connects.size, "SettingsMode and probe settings must not rebuild a tunnel")
         } finally { f.close() }
     }
 

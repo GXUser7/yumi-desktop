@@ -48,6 +48,12 @@ enum class Visualizer(val labelRes: Int) {
 }
 
 @Serializable
+enum class SettingsMode(val labelRes: Int, val descriptionRes: Int) {
+    Simple(R.string.settings_mode_simple, R.string.settings_mode_simple_description),
+    Advanced(R.string.settings_mode_advanced, R.string.settings_mode_advanced_description),
+}
+
+@Serializable
 enum class RoutingMode(val labelRes: Int, val descriptionRes: Int) {
     Global(R.string.routing_global, R.string.routing_global_description),
     Rules(R.string.routing_rules, R.string.routing_rules_description),
@@ -65,14 +71,71 @@ enum class SplitTunnelMode(val labelRes: Int) {
 enum class LogLevel { Trace, Debug, Info, Warn, Error }
 
 /**
- * How a server's latency gets measured. QUIC nodes ignore this and always use a UDP probe —
- * they have no TCP port to handshake with.
+ * How a server's latency gets measured. [UrlTest] dials the probe URL through the Xray core, while
+ * [Tcp]/[Tls]/[Median] still upgrade QUIC, WireGuard, and fragmented nodes to the core automatically.
  */
 @Serializable
 enum class PingMode(val labelRes: Int, val descriptionRes: Int) {
     Tcp(R.string.ping_tcp, R.string.ping_tcp_description),
     Tls(R.string.ping_tls, R.string.ping_tls_description),
     Median(R.string.ping_median, R.string.ping_median_description),
+    UrlTest(R.string.ping_url_test, R.string.ping_url_test_description),
+}
+
+@Serializable
+enum class ServerSort(val labelRes: Int, val shortLabelRes: Int) {
+    Default(R.string.servers_sort_default, R.string.servers_filter_sort_default_short),
+    Latency(R.string.servers_sort_latency, R.string.servers_filter_sort_latency_short),
+    Name(R.string.servers_sort_name, R.string.servers_filter_sort_name_short),
+    Protocol(R.string.servers_sort_protocol, R.string.servers_filter_sort_protocol_short),
+}
+
+@Serializable
+enum class CountryFilterMode {
+    Include,
+    Exclude,
+}
+
+/**
+ * Global uTLS ClientHello fingerprint override applied to TLS/REALITY TCP outbounds.
+ */
+@Serializable
+enum class TlsFingerprintOverride(val labelRes: Int, val xrayValue: String?) {
+    Auto(R.string.tls_fp_auto, null),
+    Chrome(R.string.tls_fp_chrome, "chrome"),
+    Firefox(R.string.tls_fp_firefox, "firefox"),
+    Safari(R.string.tls_fp_safari, "safari"),
+    Ios(R.string.tls_fp_ios, "ios"),
+    Android(R.string.tls_fp_android, "android"),
+    Edge(R.string.tls_fp_edge, "edge"),
+    Qq(R.string.tls_fp_qq, "qq"),
+    Browser360(R.string.tls_fp_360, "360"),
+    Random(R.string.tls_fp_random, "random"),
+    Randomized(R.string.tls_fp_randomized, "randomized"),
+}
+
+/**
+ * Freedom outbound TCP/TLS packet fragmentation mode for DPI circumvention.
+ */
+@Serializable
+enum class FragmentMode(
+    val labelRes: Int,
+    val descriptionRes: Int,
+    val packets: String?,
+) {
+    Off(R.string.fragment_mode_off, R.string.fragment_mode_off_description, null),
+    TlsHello(R.string.fragment_mode_tlshello, R.string.fragment_mode_tlshello_description, "tlshello"),
+    TcpSegments(R.string.fragment_mode_tcp, R.string.fragment_mode_tcp_description, "1-3"),
+}
+
+/**
+ * Which outbound proxy configurations receive the global [FragmentMode] dialer proxy.
+ */
+@Serializable
+enum class FragmentScope(val labelRes: Int, val descriptionRes: Int) {
+    TlsOnly(R.string.fragment_scope_tls_only, R.string.fragment_scope_tls_only_description),
+    TlsAndReality(R.string.fragment_scope_tls_reality, R.string.fragment_scope_tls_reality_description),
+    AllTcp(R.string.fragment_scope_all_tcp, R.string.fragment_scope_all_tcp_description),
 }
 
 @Serializable
@@ -85,11 +148,15 @@ data class AppSettings(
     val dynamicColor: Boolean = false,
     val amoled: Boolean = false,
     val language: AppLanguage = AppLanguage.System,
+    val settingsMode: SettingsMode = SettingsMode.Advanced,
+    val showRecommendedBadges: Boolean = true,
 
     // Routing
     val routingMode: RoutingMode = RoutingMode.Rules,
     val bypassLan: Boolean = true,
     val blockAds: Boolean = false,
+    val providerRouting: Boolean = true,
+    val customRules: CustomRules = CustomRules(),
     /**
      * Rejects QUIC on 443 so browsers fall back to TLS over TCP.
      *
@@ -97,10 +164,17 @@ data class AppSettings(
      * succeeds nor fails quickly — it sits until a timeout, which is what
      * `listen packet connection ... context deadline exceeded` in the journal is. A rejected
      * attempt is answered immediately and Chrome switches protocol on the spot, so blocking it
-     * is faster than letting it through. Off by default: on a network that does not throttle
-     * UDP, QUIC is the better transport and this only takes it away.
+     * is faster than letting it through.
      */
-    val blockQuic: Boolean = false,
+    val blockQuic: Boolean = true,
+    val tlsFingerprint: TlsFingerprintOverride = TlsFingerprintOverride.Auto,
+    val fragmentMode: FragmentMode = FragmentMode.Off,
+    val fragmentScope: FragmentScope = FragmentScope.TlsAndReality,
+    val fragmentLength: String = DEFAULT_FRAGMENT_LENGTH,
+    val fragmentInterval: String = DEFAULT_FRAGMENT_INTERVAL,
+    val fragmentMaxChunks: String = "",
+    val resolveServerAddress: Boolean = true,
+    val resolveDohUrl: String = "https://1.1.1.1/dns-query",
 
     // Tunnel
     val enableIpv6: Boolean = false,
@@ -139,15 +213,13 @@ data class AppSettings(
 
     // Behaviour
     /**
-     * TLS rather than TCP, because a bare handshake answers the wrong question here.
-     *
-     * Russian DPI routinely lets the TCP connection to a blocked server complete and kills the
-     * session after the ClientHello. A TCP probe sees the SYN-ACK, calls the server alive, and
-     * [com.mydrop.vpn.data.FailoverWatchdog] never moves off a server that carries nothing. A
-     * full handshake is the cheapest probe that fails when the thing the user cares about fails —
-     * and for REALITY it is the difference between "the port is open" and "the disguise works".
+     * Real-delay HTTP 204 probe through Xray by default so Hysteria2 (Salamander), REALITY, uTLS,
+     * fragmented nodes, and WireGuard all measure end-to-end usability rather than bare sockets.
      */
-    val pingMode: PingMode = PingMode.Tls,
+    val pingMode: PingMode = PingMode.UrlTest,
+    val pingModeUrlTestDefaultApplied: Boolean = false,
+    val probeUrl: String = ProbeTargets.DEFAULT_URL,
+    val probeTimeoutMillis: Int = 5_000,
     val autoConnectOnBoot: Boolean = false,
     val autoSelectFastest: Boolean = false,
     // Hands the core a group of servers instead of one, so a server that stops answering is
@@ -280,4 +352,88 @@ data class AppSettings(
      * would turn one question into nagging.
      */
     val batteryPromptShown: Boolean = false,
-)
+    val subscriptionUpdateOnStart: Boolean = true,
+    val serverSort: ServerSort = ServerSort.Default,
+    val serverFilterProtocols: Set<Protocol> = emptySet(),
+    val serverFilterCountries: Set<String> = emptySet(),
+    val serverFilterCountryMode: CountryFilterMode = CountryFilterMode.Include,
+) {
+    val simpleBypassEnabled: Boolean
+        get() = fragmentMode != FragmentMode.Off
+
+    fun withSimpleBypass(enabled: Boolean): AppSettings = if (enabled) {
+        if (fragmentMode == FragmentMode.Off) copy(fragmentMode = FragmentMode.TcpSegments) else this
+    } else {
+        copy(fragmentMode = FragmentMode.Off)
+    }
+
+    val simpleAutoUpdateEnabled: Boolean
+        get() = subscriptionAutoUpdate || subscriptionUpdateOnStart
+
+    fun withSimpleAutoUpdate(enabled: Boolean): AppSettings = copy(
+        subscriptionAutoUpdate = enabled,
+        subscriptionUpdateOnStart = enabled,
+    )
+
+    val simpleAlertsEnabled: Boolean
+        get() = alertServer || alertDns || alertLists || alertUpdate
+
+    fun withSimpleAlerts(enabled: Boolean): AppSettings = copy(
+        alertServer = enabled,
+        alertDns = enabled,
+        alertLists = enabled,
+        alertUpdate = enabled,
+    )
+
+    companion object {
+        const val MIN_PROBE_TIMEOUT_MILLIS = 500
+        const val MAX_PROBE_TIMEOUT_MILLIS = 30_000
+        const val DEFAULT_FRAGMENT_LENGTH = "20-50"
+        const val DEFAULT_FRAGMENT_INTERVAL = "2-5"
+        const val MIN_FRAGMENT_LENGTH = 1
+        const val MAX_FRAGMENT_LENGTH = 1500
+        const val MIN_FRAGMENT_INTERVAL = 0
+        const val MAX_FRAGMENT_INTERVAL = 1000
+        const val MIN_FRAGMENT_MAX_CHUNKS = 1
+        const val MAX_FRAGMENT_MAX_CHUNKS = 1000
+
+        /**
+         * Validates and normalizes a numeric value (`"10"`) or inclusive range (`"10-20"`) against
+         * `[minAllowed, maxAllowed]`. Rejects negative values, spaces, or inverted ranges.
+         */
+        fun normalizeRange(raw: String, minAllowed: Int, maxAllowed: Int): String? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            val dash = trimmed.indexOf('-')
+            if (dash < 0) {
+                if (!trimmed.all { it in '0'..'9' }) return null
+                val n = trimmed.toIntOrNull()?.takeIf { it in minAllowed..maxAllowed } ?: return null
+                return n.toString()
+            }
+            val left = trimmed.substring(0, dash)
+            val right = trimmed.substring(dash + 1)
+            if (left.isEmpty() || right.isEmpty() || !left.all { it in '0'..'9' } || !right.all { it in '0'..'9' }) {
+                return null
+            }
+            val from = left.toIntOrNull() ?: return null
+            val to = right.toIntOrNull() ?: return null
+            if (from !in minAllowed..maxAllowed || to !in minAllowed..maxAllowed || from > to) return null
+            return "$from-$to"
+        }
+
+        fun isValidFragmentLength(raw: String): Boolean =
+            normalizeRange(raw, MIN_FRAGMENT_LENGTH, MAX_FRAGMENT_LENGTH) != null
+
+        fun isValidFragmentInterval(raw: String): Boolean =
+            normalizeRange(raw, MIN_FRAGMENT_INTERVAL, MAX_FRAGMENT_INTERVAL) != null
+
+        fun isValidFragmentMaxChunks(raw: String): Boolean =
+            raw.isBlank() || normalizeRange(raw, MIN_FRAGMENT_MAX_CHUNKS, MAX_FRAGMENT_MAX_CHUNKS) != null
+
+        fun isValidFragmentPackets(raw: String): Boolean {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty() || trimmed.equals("tlshello", ignoreCase = true)) return true
+            return normalizeRange(trimmed, 1, 1000) != null
+        }
+    }
+}

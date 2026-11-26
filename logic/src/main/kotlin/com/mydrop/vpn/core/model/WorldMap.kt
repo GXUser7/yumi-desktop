@@ -64,6 +64,16 @@ object WorldMap {
         return null
     }
 
+    /** Flag emoji corresponding to an ISO 3166-1 alpha-2 country code, or null. */
+    fun flagOf(code: String): String? {
+        val clean = code.trim().uppercase()
+        if (clean.length != 2 || clean.any { it !in 'A'..'Z' }) return null
+        return buildString {
+            append(Character.toChars(REGIONAL_FIRST + (clean[0] - 'A')))
+            append(Character.toChars(REGIONAL_FIRST + (clean[1] - 'A')))
+        }
+    }
+
     /**
      * Latitude and longitude for an ISO country code, or null for one that is not in the table.
      *

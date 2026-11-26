@@ -159,6 +159,9 @@ func worker() {
 				document = json.RawMessage(`{"outbounds":[{"tag":"direct-forward","protocol":"freedom","settings":{"domainStrategy":"UseIP"}}]}`)
 			}
 			parsed, err := serial.LoadJSONConfig(bytes.NewReader(document))
+			if err == nil && !next.Disconnect {
+				err = ensureFragmentOutbounds(instance, parsed)
+			}
 			if err == nil {
 				handler, e := prepareLiveOutbound(instance, parsed)
 				if e == nil && next.Group != nil {

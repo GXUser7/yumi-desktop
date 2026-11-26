@@ -3,14 +3,18 @@ package com.mydrop.vpn.data
 import com.mydrop.vpn.core.model.DnsProfile
 import com.mydrop.vpn.core.model.LatencyResult
 import com.mydrop.vpn.core.model.NodeIdMigration
+import com.mydrop.vpn.core.model.ProviderProfile
+import com.mydrop.vpn.core.model.ProviderRouting
 import com.mydrop.vpn.core.model.ProxyNode
 import com.mydrop.vpn.core.model.Subscription
+import com.mydrop.vpn.core.model.SubscriptionFailureMetadata
 import com.mydrop.vpn.core.model.SubscriptionUserInfo
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 
 @Serializable
 data class ProfileState(
@@ -38,14 +42,23 @@ data class ProfileState(
      * Servers added by hand carry no [ProxyNode.subscriptionId] and belong to no switch, so they
      * are never hidden.
      */
+    @Volatile
+    @Transient
+    private var _visibleNodes: List<ProxyNode>? = null
+
     val visibleNodes: List<ProxyNode>
-        get() {
-            val off = subscriptions.asSequence()
-                .filterNot { it.enabled }
-                .map { it.id }
-                .toSet()
-            return if (off.isEmpty()) nodes else nodes.filterNot { it.subscriptionId in off }
+        get() = _visibleNodes ?: computeVisibleNodes().also { _visibleNodes = it }
+
+    private fun computeVisibleNodes(): List<ProxyNode> {
+        var off: MutableSet<String>? = null
+        for (subscription in subscriptions) {
+            if (!subscription.enabled) {
+                if (off == null) off = HashSet()
+                off.add(subscription.id)
+            }
         }
+        return if (off == null) nodes else nodes.filterNot { it.subscriptionId in off }
+    }
 }
 
 class ProfileRepository(
@@ -294,6 +307,10 @@ class ProfileRepository(
         userInfo: SubscriptionUserInfo?,
         remoteTitle: String?,
         webPageUrl: String?,
+        providerRouting: ProviderRouting? = null,
+        billingManifestUrl: String? = null,
+        paymentUrl: String? = null,
+        supportUrl: String? = null,
     ): Pair<Int, Int> {
         var added = 0
         var removed = 0
@@ -331,8 +348,13 @@ class ProfileRepository(
                             userInfo = userInfo ?: sub.userInfo,
                             remoteTitle = remoteTitle ?: sub.remoteTitle,
                             webPageUrl = webPageUrl ?: sub.webPageUrl,
+                            billingManifestUrl = billingManifestUrl ?: sub.billingManifestUrl,
+                            paymentUrl = paymentUrl ?: sub.paymentUrl,
+                            supportUrl = supportUrl ?: sub.supportUrl,
                             lastUpdatedEpochMillis = System.currentTimeMillis(),
                             lastError = null,
+                            providerRouting = (providerRouting ?: sub.providerRouting)
+                                ?.keepingOnly(fetchedIds),
                         )
                     }
                 },
@@ -378,10 +400,26 @@ class ProfileRepository(
         return sameName?.id ?: selectedId
     }
 
-    fun recordSubscriptionError(subscriptionId: String, message: String) = store.update { current ->
+    fun recordSubscriptionError(
+        subscriptionId: String,
+        message: String,
+        metadata: SubscriptionFailureMetadata? = null,
+    ) = store.update { current ->
         current.copy(
-            subscriptions = current.subscriptions.map {
-                if (it.id == subscriptionId) it.copy(lastError = message) else it
+            subscriptions = current.subscriptions.map { sub ->
+                if (sub.id != subscriptionId) {
+                    sub
+                } else {
+                    sub.copy(
+                        userInfo = metadata?.userInfo ?: sub.userInfo,
+                        remoteTitle = metadata?.remoteTitle ?: sub.remoteTitle,
+                        webPageUrl = metadata?.webPageUrl ?: sub.webPageUrl,
+                        billingManifestUrl = metadata?.billingManifestUrl ?: sub.billingManifestUrl,
+                        paymentUrl = metadata?.paymentUrl ?: sub.paymentUrl,
+                        supportUrl = metadata?.supportUrl ?: sub.supportUrl,
+                        lastError = message,
+                    )
+                }
             },
         )
     }
@@ -441,6 +479,14 @@ class ProfileRepository(
 
     /** Null switches back to the resolver configured in settings. */
     fun selectDnsProfile(id: String?) = store.update { it.copy(selectedDnsId = id) }
+
+    fun providerProfileFor(node: ProxyNode): ProviderProfile? {
+        val subscriptionId = node.subscriptionId ?: return null
+        return store.value.subscriptions
+            .firstOrNull { it.id == subscriptionId }
+            ?.providerRouting
+            ?.profileFor(node.id)
+    }
 
     fun selectedDnsProfile(): DnsProfile? = store.value.let { state ->
         state.dnsProfiles.firstOrNull { it.id == state.selectedDnsId }

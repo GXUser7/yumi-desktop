@@ -1,5 +1,8 @@
 package com.mydrop.vpn.core.net
 
+import java.net.InetAddress
+import java.net.URL
+
 /**
  * One answer to "is this an address, and where does the host end and the port begin".
  *
@@ -120,3 +123,194 @@ private fun isIpv6(value: String): Boolean {
 }
 
 private fun Char.isHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+private fun stripIpv6Zone(host: String): String {
+    if (':' !in host) return host
+    val pct = host.indexOf('%')
+    return if (pct > 0) host.substring(0, pct) else host
+}
+
+private fun parseIpv4AtonPart(part: String): Long? {
+    if (part.isEmpty()) return null
+    return when {
+        part.startsWith("0x", ignoreCase = true) -> {
+            val digits = part.substring(2)
+            if (digits.isEmpty()) return null
+            var acc = 0L
+            for (ch in digits) {
+                val digit = when (ch) {
+                    in '0'..'9' -> ch - '0'
+                    in 'a'..'f' -> 10 + (ch - 'a')
+                    in 'A'..'F' -> 10 + (ch - 'A')
+                    else -> return null
+                }
+                acc = (acc shl 4) + digit
+                if (acc > 0xFFFFFFFFL) return null
+            }
+            acc
+        }
+        part.length > 1 && part[0] == '0' -> {
+            var acc = 0L
+            for (ch in part) {
+                if (ch !in '0'..'7') return null
+                acc = (acc shl 3) + (ch - '0')
+                if (acc > 0xFFFFFFFFL) return null
+            }
+            acc
+        }
+        else -> {
+            var acc = 0L
+            for (ch in part) {
+                if (ch !in '0'..'9') return null
+                acc = acc * 10 + (ch - '0')
+                if (acc > 0xFFFFFFFFL) return null
+            }
+            acc
+        }
+    }
+}
+
+private fun parseIpv4AtonBytes(value: String): ByteArray? {
+    val parts = value.split('.')
+    if (parts.size !in 1..4) return null
+    val values = LongArray(parts.size) { i ->
+        parseIpv4AtonPart(parts[i]) ?: return null
+    }
+    val b0: Long
+    val b1: Long
+    val b2: Long
+    val b3: Long
+    when (values.size) {
+        1 -> {
+            val v = values[0]
+            b0 = (v ushr 24) and 0xFFL
+            b1 = (v ushr 16) and 0xFFL
+            b2 = (v ushr 8) and 0xFFL
+            b3 = v and 0xFFL
+        }
+        2 -> {
+            if (values[0] > 0xFFL || values[1] > 0xFFFFFFL) return null
+            b0 = values[0]
+            b1 = (values[1] ushr 16) and 0xFFL
+            b2 = (values[1] ushr 8) and 0xFFL
+            b3 = values[1] and 0xFFL
+        }
+        3 -> {
+            if (values[0] > 0xFFL || values[1] > 0xFFL || values[2] > 0xFFFFL) return null
+            b0 = values[0]
+            b1 = values[1]
+            b2 = (values[2] ushr 8) and 0xFFL
+            b3 = values[2] and 0xFFL
+        }
+        else -> {
+            if (values.any { it > 0xFFL }) return null
+            b0 = values[0]
+            b1 = values[1]
+            b2 = values[2]
+            b3 = values[3]
+        }
+    }
+    return byteArrayOf(b0.toByte(), b1.toByte(), b2.toByte(), b3.toByte())
+}
+
+/** Extracts the bare host (without scheme, userinfo, path, query, fragment, port, or IPv6 zone). */
+fun extractAuthorityHost(target: String): String? {
+    val trimmed = target.trim()
+    if (trimmed.isEmpty()) return null
+    val withoutScheme = trimmed.substringAfter("://", missingDelimiterValue = trimmed)
+    val authority = withoutScheme
+        .substringBefore('/')
+        .substringBefore('?')
+        .substringBefore('#')
+        .substringAfterLast('@')
+    return splitHostPort(authority)?.host?.let(::stripIpv6Zone)?.takeIf { it.isNotBlank() }
+}
+
+/**
+ * True for resolver/redirect hosts that target loopback, unspecified addresses, `localhost`,
+ * or non-canonical IP literals.
+ */
+fun isLoopbackOrUnspecifiedHost(host: String): Boolean {
+    val raw = host.trim().removeSurrounding("[", "]").trimEnd('.').lowercase()
+    val clean = stripIpv6Zone(raw)
+    if (clean.isEmpty() || clean == "localhost" || clean.endsWith(".localhost")) return true
+    if (clean.all { it in '0'..'9' }) return true
+    if (clean.startsWith("0x") && clean.length > 2 && clean.drop(2).all { it.isHexDigit() }) return true
+
+    parseIpv4AtonBytes(clean)?.let { bytes ->
+        val b0 = bytes[0].toInt() and 0xFF
+        return b0 == 127 || b0 == 0
+    }
+
+    val normalized = if (':' in clean && '.' in clean) {
+        val lastColon = clean.lastIndexOf(':')
+        val tail = clean.substring(lastColon + 1)
+        val tailBytes = parseIpv4AtonBytes(tail)
+        if (tailBytes != null && tailBytes.size == 4) {
+            val canonicalTail = tailBytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
+            "${clean.substring(0, lastColon)}:$canonicalTail"
+        } else {
+            clean
+        }
+    } else {
+        clean
+    }
+
+    if (!isNumericAddress(normalized)) return false
+    return runCatching {
+        val addr = InetAddress.getByName(normalized)
+        if (addr.isLoopbackAddress || addr.isAnyLocalAddress) return@runCatching true
+        val bytes = addr.address
+        (bytes.size == 4 && ((bytes[0].toInt() and 0xFF) == 127 || (bytes[0].toInt() and 0xFF) == 0)) ||
+            (bytes.size == 16 && (0..11).all { bytes[it] == 0.toByte() } && (bytes[12].toInt() and 0xFF) == 127)
+    }.getOrDefault(true)
+}
+
+/** True when [host] must never be emitted as an Xray DNS server address. */
+fun isForbiddenDnsHost(host: String): Boolean {
+    val clean = host.trim().removeSurrounding("[", "]").trimEnd('.').lowercase()
+    if (clean == "fakedns") return true
+    return isLoopbackOrUnspecifiedHost(clean)
+}
+
+internal fun isNonCanonicalOrZonedIpLiteral(host: String): Boolean {
+    val raw = host.trim().removeSurrounding("[", "]").trimEnd('.').lowercase()
+    if (raw.isEmpty()) return false
+    if (':' in raw && '%' in raw) return true
+    if (raw.all { it in '0'..'9' }) return true
+    if (raw.startsWith("0x") && raw.length > 2 && raw.drop(2).all { it.isHexDigit() }) return true
+    if (parseIpv4AtonBytes(raw) != null && !isIpv4(raw)) return true
+    return false
+}
+
+/**
+ * Resolves [location] relative to [source] for direct (non-tunnelled) HTTP requests, blocking
+ * non-http(s) schemes, non-canonical/zoned IP literals, and SSRF redirects into loopback /
+ * unspecified / `localhost` targets.
+ */
+fun resolveSafeDirectRedirect(source: URL, location: String): URL {
+    val next = URL(source, location)
+    val scheme = next.protocol.lowercase()
+    check(scheme == "http" || scheme == "https") {
+        "Blocked unsafe redirect scheme: ${next.protocol}"
+    }
+    val nextHost = next.host.orEmpty()
+    check(nextHost.isNotBlank()) { "Blocked redirect without a host" }
+    check(!isNonCanonicalOrZonedIpLiteral(nextHost)) {
+        "Blocked unsafe redirect to non-canonical or zoned IP host: $nextHost"
+    }
+    if (isLoopbackOrUnspecifiedHost(nextHost)) {
+        val sourceHost = source.host.orEmpty()
+        val sameLoopbackOrigin = isLoopbackOrUnspecifiedHost(sourceHost) &&
+            !isNonCanonicalOrZonedIpLiteral(sourceHost) &&
+            sourceHost.equals(nextHost, ignoreCase = true) &&
+            effectivePort(source) == effectivePort(next)
+        check(sameLoopbackOrigin) {
+            "Blocked unsafe redirect to loopback/unspecified host: $nextHost"
+        }
+    }
+    return next
+}
+
+private fun effectivePort(url: URL): Int =
+    if (url.port != -1) url.port else url.defaultPort

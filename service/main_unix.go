@@ -92,6 +92,25 @@ func workerJournal() *os.File {
 	return file
 }
 
+func openWorkerJournalRead() (*os.File, error) {
+	root := systemStateDirectory()
+	if root == "" {
+		return nil, os.ErrNotExist
+	}
+	if dirInfo, err := os.Lstat(root); err != nil || dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+		return nil, errors.New("state dir unavailable")
+	}
+	path := filepath.Join(root, "worker.log")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("journal is not a regular file")
+	}
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+}
+
 // Only the daemon and the administrators may write what the core parses; on unix that is a
 // directory the daemon created as root, which is exactly that.
 func secureDirectory(dir string) error {
@@ -328,6 +347,7 @@ func removeService() error {
 
 func main() {
 	isWorker := flag.Bool("worker", false, "")
+	isProbe := flag.Bool("probe", false, "")
 	isService := flag.Bool("service", false, "")
 	installFlag := flag.Bool("install", false, "")
 	removeFlag := flag.Bool("uninstall", false, "")
@@ -340,6 +360,8 @@ func main() {
 	case *isWorker:
 		worker()
 		return
+	case *isProbe:
+		err = runProbeCLI()
 	case *printOwner || *ownerOut != "":
 		id, e := currentOwner()
 		if e != nil {

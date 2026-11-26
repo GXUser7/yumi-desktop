@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -365,7 +366,12 @@ func (s *supervisor) connect(r Request) error {
 	s.mu.Lock()
 	dir := s.geoDir
 	s.mu.Unlock()
-	geo := r.Options.BypassRussia && inspectGeo(dir).Ready
+	geoReady := inspectGeo(dir).Ready
+	geo := r.Options.BypassRussia && geoReady
+	var geoCats geoCategories
+	if geoReady {
+		geoCats = loadGeoCategories(dir)
+	}
 	outbound, outboundErr := s.resolveOutbound(r.Options.OutboundAdapter)
 	if outboundErr != nil {
 		if r.Options.OutboundAdapter != "" {
@@ -392,7 +398,7 @@ func (s *supervisor) connect(r Request) error {
 		cancel()
 		initial := switchingStatus(previous, r.NodeID)
 		initial.ServerCountry = r.ServerCountry
-		config := buildConfig(bootstrapped, initial.ProbePort, initial.ProbeUser, initial.ProbePassword, geo, outbound)
+		config := buildConfigWithGeo(bootstrapped, initial.ProbePort, initial.ProbeUser, initial.ProbePassword, geo, geoReady, geoCats, outbound)
 		// A live switch stays connected with the old server until the worker atomically
 		// publishes the new one. Do not reset counters, the timer or the UI's rate history.
 		s.mu.Lock()
@@ -433,7 +439,7 @@ func (s *supervisor) connect(r Request) error {
 	bootstrapped := bootstrapRequest(bootstrapCtx, r, outbound, s.shieldUp.Load())
 	cancel()
 	initial := Status{Version: 1, State: "connecting", NodeID: r.NodeID, ServerCountry: r.ServerCountry, ProbePort: port, ProbeUser: randomSecret(), ProbePassword: randomSecret()}
-	config := buildConfig(bootstrapped, port, initial.ProbeUser, initial.ProbePassword, geo, outbound)
+	config := buildConfigWithGeo(bootstrapped, port, initial.ProbeUser, initial.ProbePassword, geo, geoReady, geoCats, outbound)
 	exe, err := os.Executable()
 	if err != nil {
 		return errors.New("worker_unavailable")
@@ -561,6 +567,52 @@ func (s *supervisor) connect(r Request) error {
 	return nil
 }
 
+func readTailFromFile(f *os.File, maxBytes int64) string {
+	if f == nil || maxBytes <= 0 {
+		return ""
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := info.Size()
+	if size <= 0 {
+		return ""
+	}
+	offset := int64(0)
+	truncated := false
+	if size > maxBytes {
+		offset = size - maxBytes
+		truncated = true
+	}
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return ""
+		}
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return ""
+	}
+	if truncated {
+		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 && idx+1 < len(buf) {
+			buf = buf[idx+1:]
+		}
+	}
+	return string(buf)
+}
+
+func readWorkerJournalTail(maxBytes int64) string {
+	journalMu.Lock()
+	defer journalMu.Unlock()
+	f, err := openWorkerJournalRead()
+	if err != nil || f == nil {
+		return ""
+	}
+	defer f.Close()
+	return readTailFromFile(f, maxBytes)
+}
+
 func (s *supervisor) handle(r Request) Status {
 	if r.Command == "status" {
 		return s.snapshot()
@@ -574,6 +626,33 @@ func (s *supervisor) handle(r Request) Status {
 		status.TunName = ""
 		status.KillSwitch = s.shieldUp.Load()
 		return status
+	}
+	if r.Command == "logs" {
+		snap := s.snapshot()
+		snap.Logs = readWorkerJournalTail(64 * 1024)
+		return snap
+	}
+	if r.Command == "probe" {
+		snap := s.snapshot()
+		outbound, _ := s.resolveOutbound(r.Probe.OutboundAdapter)
+		timeout := time.Duration(r.Probe.TimeoutMillis) * time.Millisecond
+		if timeout <= 0 {
+			timeout = defaultProbeTimeout
+		}
+		budget := timeout*4 + 15*time.Second
+		if budget > 120*time.Second {
+			budget = 120 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		results, err := runProbes(ctx, *r.Probe, outbound)
+		cancel()
+		if err != nil {
+			snap.Error = "probe_failed"
+			snap.Detail = detailOf(err)
+			return snap
+		}
+		snap.ProbeResults = results
+		return snap
 	}
 	s.commands.Lock()
 	defer s.commands.Unlock()

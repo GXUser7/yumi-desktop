@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.AltRoute
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -56,6 +57,7 @@ import com.mydrop.vpn.core.format.formatDuration
 import com.mydrop.vpn.core.model.*
 import com.mydrop.vpn.core.net.isNumericAddress
 import com.mydrop.vpn.data.ProfileState
+import com.mydrop.vpn.data.ServerAddressResolver
 import com.mydrop.vpn.pairing.*
 import com.mydrop.vpn.shared.R
 import com.mydrop.vpn.ui.components.*
@@ -101,9 +103,12 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
     val settings by model.settings.settings.collectAsState()
     val desktop by model.desktop.state.collectAsState()
     val notice by model.message.collectAsState()
+    val billing by model.billingSheet.collectAsState()
     var page by remember(initialPage) { mutableStateOf(initialPage) }
     var add by remember { mutableStateOf(false) }
     var pairing by remember { mutableStateOf(false) }
+    var logsOpen by remember { mutableStateOf(false) }
+    var gratitudeOpen by remember { mutableStateOf(false) }
     val openPairing = { pairing = true; model.startPairing() }
     val planet = remember { PlanetState() }
 
@@ -133,7 +138,12 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
                                             Page.Subscriptions -> SubscriptionsPage(model, onAdd = { add = true }, onPair = openPairing)
                                             Page.Routing -> RoutingPage(model)
                                             Page.Speed -> SpeedPage(model)
-                                            Page.Settings -> SettingsPage(model, onInstallUpdate)
+                                            Page.Settings -> SettingsPage(
+                                                model,
+                                                onInstallUpdate = onInstallUpdate,
+                                                onOpenLogs = { logsOpen = true },
+                                                onOpenGratitude = { gratitudeOpen = true },
+                                            )
                                         }
                                     }
                                 }
@@ -144,6 +154,9 @@ enum class Page(val ru: String, val en: String, val icon: ImageVector) {
             }
             if (add) ImportDialog(model, onClose = { add = false })
             if (pairing) PairingDialog(model, onClose = { pairing = false; model.stopPairing() })
+            billing?.let { BillingDialog(model, it) }
+            if (logsOpen) LogsDialog(model) { logsOpen = false }
+            if (gratitudeOpen) GratitudeDialog(model) { gratitudeOpen = false }
             notice?.let {
                 AlertDialog(
                     onDismissRequest = { model.message.value = null },
@@ -890,14 +903,26 @@ private val ReadingWidth = 860.dp
 
 @Composable private fun ServersPage(m: DesktopModel) {
     val profiles by m.profiles.state.collectAsState()
+    val settings by m.settings.settings.collectAsState()
     val pinging by m.pinging.collectAsState()
     val status by m.collectUiStatus()
     val activeNode by m.activeNode.collectAsState()
     val query by m.serverQuery.collectAsState()
     val visibleNodes = remember(profiles.nodes, profiles.subscriptions) { profiles.visibleNodes }
-    val matches = remember(visibleNodes, query) {
-        if (query.isBlank()) visibleNodes else visibleNodes.filter { it.name.contains(query.trim(), true) }
+    val matches = remember(
+        visibleNodes,
+        query,
+        settings.serverFilterProtocols,
+        settings.serverFilterCountries,
+        settings.serverFilterCountryMode,
+        settings.serverSort,
+        if (settings.serverSort == ServerSort.Latency) profiles.latencies else null,
+    ) {
+        m.filteredServers(visibleNodes, query, settings, profiles.latencies)
     }
+    val filteringActive = query.isNotBlank() ||
+        settings.serverFilterProtocols.isNotEmpty() ||
+        settings.serverFilterCountries.isNotEmpty()
     val sources = remember(profiles.subscriptions) { profiles.subscriptions.associate { it.id to (it.remoteTitle ?: it.name) } }
     val list = rememberLazyListState()
     val frameProbe = LocalUiFrameProbe.current
@@ -928,6 +953,7 @@ private val ReadingWidth = 860.dp
                 enabled = matches.isNotEmpty(),
             ) { m.ping() }
         }
+        ServerFiltersBar(m, visibleNodes, settings)
         Box(Modifier.weight(1f).fillMaxWidth().glass(PanelShape, glassTint()).testTag("server-panel")) {
             Column(Modifier.fillMaxSize()) {
                 Row(Modifier.fillMaxWidth().padding(start = 22.dp, end = 30.dp, top = 18.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -941,7 +967,7 @@ private val ReadingWidth = 860.dp
                     else HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
                 }
                 if (matches.isEmpty()) Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                    Text(m.strings.get(if (query.isBlank()) R.string.servers_empty_hint else R.string.servers_empty_filtered_hint),
+                    Text(m.strings.get(if (!filteringActive) R.string.servers_empty_hint else R.string.servers_empty_filtered_hint),
                         style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                 } else Box(Modifier.weight(1f)) {
                     LazyColumn(
@@ -989,6 +1015,16 @@ private val ReadingWidth = 860.dp
         Column(Modifier.width(92.dp), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
             LatencyLabel(m, latency)
             if (connected) Text(m.text("Подключён", "Connected"), style = MaterialTheme.typography.labelSmall, color = LocalSemanticColors.current.connected)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+            PanelIconButton(Icons.Rounded.Bolt, m.strings.get(R.string.servers_measure_latency), size = 34.dp) {
+                m.pingNode(node.id)
+            }
+            if (node.subscriptionId == null) {
+                PanelIconButton(Icons.Rounded.DeleteOutline, m.strings.get(R.string.servers_delete), size = 34.dp) {
+                    m.removeNode(node.id)
+                }
+            }
         }
     }
 }
@@ -1042,12 +1078,17 @@ private val ReadingWidth = 860.dp
 }
 
 @Composable private fun SubscriptionCard(m: DesktopModel, sub: Subscription, busy: Boolean, onRemove: () -> Unit) {
-    GlassPanel(Modifier.fillMaxWidth()) {
+    val cardAlpha by animateFloatAsState(if (sub.enabled) 1f else 0.62f, colorTween(), label = "sub-alpha")
+    GlassPanel(Modifier.fillMaxWidth().graphicsLayer { alpha = cardAlpha }) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Kicker(m.text("Подписка", "Subscription"))
+                Kicker(
+                    if (sub.enabled) m.strings.get(R.string.subscriptions_enabled)
+                    else m.strings.get(R.string.subscriptions_disabled),
+                )
                 Text(sub.remoteTitle ?: sub.name, style = MaterialTheme.typography.titleLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
+            Switch(sub.enabled, { m.setSubscriptionEnabled(sub.id, it) })
             PanelIconButton(Icons.Rounded.Refresh, m.strings.get(R.string.action_refresh), size = 44.dp, enabled = !busy) { m.action { m.refresh(sub) } }
             PanelIconButton(Icons.Rounded.DeleteOutline, m.strings.get(R.string.action_delete), size = 44.dp, onClick = onRemove)
         }
@@ -1082,7 +1123,42 @@ private val ReadingWidth = 860.dp
         )
         if (sub.lastError != null) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.tertiary)
-            Text(m.text("Не удалось обновить. Подписка сохранена.", "Refresh failed. Your subscription is saved."), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary)
+            Text(
+                sub.lastError!!.takeIf { it.isNotBlank() }
+                    ?: m.text("Не удалось обновить. Подписка сохранена.", "Refresh failed. Your subscription is saved."),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.tertiary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (sub.hasAnyPortalAction || sub.supportUrl != null) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (sub.hasBillingAction) {
+                    val expired = sub.userInfo?.expiresAtEpochSeconds?.let { it * 1000L <= System.currentTimeMillis() } == true ||
+                        sub.lastError != null
+                    AccentButton(
+                        m.strings.get(if (expired) R.string.subscriptions_action_renew else R.string.subscriptions_action_plans),
+                        icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                    ) { m.openSubscriptionBilling(sub.id) }
+                }
+                if (sub.webPageUrl != null) {
+                    QuietButton(
+                        m.strings.get(R.string.subscriptions_action_account),
+                        icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                    ) { m.openSubscriptionPortal(sub.id) }
+                }
+                if (sub.supportUrl != null) {
+                    QuietButton(
+                        m.strings.get(R.string.subscriptions_action_support),
+                        icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                    ) { m.openSubscriptionSupport(sub.id) }
+                }
+            }
         }
     }
 }
@@ -1135,9 +1211,26 @@ private val ReadingWidth = 860.dp
                 settings.bypassLan,
                 m.text("Роутер, принтер, NAS и перенос подписки с телефона", "Router, printer, NAS and phone transfer"),
             ) { m.changeSettings({ s -> s.copy(bypassLan = it) }, true) }
+            SwitchRow(
+                m.strings.get(R.string.settings_provider_routing),
+                settings.providerRouting,
+                m.strings.get(R.string.settings_provider_routing_subtitle),
+            ) { m.changeSettings({ s -> s.copy(providerRouting = it) }, true) }
+            SwitchRow(
+                m.strings.get(R.string.settings_block_quic),
+                settings.blockQuic,
+                m.strings.get(R.string.settings_block_quic_subtitle),
+            ) { m.changeSettings({ s -> s.copy(blockQuic = it) }, true) }
+            SwitchRow(
+                m.strings.get(R.string.settings_block_ads),
+                settings.blockAds,
+                m.strings.get(R.string.settings_block_ads_subtitle),
+            ) { m.changeSettings({ s -> s.copy(blockAds = it) }, true) }
         }
 
         RussiaPanel(m, current, status)
+
+        CustomRulesPanel(m, settings)
 
         GlassPanel(Modifier.fillMaxWidth()) {
             val appsAlpha by animateFloatAsState(if (current.applicationsEnabled) 1f else 0.55f, colorTween(), label = "routing-apps-alpha")
@@ -1492,145 +1585,666 @@ private val ReadingWidth = 860.dp
     }
 }
 
+@Composable private fun CustomRulesPanel(m: DesktopModel, settings: AppSettings) {
+    val s = m.strings
+    var selectedAction by remember { mutableStateOf(CustomRules.Action.Proxy) }
+    var draft by remember { mutableStateOf("") }
+    var rejected by remember { mutableStateOf(false) }
+    val entries = settings.customRules.of(selectedAction)
+
+    fun submitRule() {
+        if (draft.isBlank()) {
+            rejected = false
+            return
+        }
+        if (m.addCustomRule(selectedAction, draft)) {
+            draft = ""
+            rejected = false
+        } else {
+            rejected = true
+        }
+    }
+
+    GlassPanel(Modifier.fillMaxWidth().testTag("custom-rules-panel")) {
+        SectionTitle(s.get(R.string.custom_rules_title), s.get(R.string.custom_rules_subtitle))
+        ChoiceRow(
+            label = null,
+            options = CustomRules.Action.entries,
+            selected = selectedAction,
+            text = { action ->
+                val count = settings.customRules.of(action).size
+                val base = when (action) {
+                    CustomRules.Action.Proxy -> s.get(R.string.custom_rules_action_proxy)
+                    CustomRules.Action.Direct -> s.get(R.string.custom_rules_action_direct)
+                    CustomRules.Action.Block -> s.get(R.string.custom_rules_action_block)
+                }
+                if (count > 0) "$base · $count" else base
+            },
+            onSelect = { selectedAction = it },
+        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            GlassField(
+                value = draft,
+                onValueChange = { draft = it; rejected = false },
+                modifier = Modifier.weight(1f).testTag("custom-rule-input"),
+                label = s.get(R.string.custom_rules_input_label),
+                placeholder = s.get(R.string.custom_rules_input_hint),
+                isError = rejected,
+            )
+            AccentButton(
+                s.get(R.string.action_add),
+                Modifier.testTag("custom-rule-add"),
+                icon = Icons.Rounded.Add,
+                enabled = draft.isNotBlank(),
+            ) { submitRule() }
+        }
+        if (rejected) {
+            Text(s.get(R.string.custom_rules_input_error), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        } else {
+            Text(s.get(R.string.custom_rules_priority_note), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (entries.isEmpty()) {
+            Text(s.get(R.string.custom_rules_empty), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                entries.forEach { entry ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RowShape)
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+                            .padding(horizontal = 14.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        val badge = when {
+                            entry.startsWith("domain:") -> s.get(R.string.custom_rules_prefix_domain)
+                            CustomRules.isAddress(entry) -> "IP"
+                            else -> null
+                        }
+                        if (badge != null) Plate(badge)
+                        Text(
+                            entry.removePrefix("domain:"),
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        PanelIconButton(Icons.Rounded.Close, s.get(R.string.action_delete), size = 34.dp) {
+                            m.removeCustomRule(selectedAction, entry)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* ── Settings ─────────────────────────────────────────────────────────────────────────────── */
 
-@Composable private fun SettingsPage(m: DesktopModel, onInstallUpdate: () -> Unit) {
+private data class FragmentPresetOption(
+    val labelRes: Int,
+    val length: String,
+    val interval: String,
+    val maxChunks: String = "",
+)
+
+private val DesktopFragmentPresets = listOf(
+    FragmentPresetOption(R.string.fragment_preset_gentle, length = "50-100", interval = "2-5"),
+    FragmentPresetOption(R.string.fragment_preset_standard, length = "20-50", interval = "2-5"),
+    FragmentPresetOption(R.string.fragment_preset_aggressive, length = "10-20", interval = "1-3"),
+)
+
+@Composable private fun SettingsPage(
+    m: DesktopModel,
+    onInstallUpdate: () -> Unit,
+    onOpenLogs: () -> Unit = {},
+    onOpenGratitude: () -> Unit = {},
+) {
     val settings by m.settings.settings.collectAsState()
     val desktop by m.desktop.state.collectAsState()
+    val profiles by m.profiles.state.collectAsState()
     val status by m.collectUiStatus()
     val adapters by m.adapters.collectAsState()
+    LaunchedEffect(Unit) { m.refreshAdapters() }
+
+    ScrollingColumn {
+        PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later",
+            description = m.text("Выбери оформление и поведение приложения, настрой защиту и обновления. Здесь можно сменить палитру, настроить запуск вместе с системой и проверить новую версию. Подписки и выбранный сервер сохранятся.", "Choose the appearance, app behavior, protection and updates. Change the palette, configure startup and check for a new version. Your subscriptions and selected server are preserved."))
+
+        GlassPanel(Modifier.fillMaxWidth().testTag("settings-mode-panel")) {
+            SectionTitle(m.strings.get(R.string.settings_mode_title))
+            ChoiceRow(
+                label = null,
+                options = SettingsMode.entries,
+                selected = settings.settingsMode,
+                text = { m.strings.get(it.labelRes) },
+            ) { mode -> m.changeSettings({ it.copy(settingsMode = mode) }) }
+            Text(
+                m.strings.get(settings.settingsMode.descriptionRes),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        UpdatePanel(m, desktop, onInstallUpdate)
+
+        if (settings.settingsMode == SettingsMode.Simple) {
+            SettingsProtectionPanel(m, settings, desktop, status, simple = true)
+            SettingsAppearancePanel(m, settings, desktop)
+            SettingsSimpleBehaviorPanel(m, settings, desktop)
+            GlassPanel(Modifier.fillMaxWidth().testTag("settings-simple-more")) {
+                SectionTitle(
+                    m.strings.get(R.string.settings_simple_more_title),
+                    trailing = {
+                        AccentButton(m.strings.get(R.string.settings_mode_advanced)) {
+                            m.changeSettings({ it.copy(settingsMode = SettingsMode.Advanced) })
+                        }
+                    },
+                )
+                Text(
+                    m.strings.get(R.string.settings_simple_more_subtitle),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            SettingsDiagnosticsPanel(m, onOpenLogs, onOpenGratitude)
+        } else {
+            SettingsProtectionPanel(m, settings, desktop, status, simple = false)
+            SettingsAppearancePanel(m, settings, desktop)
+            SettingsTlsAndFragmentPanel(m, settings)
+            SettingsConnectionDnsPanel(m, settings, desktop, profiles, adapters)
+            SettingsLatencyPanel(m, settings)
+            SettingsAdvancedBehaviorPanel(m, settings, desktop)
+            SettingsDiagnosticsPanel(m, onOpenLogs, onOpenGratitude)
+        }
+    }
+}
+
+@Composable private fun SettingsProtectionPanel(
+    m: DesktopModel,
+    settings: AppSettings,
+    desktop: DesktopSettings,
+    status: ServiceStatus,
+    simple: Boolean,
+) {
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(m.text("Защита", "Protection"), m.text("Килл свитч", "Kill switch"))
+        SwitchRow(
+            m.text("Блокировать интернет без VPN", "Block the internet without the VPN"),
+            desktop.killSwitch,
+            m.text(
+                "С подключения и до отключения ничего не уходит мимо туннеля — даже если сервер упал или служба перезапускается. Локальная сеть остаётся, если она идёт напрямую.",
+                "From connecting until you disconnect nothing leaves around the tunnel — even if the server drops or the service restarts. The local network stays reachable while it bypasses the tunnel.",
+            ),
+        ) { m.changeDesktop(desktop.copy(killSwitch = it), true) }
+        SwitchRow(
+            m.text("Местоположение — как у сервера", "Match the server's location"),
+            desktop.matchServerLocation,
+            m.text(
+                "Пока VPN подключён, системная таймзона переезжает на серверную, а системная геолокация замолкает — сайты и приложения видят местоположение сервера. На отключении всё возвращается. Системные часы сдвинутся.",
+                "While the VPN is connected the system timezone moves to the server's and system location is silenced, so sites and apps see the server's whereabouts. Everything is restored on disconnect. The system clock will visibly move.",
+            ),
+        ) { m.changeDesktop(desktop.copy(matchServerLocation = it), true) }
+        if (simple) {
+            SwitchRow(
+                m.strings.get(R.string.settings_simple_bypass),
+                settings.simpleBypassEnabled,
+                m.strings.get(R.string.settings_simple_bypass_subtitle),
+            ) { enabled -> m.changeSettings({ it.withSimpleBypass(enabled) }, true) }
+            SwitchRow(
+                m.strings.get(R.string.settings_simple_block_ads),
+                settings.blockAds,
+                m.strings.get(R.string.settings_simple_block_ads_subtitle),
+            ) { enabled -> m.changeSettings({ it.copy(blockAds = enabled) }, true) }
+        }
+        if (status.sysNote.isNotEmpty()) {
+            Text(
+                m.text("Не получилось: ${status.sysNote}", "Could not: ${status.sysNote}"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+        } else if (status.sysTimezone.isNotEmpty()) {
+            Text(
+                m.text("Таймзона системы: ${status.sysTimezone}", "System timezone: ${status.sysTimezone}"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable private fun SettingsAppearancePanel(m: DesktopModel, settings: AppSettings, desktop: DesktopSettings) {
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(m.text("Внешний вид", "Appearance"))
+        ChoiceRow(m.text("Тема", "Theme"), ThemeMode.entries, settings.themeMode, { m.strings.get(it.labelRes) }) { mode -> m.changeSettings({ it.copy(themeMode = mode) }) }
+        PaletteRow(m, settings, desktop)
+        SwitchRow("AMOLED", settings.amoled, m.text("Чёрный фон вместо тёмного", "True black instead of dark")) { m.changeSettings({ s -> s.copy(amoled = it) }) }
+        SwitchRow(m.text("Живой фон", "Live backdrop"), desktop.liveBackdrop, m.text("Фигуры за стеклом медленно плывут и следят за курсором", "The shapes behind the glass drift and follow the pointer")) {
+            m.changeDesktop(desktop.copy(liveBackdrop = it))
+        }
+        ChoiceRow(m.text("Фигура", "Figure"), Visualizer.entries, settings.visualizer, { m.strings.get(it.labelRes) }) { value -> m.changeSettings({ it.copy(visualizer = value) }) }
+        ChoiceRow(m.text("Язык", "Language"), AppLanguage.entries, settings.language, { m.strings.get(it.labelRes) }) { lang -> m.changeSettings({ it.copy(language = lang) }) }
+        SwitchRow(
+            m.strings.get(R.string.settings_show_recommended),
+            settings.showRecommendedBadges,
+            m.strings.get(R.string.settings_show_recommended_subtitle),
+        ) { enabled -> m.changeSettings({ it.copy(showRecommendedBadges = enabled) }) }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable private fun SettingsTlsAndFragmentPanel(m: DesktopModel, settings: AppSettings) {
+    val s = m.strings
+    var lengthDraft by remember(settings.fragmentLength) { mutableStateOf(settings.fragmentLength) }
+    var intervalDraft by remember(settings.fragmentInterval) { mutableStateOf(settings.fragmentInterval) }
+    var maxChunksDraft by remember(settings.fragmentMaxChunks) { mutableStateOf(settings.fragmentMaxChunks) }
+    var fragmentError by remember { mutableStateOf(false) }
+
+    GlassPanel(Modifier.fillMaxWidth().testTag("settings-tls-fragment-panel")) {
+        SectionTitle(s.get(R.string.settings_tls_fingerprint), m.text("TLS и DPI", "TLS & DPI"))
+        Text(
+            s.get(R.string.settings_tls_fingerprint_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ChoiceRow(
+            label = null,
+            options = TlsFingerprintOverride.entries,
+            selected = settings.tlsFingerprint,
+            text = { s.get(it.labelRes) },
+        ) { fp -> m.changeSettings({ it.copy(tlsFingerprint = fp) }, true) }
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+
+        ChoiceRow(
+            label = s.get(R.string.settings_fragment),
+            options = FragmentMode.entries,
+            selected = settings.fragmentMode,
+            text = { s.get(it.labelRes) },
+        ) { mode -> m.changeSettings({ it.copy(fragmentMode = mode) }, true) }
+        Text(
+            s.get(settings.fragmentMode.descriptionRes),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (settings.fragmentMode != FragmentMode.Off) {
+            Kicker(s.get(R.string.settings_fragment_presets))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                DesktopFragmentPresets.forEach { preset ->
+                    val chosen = settings.fragmentLength == preset.length &&
+                        settings.fragmentInterval == preset.interval &&
+                        settings.fragmentMaxChunks.trim() == preset.maxChunks.trim()
+                    val onClick = {
+                        lengthDraft = preset.length
+                        intervalDraft = preset.interval
+                        maxChunksDraft = preset.maxChunks
+                        fragmentError = false
+                        m.changeSettings({
+                            it.copy(
+                                fragmentLength = preset.length,
+                                fragmentInterval = preset.interval,
+                                fragmentMaxChunks = preset.maxChunks,
+                            )
+                        }, true)
+                        Unit
+                    }
+                    if (chosen) AccentButton(s.get(preset.labelRes), onClick = onClick)
+                    else QuietButton(s.get(preset.labelRes), onClick = onClick)
+                }
+            }
+
+            ChoiceRow(
+                label = s.get(R.string.settings_fragment_scope),
+                options = FragmentScope.entries,
+                selected = settings.fragmentScope,
+                text = { s.get(it.labelRes) },
+            ) { scope -> m.changeSettings({ it.copy(fragmentScope = scope) }, true) }
+            Text(
+                s.get(settings.fragmentScope.descriptionRes),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                GlassField(
+                    lengthDraft,
+                    { lengthDraft = it; fragmentError = false },
+                    Modifier.width(190.dp),
+                    label = s.get(R.string.settings_fragment_length),
+                    placeholder = s.get(R.string.settings_fragment_length_hint),
+                    isError = fragmentError && !AppSettings.isValidFragmentLength(lengthDraft),
+                )
+                GlassField(
+                    intervalDraft,
+                    { intervalDraft = it; fragmentError = false },
+                    Modifier.width(190.dp),
+                    label = s.get(R.string.settings_fragment_interval),
+                    placeholder = s.get(R.string.settings_fragment_interval_hint),
+                    isError = fragmentError && !AppSettings.isValidFragmentInterval(intervalDraft),
+                )
+                GlassField(
+                    maxChunksDraft,
+                    { maxChunksDraft = it; fragmentError = false },
+                    Modifier.width(190.dp),
+                    label = s.get(R.string.settings_fragment_max_split),
+                    placeholder = s.get(R.string.settings_fragment_max_split_hint),
+                    isError = fragmentError && !AppSettings.isValidFragmentMaxChunks(maxChunksDraft),
+                )
+            }
+            if (fragmentError) {
+                Text(
+                    listOf(
+                        s.get(R.string.settings_fragment_length_error, AppSettings.MIN_FRAGMENT_LENGTH, AppSettings.MAX_FRAGMENT_LENGTH),
+                        s.get(R.string.settings_fragment_interval_error, AppSettings.MIN_FRAGMENT_INTERVAL, AppSettings.MAX_FRAGMENT_INTERVAL),
+                    ).joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            AccentButton(s.get(R.string.action_save)) {
+                val len = AppSettings.normalizeRange(lengthDraft, AppSettings.MIN_FRAGMENT_LENGTH, AppSettings.MAX_FRAGMENT_LENGTH)
+                val interval = AppSettings.normalizeRange(intervalDraft, AppSettings.MIN_FRAGMENT_INTERVAL, AppSettings.MAX_FRAGMENT_INTERVAL)
+                val maxChunks = if (maxChunksDraft.isBlank()) "" else AppSettings.normalizeRange(maxChunksDraft, AppSettings.MIN_FRAGMENT_MAX_CHUNKS, AppSettings.MAX_FRAGMENT_MAX_CHUNKS)
+                if (len == null || interval == null || maxChunks == null) {
+                    fragmentError = true
+                } else {
+                    lengthDraft = len
+                    intervalDraft = interval
+                    maxChunksDraft = maxChunks
+                    fragmentError = false
+                    m.changeSettings({
+                        it.copy(fragmentLength = len, fragmentInterval = interval, fragmentMaxChunks = maxChunks)
+                    }, true)
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsConnectionDnsPanel(
+    m: DesktopModel,
+    settings: AppSettings,
+    desktop: DesktopSettings,
+    profiles: ProfileState,
+    adapters: List<NetworkAdapter>,
+) {
+    val s = m.strings
     var dns by remember(settings.remoteDns) { mutableStateOf(settings.remoteDns) }
+    var directDns by remember(settings.directDns) { mutableStateOf(settings.directDns) }
+    var dohUrl by remember(settings.resolveDohUrl) { mutableStateOf(settings.resolveDohUrl) }
+    var newDnsDraft by remember { mutableStateOf("") }
+    var newDnsInvalid by remember { mutableStateOf(false) }
     var mtu by remember(settings.mtu) { mutableStateOf(settings.mtu.toString()) }
     var invalid by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { m.refreshAdapters() }
-    // A saved adapter that has since been unplugged stays visible, so the choice reads as a
-    // choice rather than silently reverting to Automatic.
     val adapterChoices = remember(adapters, desktop.outboundAdapter) {
         (listOf("") + adapters.map { it.name }).let { options ->
             if (desktop.outboundAdapter.isNotEmpty() && desktop.outboundAdapter !in options) options + desktop.outboundAdapter else options
         }.distinct()
     }
 
-    ScrollingColumn {
-        PageTitle(m.text("Настройки", "Settings"), "Yumi Desktop $AppVersion · Xray · GPL-3.0-or-later",
-            description = m.text("Выбери оформление и поведение приложения, настрой защиту и обновления. Здесь можно сменить палитру, настроить запуск вместе с системой и проверить новую версию. Подписки и выбранный сервер сохранятся.", "Choose the appearance, app behavior, protection and updates. Change the palette, configure startup and check for a new version. Your subscriptions and selected server are preserved."))
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(
+            m.text("Соединение и DNS", "Connection and DNS"),
+            trailing = {
+                QuietButton(m.text("Обновить", "Refresh"), icon = Icons.Rounded.Refresh) { m.refreshAdapters() }
+            },
+        )
+        if (settings.providerRouting) {
+            Text(
+                s.get(R.string.settings_dns_provider_note),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        GlassField(dns, { dns = it; invalid = false }, Modifier.fillMaxWidth(), label = s.get(R.string.settings_remote_dns), placeholder = s.get(R.string.settings_remote_dns_hint), isError = invalid)
+        GlassField(directDns, { directDns = it; invalid = false }, Modifier.fillMaxWidth(), label = s.get(R.string.settings_direct_dns), placeholder = s.get(R.string.settings_direct_dns_hint), isError = invalid)
+        Text(
+            m.text("DoH (https://), TCP, UDP или IP-адрес. Без автоматической замены резолвера.", "DoH (https://), TCP, UDP or an IP address. No automatic resolver substitution."),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
-        UpdatePanel(m, desktop, onInstallUpdate)
+        SwitchRow(s.get(R.string.settings_hijack_dns), settings.hijackDns, s.get(R.string.settings_hijack_dns_subtitle)) {
+            m.changeSettings({ cur -> cur.copy(hijackDns = it) }, true)
+        }
+        SwitchRow(s.get(R.string.settings_resolve_server_doh), settings.resolveServerAddress, s.get(R.string.settings_resolve_server_doh_subtitle)) {
+            m.changeSettings({ cur -> cur.copy(resolveServerAddress = it) }, true)
+        }
+        if (settings.resolveServerAddress) {
+            GlassField(
+                dohUrl,
+                { dohUrl = it; invalid = false },
+                Modifier.fillMaxWidth(),
+                label = s.get(R.string.settings_resolve_doh_url),
+                placeholder = s.get(R.string.settings_resolve_doh_url_hint),
+                isError = invalid && !ServerAddressResolver.isValidDohUrl(dohUrl),
+            )
+        }
 
-        GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(m.text("Защита", "Protection"), m.text("Килл свитч", "Kill switch"))
-            SwitchRow(
-                m.text("Блокировать интернет без VPN", "Block the internet without the VPN"),
-                desktop.killSwitch,
-                m.text(
-                    "С подключения и до отключения ничего не уходит мимо туннеля — даже если сервер упал или служба перезапускается. Локальная сеть остаётся, если она идёт напрямую.",
-                    "From connecting until you disconnect nothing leaves around the tunnel — even if the server drops or the service restarts. The local network stays reachable while it bypasses the tunnel.",
-                ),
-            ) { m.changeDesktop(desktop.copy(killSwitch = it), true) }
-            SwitchRow(
-                m.text("Местоположение — как у сервера", "Match the server's location"),
-                desktop.matchServerLocation,
-                m.text(
-                    "Пока VPN подключён, системная таймзона переезжает на серверную, а системная геолокация замолкает — сайты и приложения видят местоположение сервера. На отключении всё возвращается. Системные часы сдвинутся.",
-                    "While the VPN is connected the system timezone moves to the server's and system location is silenced, so sites and apps see the server's whereabouts. Everything is restored on disconnect. The system clock will visibly move.",
-                ),
-            ) { m.changeDesktop(desktop.copy(matchServerLocation = it), true) }
-            if (status.sysNote.isNotEmpty()) {
-                Text(
-                    m.text("Не получилось: ${status.sysNote}", "Could not: ${status.sysNote}"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.tertiary,
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Kicker(s.get(R.string.settings_dns_resolvers))
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RowShape)
+                    .background(if (profiles.selectedDnsId == null) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+                    .clickable { m.selectDnsProfile(null) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (profiles.selectedDnsId == null) Icon(Icons.Rounded.Check, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                Column(Modifier.weight(1f)) {
+                    Text(s.get(R.string.settings_dns_from_settings), style = MaterialTheme.typography.titleSmall)
+                    Text(settings.remoteDns, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            profiles.dnsProfiles.forEach { profile ->
+                val chosen = profiles.selectedDnsId == profile.id
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RowShape)
+                        .background(if (chosen) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+                        .clickable { m.selectDnsProfile(profile.id) }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    if (chosen) Icon(Icons.Rounded.Check, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                    Column(Modifier.weight(1f)) {
+                        Text(profile.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(profile.url, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    PanelIconButton(Icons.Rounded.DeleteOutline, s.get(R.string.action_delete), size = 34.dp) {
+                        m.removeDnsProfile(profile.id)
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GlassField(
+                    newDnsDraft,
+                    { newDnsDraft = it; newDnsInvalid = false },
+                    Modifier.weight(1f),
+                    placeholder = "https://dns.google/dns-query · sdns://…",
+                    isError = newDnsInvalid,
                 )
-            } else if (status.sysTimezone.isNotEmpty()) {
-                Text(
-                    m.text("Таймзона системы: ${status.sysTimezone}", "System timezone: ${status.sysTimezone}"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                QuietButton(s.get(R.string.action_add), icon = Icons.Rounded.Add, enabled = newDnsDraft.isNotBlank()) {
+                    if (m.addDnsProfile(newDnsDraft)) {
+                        newDnsDraft = ""
+                        newDnsInvalid = false
+                    } else {
+                        newDnsInvalid = true
+                    }
+                }
             }
         }
 
-        GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(m.text("Внешний вид", "Appearance"))
-            ChoiceRow(m.text("Тема", "Theme"), ThemeMode.entries, settings.themeMode, { m.strings.get(it.labelRes) }) { mode -> m.changeSettings({ it.copy(themeMode = mode) }) }
-            PaletteRow(m, settings, desktop)
-            SwitchRow("AMOLED", settings.amoled, m.text("Чёрный фон вместо тёмного", "True black instead of dark")) { m.changeSettings({ s -> s.copy(amoled = it) }) }
-            SwitchRow(m.text("Живой фон", "Live backdrop"), desktop.liveBackdrop, m.text("Фигуры за стеклом медленно плывут и следят за курсором", "The shapes behind the glass drift and follow the pointer")) {
-                m.changeDesktop(desktop.copy(liveBackdrop = it))
-            }
-            ChoiceRow(m.text("Фигура", "Figure"), Visualizer.entries, settings.visualizer, { m.strings.get(it.labelRes) }) { value -> m.changeSettings({ it.copy(visualizer = value) }) }
-            ChoiceRow(m.text("Язык", "Language"), AppLanguage.entries, settings.language, { m.strings.get(it.labelRes) }) { lang -> m.changeSettings({ it.copy(language = lang) }) }
+        GlassField(mtu, { mtu = it; invalid = false }, Modifier.width(220.dp), label = "MTU · 1280–9000", isError = invalid)
+        SwitchRow("IPv6", settings.enableIpv6) { m.changeSettings({ s -> s.copy(enableIpv6 = it) }, true) }
+        ChoiceRow(
+            m.text("Откуда брать интернет", "Where the internet comes from"),
+            adapterChoices,
+            desktop.outboundAdapter,
+            { name ->
+                if (name.isEmpty()) m.text("Автоматически", "Automatic")
+                else adapters.firstOrNull { it.name == name }?.let { adapter ->
+                    val title = adapter.name + if (adapter.default) m.text(" · основной", " · default") else ""
+                    if (adapter.address != null) "$title · ${adapter.address}" else title
+                } ?: name
+            },
+        ) { name ->
+            // A live tunnel has to move onto the new interface now, not at the next connect.
+            m.changeDesktop(desktop.copy(outboundAdapter = name), true)
         }
-
-        GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(
-                m.text("Соединение и DNS", "Connection and DNS"),
-                trailing = {
-                    QuietButton(m.text("Обновить", "Refresh"), icon = Icons.Rounded.Refresh) { m.refreshAdapters() }
-                },
-            )
-            GlassField(dns, { dns = it; invalid = false }, Modifier.fillMaxWidth(), label = m.text("DNS-резолвер", "DNS resolver"), isError = invalid)
-            Text(
-                m.text("DoH (https://), TCP, UDP или IP-адрес. Без автоматической замены резолвера.", "DoH (https://), TCP, UDP or an IP address. No automatic resolver substitution."),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            GlassField(mtu, { mtu = it; invalid = false }, Modifier.width(220.dp), label = "MTU · 1280–9000", isError = invalid)
-            SwitchRow("IPv6", settings.enableIpv6) { m.changeSettings({ s -> s.copy(enableIpv6 = it) }, true) }
-            ChoiceRow(
-                m.text("Откуда брать интернет", "Where the internet comes from"),
-                adapterChoices,
-                desktop.outboundAdapter,
-                { name ->
-                    if (name.isEmpty()) m.text("Автоматически", "Automatic")
-                    else adapters.firstOrNull { it.name == name }?.let { adapter ->
-                        val title = adapter.name + if (adapter.default) m.text(" · основной", " · default") else ""
-                        if (adapter.address != null) "$title · ${adapter.address}" else title
-                    } ?: name
-                },
-            ) { name ->
-                // A live tunnel has to move onto the new interface now, not at the next connect.
-                m.changeDesktop(desktop.copy(outboundAdapter = name), true)
+        Text(
+            m.text(
+                "Автоматически — адаптер основного маршрута Windows. Выбери вручную, если интернет уходит не через тот адаптер или туннель не поднимается.",
+                "Automatic follows the Windows default route. Pick one by hand when traffic leaves through the wrong adapter or the tunnel will not start.",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        AccentButton(m.text("Сохранить соединение", "Save connection settings")) {
+            val value = mtu.toIntOrNull()
+            val resolver = validateRemoteDns(dns)
+            val directResolver = if (directDns.isBlank()) AppSettings().directDns else validateRemoteDns(directDns)
+            val validDoh = !settings.resolveServerAddress || ServerAddressResolver.isValidDohUrl(dohUrl)
+            if (value == null || value !in 1280..9000 || resolver == null || directResolver == null || !validDoh) {
+                invalid = true
+            } else {
+                if (resolver != settings.remoteDns) m.selectDnsProfile(null)
+                m.changeSettings({
+                    it.copy(
+                        remoteDns = resolver,
+                        directDns = directResolver,
+                        resolveDohUrl = if (settings.resolveServerAddress) dohUrl.trim() else it.resolveDohUrl,
+                        mtu = value,
+                    )
+                }, true)
             }
-            Text(
-                m.text(
-                    "Автоматически — адаптер основного маршрута Windows. Выбери вручную, если интернет уходит не через тот адаптер или туннель не поднимается.",
-                    "Automatic follows the Windows default route. Pick one by hand when traffic leaves through the wrong adapter or the tunnel will not start.",
-                ),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            AccentButton(m.text("Сохранить соединение", "Save connection settings")) {
-                val value = mtu.toIntOrNull()
-                val resolver = validateRemoteDns(dns)
-                if (value == null || value !in 1280..9000 || resolver == null) invalid = true
-                else m.changeSettings({ it.copy(remoteDns = resolver, mtu = value) }, true)
-            }
-            if (invalid) Text(m.text("Проверь DNS и MTU.", "Check DNS and MTU."), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
         }
+        if (invalid) Text(m.text("Проверь DNS, DoH и MTU.", "Check DNS, DoH and MTU."), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
+    }
+}
 
-        GlassPanel(Modifier.fillMaxWidth()) {
-            SectionTitle(m.text("Поведение", "Behavior"))
-            SwitchRow(m.text("Запускать при входе в систему", "Launch at sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
-            SwitchRow(
-                m.text("Подключать VPN при запуске", "Connect VPN on launch"),
-                desktop.connectOnLaunch,
-                m.text("После запуска Yumi подключится к выбранному серверу, когда служба будет готова.", "After Yumi starts, connect to the selected server when the service is ready."),
-            ) { m.changeDesktop(desktop.copy(connectOnLaunch = it)) }
-            SwitchRow(m.text("Обновлять подписки автоматически", "Refresh subscriptions automatically"), settings.subscriptionAutoUpdate) { m.changeSettings({ s -> s.copy(subscriptionAutoUpdate = it) }) }
-            if (settings.subscriptionAutoUpdate) ChoiceRow(
-                m.text("Как часто", "How often"),
-                UpdateIntervals,
-                settings.subscriptionUpdateMinutes,
-                { intervalLabel(m, it) },
-            ) { minutes -> m.changeSettings({ it.copy(subscriptionUpdateMinutes = minutes) }) }
+@Composable private fun SettingsLatencyPanel(m: DesktopModel, settings: AppSettings) {
+    val s = m.strings
+    var probeUrl by remember(settings.probeUrl) { mutableStateOf(settings.probeUrl) }
+    var probeTimeout by remember(settings.probeTimeoutMillis) { mutableStateOf(settings.probeTimeoutMillis.toString()) }
+    var probeError by remember { mutableStateOf(false) }
+
+    GlassPanel(Modifier.fillMaxWidth().testTag("settings-latency-panel")) {
+        SectionTitle(s.get(R.string.settings_latency))
+        ChoiceRow(
+            label = null,
+            options = PingMode.entries,
+            selected = settings.pingMode,
+            text = { s.get(it.labelRes) },
+        ) { mode -> m.changeSettings({ it.copy(pingMode = mode) }) }
+        Text(s.get(settings.pingMode.descriptionRes), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(s.get(R.string.settings_quic_note), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GlassField(
+            probeUrl,
+            { probeUrl = it; probeError = false },
+            Modifier.fillMaxWidth(),
+            label = s.get(R.string.settings_probe_url),
+            placeholder = s.get(R.string.settings_probe_url_hint),
+            isError = probeError && !ProbeTargets.isValidProbeUrl(probeUrl),
+        )
+        GlassField(
+            probeTimeout,
+            { probeTimeout = it; probeError = false },
+            Modifier.width(240.dp),
+            label = s.get(R.string.settings_probe_timeout),
+            placeholder = s.get(R.string.settings_probe_timeout_hint),
+            isError = probeError && (probeTimeout.trim().toIntOrNull() !in AppSettings.MIN_PROBE_TIMEOUT_MILLIS..AppSettings.MAX_PROBE_TIMEOUT_MILLIS),
+        )
+        if (probeError) {
             Text(
-                m.text(
-                    "Крестик сворачивает окно в трей. Выход через меню трея отключает VPN. Сервер меняется только по твоему выбору — сам он не переключается никогда.",
-                    "Closing the window keeps Yumi in the tray. Exit from the tray disconnects VPN. Servers change only when you choose them — never by themselves.",
-                ),
+                s.get(R.string.settings_probe_url_error) + " · " + s.get(R.string.settings_probe_timeout_error),
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        AccentButton(s.get(R.string.action_save)) {
+            val timeout = probeTimeout.trim().toIntOrNull()
+            if (!ProbeTargets.isValidProbeUrl(probeUrl) || timeout == null || timeout !in AppSettings.MIN_PROBE_TIMEOUT_MILLIS..AppSettings.MAX_PROBE_TIMEOUT_MILLIS) {
+                probeError = true
+            } else {
+                probeError = false
+                m.changeSettings({ it.copy(probeUrl = probeUrl.trim(), probeTimeoutMillis = timeout) })
+            }
+        }
+    }
+}
+
+@Composable private fun SettingsSimpleBehaviorPanel(m: DesktopModel, settings: AppSettings, desktop: DesktopSettings) {
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(m.text("Поведение", "Behavior"))
+        SwitchRow(m.text("Запускать при входе в систему", "Launch at sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
+        SwitchRow(
+            m.text("Подключать VPN при запуске", "Connect VPN on launch"),
+            desktop.connectOnLaunch,
+            m.text("После запуска Yumi подключится к выбранному серверу, когда служба будет готова.", "After Yumi starts, connect to the selected server when the service is ready."),
+        ) { m.changeDesktop(desktop.copy(connectOnLaunch = it)) }
+        SwitchRow(
+            m.strings.get(R.string.settings_simple_auto_update),
+            settings.simpleAutoUpdateEnabled,
+            m.strings.get(R.string.settings_simple_auto_update_subtitle),
+        ) { enabled -> m.changeSettings({ it.withSimpleAutoUpdate(enabled) }) }
+    }
+}
+
+@Composable private fun SettingsAdvancedBehaviorPanel(m: DesktopModel, settings: AppSettings, desktop: DesktopSettings) {
+    GlassPanel(Modifier.fillMaxWidth()) {
+        SectionTitle(m.text("Поведение", "Behavior"))
+        SwitchRow(m.text("Запускать при входе в систему", "Launch at sign-in"), desktop.launchAtLogin) { m.changeDesktop(desktop.copy(launchAtLogin = it)) }
+        SwitchRow(
+            m.text("Подключать VPN при запуске", "Connect VPN on launch"),
+            desktop.connectOnLaunch,
+            m.text("После запуска Yumi подключится к выбранному серверу, когда служба будет готова.", "After Yumi starts, connect to the selected server when the service is ready."),
+        ) { m.changeDesktop(desktop.copy(connectOnLaunch = it)) }
+        SwitchRow(m.text("Обновлять подписки автоматически", "Refresh subscriptions automatically"), settings.subscriptionAutoUpdate) { m.changeSettings({ s -> s.copy(subscriptionAutoUpdate = it) }) }
+        SwitchRow(
+            m.strings.get(R.string.settings_auto_update_on_start),
+            settings.subscriptionUpdateOnStart,
+            m.strings.get(R.string.settings_auto_update_on_start_subtitle),
+        ) { m.changeSettings({ s -> s.copy(subscriptionUpdateOnStart = it) }) }
+        if (settings.subscriptionAutoUpdate) ChoiceRow(
+            m.text("Как часто", "How often"),
+            UpdateIntervals,
+            settings.subscriptionUpdateMinutes,
+            { intervalLabel(m, it) },
+        ) { minutes -> m.changeSettings({ it.copy(subscriptionUpdateMinutes = minutes) }) }
+        Text(
+            m.text(
+                "Крестик сворачивает окно в трей. Выход через меню трея отключает VPN. Сервер меняется только по твоему выбору — сам он не переключается никогда.",
+                "Closing the window keeps Yumi in the tray. Exit from the tray disconnects VPN. Servers change only when you choose them — never by themselves.",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable private fun SettingsDiagnosticsPanel(m: DesktopModel, onOpenLogs: () -> Unit, onOpenGratitude: () -> Unit) {
+    val s = m.strings
+    GlassPanel(Modifier.fillMaxWidth().testTag("settings-diagnostics-panel")) {
+        SectionTitle(s.get(R.string.settings_diagnostics))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            QuietButton(s.get(R.string.settings_logs), Modifier.testTag("open-logs-button"), icon = Icons.Rounded.BugReport, onClick = onOpenLogs)
+            QuietButton(
+                "${s.get(R.string.settings_gratitude_title)} · ${s.plural(R.plurals.settings_gratitude_subtitle, 6)}",
+                Modifier.testTag("open-gratitude-button"),
+                icon = Icons.Rounded.Favorite,
+                onClick = onOpenGratitude,
             )
         }
     }
@@ -1783,6 +2397,14 @@ private fun serviceError(m: DesktopModel, code: String, includeUnknown: Boolean 
         m.text("Выбранный адаптер недоступен. Подключи его или выбери «Автоматически» в настройках.", "The selected adapter is unavailable. Connect it or choose Automatic in Settings.")
     "invalid_configuration", "forbidden_field", "unsupported_protocol" ->
         m.text("Конфигурация сервера не поддерживается ядром.", "The server configuration is not supported by the core.")
+    "invalid_fragment" ->
+        m.text("Проверь параметры фрагментации пакетов.", "Check the packet fragmentation settings.")
+    "invalid_doh", "invalid_doh_url" ->
+        m.text("Проверь URL DoH-резолвера для адресов серверов.", "Check the DoH resolver URL for server addresses.")
+    "invalid_rules", "invalid_provider_profile" ->
+        m.text("Проверь пользовательские правила или маршрутизацию подписки.", "Check custom routing rules or subscription routing profile.")
+    "invalid_probe", "invalid_probe_url", "invalid_probe_target" ->
+        m.text("Проверь настройки URL-проверки задержки.", "Check latency probe URL and targets.")
     else -> m.text("Не удалось запустить туннель. Проверь VPN-службу и выбранный сервер.", "Could not start the tunnel. Check the service and selected server.") + if (includeUnknown) "\n\n$code" else ""
 }
 

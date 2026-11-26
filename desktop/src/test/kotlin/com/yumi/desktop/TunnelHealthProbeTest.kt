@@ -161,6 +161,42 @@ class TunnelHealthProbeTest {
         }
     }
 
+    @Test fun probeSupportsCustomHttpAndHttpsUrlsWithoutBreakingDefaultHttps204Contract() = runBlocking {
+        val customHttpReq = CompletableDeferred<String>()
+        Fixture { socket ->
+            readHead(socket.inputStream)
+            socket.outputStream.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+            customHttpReq.complete(readHead(socket.inputStream))
+            socket.outputStream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+            socket.outputStream.flush()
+        }.use { fixture ->
+            val rtt = TunnelHealthProbe(probeUrl = "http://custom.example:8080/healthz?ok=1").probe(fixture.endpoint)
+            assertTrue(rtt != null && rtt >= 1)
+            val get = customHttpReq.await()
+            assertTrue(get.startsWith("GET /healthz?ok=1 HTTP/1.1\r\nHost: custom.example:8080\r\n"))
+            fixture.await()
+        }
+
+        val customHttpsReq = CompletableDeferred<String>()
+        Fixture { socket ->
+            readHead(socket.inputStream)
+            socket.outputStream.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+            serverTls(socket).use { tls ->
+                customHttpsReq.complete(readHead(tls.inputStream))
+                tls.outputStream.write("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".toByteArray())
+                tls.outputStream.flush()
+            }
+        }.use { fixture ->
+            val rtt = TunnelHealthProbe(
+                tlsFactory = trustedContext.socketFactory,
+                probeUrl = "https://cp.cloudflare.com/ping",
+            ).probe(fixture.endpoint)
+            assertTrue(rtt != null && rtt >= 1)
+            assertTrue(customHttpsReq.await().startsWith("GET /ping HTTP/1.1\r\nHost: cp.cloudflare.com\r\n"))
+            fixture.await()
+        }
+    }
+
     private fun probe(timeout: Long = 5_000) = TunnelHealthProbe(timeoutMillis = timeout, tlsFactory = trustedContext.socketFactory)
 
     private class Fixture(handler: (Socket) -> Unit) : AutoCloseable {

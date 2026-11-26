@@ -3,10 +3,44 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/xtls/xray-core/core"
 	xoutbound "github.com/xtls/xray-core/features/outbound"
 )
+
+const fragmentTagPrefix = "frag-"
+
+func ensureFragmentOutbounds(instance *core.Instance, config *core.Config) error {
+	if instance == nil || config == nil {
+		return nil
+	}
+	manager, ok := instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager)
+	if !ok {
+		return errors.New("outbound manager unavailable")
+	}
+	for _, ob := range config.Outbound {
+		if ob == nil || !strings.HasPrefix(ob.Tag, fragmentTagPrefix) {
+			continue
+		}
+		if manager.GetHandler(ob.Tag) != nil {
+			continue
+		}
+		raw, err := core.CreateObject(instance, ob)
+		if err != nil {
+			return err
+		}
+		h, ok := raw.(xoutbound.Handler)
+		if !ok {
+			return errors.New("invalid fragment outbound handler")
+		}
+		if err := manager.AddHandler(context.Background(), h); err != nil {
+			_ = h.Close()
+			return err
+		}
+	}
+	return nil
+}
 
 func installLiveOutbound(instance *core.Instance, groups ...*OutboundGroup) (*liveOutbound, error) {
 	manager, ok := instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager)

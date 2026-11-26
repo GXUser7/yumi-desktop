@@ -57,6 +57,12 @@ data class Subscription(
     val remoteTitle: String? = null,
     /** Provider support/renewal page, from the `profile-web-page-url` header. */
     val webPageUrl: String? = null,
+    /** External tariff & checkout manifest, from the `billing-manifest-url` header. */
+    val billingManifestUrl: String? = null,
+    /** Direct one-tap renewal/payment link, from `payment-url` or `sub-expire-button-link`. */
+    val paymentUrl: String? = null,
+    /** Provider support chat/page, from the `support-url` header. */
+    val supportUrl: String? = null,
 
     /**
      * Client to claim to be when fetching this one, overriding the app's own agent.
@@ -73,6 +79,33 @@ data class Subscription(
      * for a token this way, and there is no other place to put one.
      */
     val headers: Map<String, String> = emptyMap(),
+
+    /**
+     * The routing and DNS the provider wrote into its configuration documents. Kept whether or not
+     * the user has asked for it to be applied (`AppSettings.providerRouting`), so turning that on
+     * works straight away instead of after the next refresh.
+     */
+    val providerRouting: ProviderRouting? = null,
+) {
+    val hasBillingAction: Boolean
+        get() = billingManifestUrl != null || paymentUrl != null
+
+    val hasAnyPortalAction: Boolean
+        get() = hasBillingAction || webPageUrl != null
+}
+
+/**
+ * Metadata still worth preserving when a panel refuses servers (for example on expiry or an
+ * exhausted HWID limit), so the user gets a direct renewal or device-reset button instead of a
+ * dead-end error card.
+ */
+data class SubscriptionFailureMetadata(
+    val userInfo: SubscriptionUserInfo? = null,
+    val remoteTitle: String? = null,
+    val webPageUrl: String? = null,
+    val billingManifestUrl: String? = null,
+    val paymentUrl: String? = null,
+    val supportUrl: String? = null,
 )
 
 /** Outcome of a refresh, so the UI can distinguish "no change" from "failed" from "updated". */
@@ -82,7 +115,12 @@ sealed interface SubscriptionUpdate {
         val nodes: List<ProxyNode>,
         val addedCount: Int,
         val removedCount: Int,
+        val providerRouting: ProviderRouting? = null,
     ) : SubscriptionUpdate
 
-    data class Failure(val subscriptionId: String, val message: String) : SubscriptionUpdate
+    data class Failure(
+        val subscriptionId: String,
+        val message: String,
+        val metadata: SubscriptionFailureMetadata? = null,
+    ) : SubscriptionUpdate
 }
